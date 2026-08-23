@@ -40,24 +40,43 @@ if [ ! -f "$KO" ]; then
     exit 1
 fi
 
-mkdir -p "$(dirname "$STATE_FILE")"
+if ! mkdir -p "$(dirname "$STATE_FILE")"; then
+    echo "av-reload.sh: could not create $(dirname "$STATE_FILE")" >&2
+    exit 1
+fi
 
-if lsmod | grep -q '^av '; then
+# awk instead of `lsmod | grep -q` deliberately: with pipefail set, grep -q
+# can exit as soon as it matches, before lsmod has finished writing its
+# output - lsmod then gets SIGPIPE and the pipeline's exit status becomes
+# lsmod's (nonzero) rather than grep's match, which would make a loaded
+# module look unloaded here and skip the save step outright.
+if lsmod | awk '$1 == "av" { found = 1 } END { exit !found }'; then
     echo "av-reload.sh: module loaded, saving state to $STATE_FILE"
     if ! "$AVCTL" save "$STATE_FILE"; then
         echo "av-reload.sh: save failed, aborting before rmmod (state would be lost)" >&2
         exit 1
     fi
-    rmmod av
+    if ! rmmod av; then
+        echo "av-reload.sh: rmmod failed, aborting (state was saved to $STATE_FILE" \
+             "but the old module is still loaded)" >&2
+        exit 1
+    fi
 else
     echo "av-reload.sh: module not currently loaded, skipping save"
 fi
 
-insmod "$KO"
+if ! insmod "$KO"; then
+    echo "av-reload.sh: insmod failed" >&2
+    exit 1
+fi
 
 if [ -s "$STATE_FILE" ]; then
     echo "av-reload.sh: replaying state from $STATE_FILE"
-    "$AVCTL" load "$STATE_FILE"
+    if ! "$AVCTL" load "$STATE_FILE"; then
+        echo "av-reload.sh: load failed - module is up but state may be incomplete," \
+             "check the errors above" >&2
+        exit 1
+    fi
 else
     echo "av-reload.sh: no prior state at $STATE_FILE - starting fresh" \
          "(only the auto-seeded EICAR signature and default fail-open" \

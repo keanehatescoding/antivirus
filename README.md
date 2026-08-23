@@ -1120,7 +1120,7 @@ sudo rmmod av && sudo insmod av/av.ko
 
 `scripts/av-reload.sh` wraps exactly this sequence into one command, for
 the panic/fix/reload loop this project's manual insmod/rmmod workflow
-implies day to day - it saves (skipped if the module isn't currently
+implies day-to-day - it saves (skipped if the module isn't currently
 loaded), reloads, then replays (skipped if no state file exists yet, e.g.
 the very first run):
 
