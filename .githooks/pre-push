@@ -5,7 +5,11 @@
 # touches av/, userspace/avctl/, or userspace/avd/ - a docs-only push
 # shouldn't insmod a kernel module.
 #
-# This needs sudo (insmod/rmmod) and should only run inside your VM.
+# This needs root (insmod/rmmod) and should only run inside your VM.
+# Runs via pkexec rather than sudo: pkexec goes through the system's
+# polkit authentication agent instead of demanding an interactive
+# terminal for a password/fingerprint prompt, so it also works from
+# non-interactive/agent-driven shells that can't satisfy sudo's prompt.
 #
 # Enable with: scripts/setup-hooks.sh   (or: git config core.hooksPath .githooks)
 # Bypass once with: git push --no-verify (not recommended, especially
@@ -73,13 +77,13 @@ fi
 echo "==> pre-push: changes detected in av/, userspace/avctl/, or userspace/avd/"
 echo "    running full test suite (build, insmod, EICAR detection, rmmod)"
 
-# No separate 'sudo -v' preflight: it validates a general credential
-# refresh, which a command-scoped NOPASSWD sudoers rule (e.g. for
-# exactly 'tests/run_all.sh') does not satisfy even though the actual
-# command below would succeed non-interactively under that same rule.
-# 'sudo tests/run_all.sh' fails on its own, with its own clear error,
-# if sudo genuinely is not available - no need to duplicate that check.
-if sudo tests/run_all.sh; then
+# No separate preflight credential check: 'pkexec tests/run_all.sh'
+# fails on its own, with its own clear error (and no polkit agent
+# available shows up as pkexec exiting nonzero immediately), if
+# authentication genuinely can't happen - no need to duplicate that
+# check. pkexec wants an absolute path to the program it runs, unlike
+# sudo, which resolves relative paths against the caller's cwd.
+if pkexec "$REPO_ROOT/tests/run_all.sh"; then
     echo "pre-push: all tests passed"
     exit 0
 else
