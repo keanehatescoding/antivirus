@@ -26,6 +26,11 @@ rmmod av
   pre-push            - full test suite on push (only if av/ or avctl changed)
 scripts/
   setup-hooks.sh       - one-time: git config core.hooksPath .githooks
+  av-reload.sh          - rmmod+insmod av.ko without losing the
+                        signature DB, trust list, protected-path list,
+                        and daemon policy - wraps the avctl save/load
+                        dance below into one command, see "Persistence:
+                        avctl save/load" further down
 docs/
   netlink-protocol.md  - kernel<->daemon protocol design (commands, attrs, flow)
 packaging/
@@ -1112,6 +1117,25 @@ reported as skipped rather than an error):
 sudo rmmod av && sudo insmod av/av.ko
 ./userspace/avctl/avctl load /etc/kernel-av/state.txt
 ```
+
+`scripts/av-reload.sh` wraps exactly this sequence into one command, for
+the panic/fix/reload loop this project's manual insmod/rmmod workflow
+implies day-to-day - it saves (skipped if the module isn't currently
+loaded), reloads, then replays (skipped if no state file exists yet, e.g.
+the very first run):
+
+```bash
+sudo scripts/av-reload.sh                        # uses /etc/kernel-av/state.txt
+sudo scripts/av-reload.sh /path/to/other/state.txt
+```
+
+It aborts before `rmmod` if the save step fails, so a write error
+(disk full, permissions) never silently drops the current state.
+There's still no *automatic* persistence across a bare `rmmod`/crash
+outside this script - all four `/proc` interfaces genuinely are
+in-memory-only - so anything that touches the module directly (a crash
+during development, or `rmmod` run by hand instead of through the
+script) still loses unsaved state exactly as before.
 
 ## Testing evasion resistance (v0.9.0)
 

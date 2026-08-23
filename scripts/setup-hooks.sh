@@ -18,7 +18,7 @@ chmod +x "$REPO_ROOT"/tests/*.sh
 echo "Git hooks installed (core.hooksPath -> .githooks)."
 echo "  pre-commit: lints staged files (cppcheck/shellcheck/gcc -fsyntax-only)"
 echo "  pre-push:   runs the full test suite (tests/run_all.sh) when a push"
-echo "              touches av/ or userspace/avctl/ - needs sudo"
+echo "              touches av/ or userspace/avctl/ - needs root, via pkexec"
 echo
 echo "Bypass either once with --no-verify if you really need to (not"
 echo "recommended, especially right before tagging a release)."

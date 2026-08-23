@@ -191,22 +191,38 @@ static int write_command(const char *cmd)
  * see sig_proc_write()/trust_proc_write()/protected_proc_write()/
  * daemon_policy_proc_write() in the kernel module). Line buffer sized
  * for PATH_MAX (protected-path entries can be much longer than a
- * sha256 signature/name line). */
+ * sha256 signature/name line).
+ *
+ * Written to a `path.tmp` temp file first, then rename()'d into place
+ * only once every write and both fclose()s have succeeded - a plain
+ * fopen(path, "w") would let a mid-dump failure (disk full, a /proc
+ * read that goes away) leave a truncated file at `path` with a "success"
+ * exit code indistinguishable from a real, complete snapshot. That
+ * distinction matters beyond this file: scripts/av-reload.sh trusts
+ * do_save()'s exit code alone to decide whether it's safe to rmmod. */
 static int do_save(const char *path)
 {
     FILE *out;
     FILE *in;
     char line[PATH_MAX + 16];
+    char tmp_path[PATH_MAX + 8];
     int sig_count = 0, trust_count = 0, protect_count = 0;
+    int werr = 0;
 
-    out = fopen(path, "w");
+    if (strlen(path) >= PATH_MAX) {
+        fprintf(stderr, "avctl: path too long (max %d bytes)\n", PATH_MAX - 1);
+        return 1;
+    }
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+
+    out = fopen(tmp_path, "w");
     if (!out) {
         fprintf(stderr, "avctl: could not open %s for writing: %s\n",
-                path, strerror(errno));
+                tmp_path, strerror(errno));
         return 1;
     }
 
-    fprintf(out, "# kernel-av state dump - replay with: avctl load %s\n", path);
+    werr |= fprintf(out, "# kernel-av state dump - replay with: avctl load %s\n", path) < 0;
 
     in = fopen(PROC_PATH, "r");
     if (!in) {
@@ -214,13 +230,14 @@ static int do_save(const char *path)
                          "(is the av module loaded? try: sudo insmod av.ko)\n",
                 PROC_PATH, strerror(errno));
         fclose(out);
+        unlink(tmp_path);
         return 1;
     }
     while (fgets(line, sizeof(line), in)) {
         char algo[8], hex[65], name[128];
 
         if (sscanf(line, "%7s %64s %127[^\n]", algo, hex, name) == 3) {
-            fprintf(out, "sig add %s %s %s\n", algo, hex, name);
+            werr |= fprintf(out, "sig add %s %s %s\n", algo, hex, name) < 0;
             sig_count++;
         }
     }
@@ -232,13 +249,14 @@ static int do_save(const char *path)
                          "(is the av module loaded? try: sudo insmod av.ko)\n",
                 TRUST_PROC_PATH, strerror(errno));
         fclose(out);
+        unlink(tmp_path);
         return 1;
     }
     while (fgets(line, sizeof(line), in)) {
         char hex[65], name[128];
 
         if (sscanf(line, "%64s %127[^\n]", hex, name) == 2) {
-            fprintf(out, "trust add %s %s\n", hex, name);
+            werr |= fprintf(out, "trust add %s %s\n", hex, name) < 0;
             trust_count++;
         }
     }
@@ -250,6 +268,7 @@ static int do_save(const char *path)
                          "(is the av module loaded? try: sudo insmod av.ko)\n",
                 PROTECTED_PROC_PATH, strerror(errno));
         fclose(out);
+        unlink(tmp_path);
         return 1;
     }
     while (fgets(line, sizeof(line), in)) {
@@ -258,7 +277,7 @@ static int do_save(const char *path)
         if (len > 0 && line[len - 1] == '\n')
             line[len - 1] = '\0';
         if (line[0]) {
-            fprintf(out, "protect add %s\n", line);
+            werr |= fprintf(out, "protect add %s\n", line) < 0;
             protect_count++;
         }
     }
@@ -270,6 +289,7 @@ static int do_save(const char *path)
                          "(is the av module loaded? try: sudo insmod av.ko)\n",
                 POLICY_PROC_PATH, strerror(errno));
         fclose(out);
+        unlink(tmp_path);
         return 1;
     }
     if (fgets(line, sizeof(line), in)) {
@@ -278,11 +298,26 @@ static int do_save(const char *path)
         if (len > 0 && line[len - 1] == '\n')
             line[len - 1] = '\0';
         if (line[0])
-            fprintf(out, "policy %s\n", line);
+            werr |= fprintf(out, "policy %s\n", line) < 0;
     }
     fclose(in);
 
-    fclose(out);
+    if (fclose(out) != 0)
+        werr = 1;
+
+    if (werr) {
+        fprintf(stderr, "avctl: write error while saving to %s\n", tmp_path);
+        unlink(tmp_path);
+        return 1;
+    }
+
+    if (rename(tmp_path, path) != 0) {
+        fprintf(stderr, "avctl: could not rename %s to %s: %s\n",
+                tmp_path, path, strerror(errno));
+        unlink(tmp_path);
+        return 1;
+    }
+
     printf("saved %d signature(s), %d trusted entr%s, %d protected path%s, "
            "and the daemon-unavailable policy to %s\n",
            sig_count, trust_count, trust_count == 1 ? "y" : "ies",
