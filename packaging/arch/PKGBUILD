@@ -11,6 +11,14 @@
 # changing the `source` line below to
 # git+https://github.com/keanehatescoding/antivirus.git#tag=vX.Y.Z
 # if you'd rather not build off the moving master branch.
+#
+# TEMPORARY: pinned to #branch=packaging/distro-packages because this
+# very PKGBUILD (and LICENSE, which package_hyprav-dkms()/package_hyprav()
+# below both install) only exists on that branch, not yet on master -
+# makepkg's git source clones from GitHub over the network, so it has
+# no idea this file was edited locally. Revert to the plain
+# `git+https://github.com/keanehatescoding/antivirus.git` URL (no
+# #branch=) once PR #29 merges to master.
 
 pkgbase=hyprav
 pkgname=('hyprav-dkms' 'hyprav' 'hyprav-gui')
@@ -20,7 +28,7 @@ arch=('x86_64')
 url="https://github.com/keanehatescoding/antivirus"
 license=('GPL3')
 makedepends=('git' 'linux-cachyos-headers' 'libnl' 'yara' 'ssdeep' 'tlsh' 'pkgconf')
-source=("hyprav::git+https://github.com/keanehatescoding/antivirus.git")
+source=("hyprav::git+https://github.com/keanehatescoding/antivirus.git#branch=packaging/distro-packages")
 sha256sums=('SKIP')
 
 pkgver() {
