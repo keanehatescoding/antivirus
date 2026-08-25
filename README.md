@@ -135,7 +135,9 @@ userspace/
     sha256.c/.h          - self-contained SHA-256, used only to hash
                         on-demand scans (no kernel-precomputed hash
                         for those, unlike kernel-triggered ones) -
-                        not linking libcrypto for one hash
+                        not linking libcrypto for one hash. Verified
+                        against FIPS 180-4 known-answer vectors -
+                        see tests/test_sha256.sh
     tlsh_shim.h/.cpp     - libtlsh's only public API is a C++ class
                         with no extern "C" surface at all (confirmed
                         against the real upstream header, not
@@ -163,6 +165,9 @@ experiments/          - throwaway learning modules, not tagged/released
   procfs_demo/        - /proc entry you can read/write from userspace
   kprobe_log/         - kprobe on execve that just logs filenames (no blocking)
 tests/
+  test_sha256.sh       - FIPS 180-4 known-answer tests for
+                        userspace/avd/sha256.c - no kernel module or
+                        root needed, safe to run standalone
   test_sigtable.sh     - avctl/proc protocol tests (add/list/del/reject)
   test_detection.sh    - full build/load/detect/unload integration test
   test_avd_socket.sh   - avd control socket tests: STATUS/VERDICTS RECENT,
@@ -170,7 +175,7 @@ tests/
                         restore/delete - builds+loads the module AND
                         starts avd itself, against a throwaway
                         quarantine dir/socket path
-  run_all.sh           - runs all three of the above (used by the pre-push hook)
+  run_all.sh           - runs all four of the above (used by the pre-push hook)
   benchmark.sh          - v1.0.0: execve/openat hook overhead, module
                         loaded vs unloaded (needs root, real numbers only
                         from your VM - see the benchmarking section)
@@ -450,8 +455,15 @@ avoid that right before tagging a release.
 
 ## Automated tests
 
-`tests/` has three scripts — all run *inside your VM*, not in CI (see
-the CI section below for why):
+`tests/` has four scripts. Three run *inside your VM*, not in CI (see
+the CI section below for why); `test_sha256.sh` is the exception —
+pure userspace, no kernel module or root needed, safe to run anywhere:
+
+- **`test_sha256.sh`** — FIPS 180-4 known-answer tests for the
+  self-contained SHA-256 in `userspace/avd/sha256.c`:
+  ```bash
+  tests/test_sha256.sh
+  ```
 
 - **`test_sigtable.sh`** — exercises the `avctl`/`/proc` protocol: add,
   list, del, and rejection of malformed input. Run against an
@@ -484,7 +496,7 @@ the CI section below for why):
 
 Run `test_detection.sh` from a fresh snapshot when testing anything that
 touches `handler_pre`/`av_work_fn` — same caution as manual testing.
-All three scripts print a pass/fail count and exit non-zero on any
+All four scripts print a pass/fail count and exit non-zero on any
 failure, so they're suitable for a pre-commit or pre-tag check even
 without CI runtime support.
 

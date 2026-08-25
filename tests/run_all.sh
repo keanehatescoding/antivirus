@@ -18,6 +18,12 @@ echo "### building avctl ###"
 make -C "$REPO_ROOT/userspace/avctl" || FAIL=1
 
 echo
+echo "### test_sha256.sh (known-answer tests for userspace/avd/sha256.c) ###"
+# No kernel module/root needed for this one, unlike everything else
+# here - it just doesn't hurt to run it under the same sudo invocation.
+"$REPO_ROOT/tests/test_sha256.sh" || FAIL=1
+
+echo
 echo "### test_detection.sh (build av/, load, exercise clean+EICAR, unload) ###"
 "$REPO_ROOT/tests/test_detection.sh" || FAIL=1
 

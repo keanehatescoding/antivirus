@@ -2,8 +2,13 @@
 #
 # tests/test_avd_socket.sh - exercises avd's control socket protocol
 # (see docs/avd-socket-protocol.md): STATUS, VERDICTS RECENT, SCAN,
-# QUARANTINE LIST/RESTORE/DELETE, and the SO_PEERCRED permission gate
-# on the three root-only verbs.
+# and QUARANTINE LIST/RESTORE/DELETE. Runs everything as root (this
+# script requires root anyway, for insmod/rmmod), so it does NOT cover
+# the SO_PEERCRED permission gate that rejects SCAN/QUARANTINE
+# RESTORE/DELETE from a non-root peer - that would need a second,
+# unprivileged connection alongside the root one this script already
+# makes, which is a real gap worth closing separately, not something
+# to claim coverage of here.
 #
 # Unlike test_sigtable.sh (which expects the module already loaded and
 # never touches avd), this script builds and loads the module AND
@@ -36,6 +41,19 @@ TEST_SOCK_PATH="/tmp/av_test_control_$$.sock"
 TEST_FILE="/tmp/av_test_socket_sample_$$.bin"
 AVD_PID=""
 
+# mktemp, not a fixed /tmp/av_socket_*.log path - this script runs as
+# root, and a fixed world-writable-directory path is a classic
+# symlink-planting target: another local user could pre-create a
+# symlink there pointing anywhere, and a root redirect into it would
+# truncate/overwrite whatever it points to. Same reasoning as
+# userspace/avd/Makefile's checkdeps target.
+BUILD_LOG="$(mktemp "${TMPDIR:-/tmp}/av_socket_build.XXXXXX")" || exit 1
+INSMOD_LOG="$(mktemp "${TMPDIR:-/tmp}/av_socket_insmod.XXXXXX")" || exit 1
+AVD_LOG="$(mktemp "${TMPDIR:-/tmp}/av_socket_avd.XXXXXX")" || exit 1
+SOCAT_LOG="$(mktemp "${TMPDIR:-/tmp}/av_socket_socat.XXXXXX")" || exit 1
+AVCTL_LOG="$(mktemp "${TMPDIR:-/tmp}/av_socket_avctl.XXXXXX")" || exit 1
+RMMOD_LOG="$(mktemp "${TMPDIR:-/tmp}/av_socket_rmmod.XXXXXX")" || exit 1
+
 PASS=0
 FAIL=0
 pass() { echo "  PASS: $1"; PASS=$((PASS+1)); }
@@ -62,26 +80,27 @@ cleanup() {
     rmmod av 2>/dev/null && echo "  module unloaded" || echo "  module already unloaded"
     rm -rf "$TEST_QUARANTINE_DIR"
     rm -f "$TEST_SOCK_PATH" "$TEST_FILE"
+    rm -f "$BUILD_LOG" "$INSMOD_LOG" "$AVD_LOG" "$SOCAT_LOG" "$AVCTL_LOG" "$RMMOD_LOG"
 }
 trap cleanup EXIT
 
 section "build"
-if make -C "$AV_DIR" "${MAKE_ARGS[@]}" clean >/tmp/av_socket_build.log 2>&1 && \
-   make -C "$AV_DIR" "${MAKE_ARGS[@]}" >>/tmp/av_socket_build.log 2>&1 && \
-   make -C "$AVD_DIR" >>/tmp/av_socket_build.log 2>&1 && \
-   make -C "$AVCTL_DIR" >>/tmp/av_socket_build.log 2>&1; then
+if make -C "$AV_DIR" "${MAKE_ARGS[@]}" clean >"$BUILD_LOG" 2>&1 && \
+   make -C "$AV_DIR" "${MAKE_ARGS[@]}" >>"$BUILD_LOG" 2>&1 && \
+   make -C "$AVD_DIR" >>"$BUILD_LOG" 2>&1 && \
+   make -C "$AVCTL_DIR" >>"$BUILD_LOG" 2>&1; then
     pass "av.ko, avd, and avctl built"
 else
-    fail "build failed - see /tmp/av_socket_build.log"
-    cat /tmp/av_socket_build.log
+    fail "build failed - see $BUILD_LOG"
+    cat "$BUILD_LOG"
     exit 1
 fi
 
 section "load module"
-if insmod "$AV_DIR/av.ko" 2>/tmp/av_socket_insmod.log; then
+if insmod "$AV_DIR/av.ko" 2>"$INSMOD_LOG"; then
     pass "module loaded"
 else
-    fail "insmod failed: $(cat /tmp/av_socket_insmod.log)"
+    fail "insmod failed: $(cat "$INSMOD_LOG")"
     exit 1
 fi
 sleep 1
@@ -91,7 +110,7 @@ mkdir -p "$TEST_QUARANTINE_DIR"
 (
     cd "$REPO_ROOT" || exit 1
     exec "$AVD_DIR/avd" rules corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
-        corpus/tlsh_hashes.txt "$TEST_SOCK_PATH" >/tmp/av_socket_avd.log 2>&1
+        corpus/tlsh_hashes.txt "$TEST_SOCK_PATH" >"$AVD_LOG" 2>&1
 ) &
 AVD_PID=$!
 
@@ -102,8 +121,8 @@ done
 if [ -S "$TEST_SOCK_PATH" ]; then
     pass "avd started and control socket exists"
 else
-    fail "avd did not create the control socket in time - see /tmp/av_socket_avd.log"
-    cat /tmp/av_socket_avd.log
+    fail "avd did not create the control socket in time - see $AVD_LOG"
+    cat "$AVD_LOG"
     exit 1
 fi
 
@@ -117,21 +136,21 @@ export AVD_SOCK_PATH="$TEST_SOCK_PATH"
 # security-relevant verbs (SCAN, QUARANTINE *) below either way.
 section "STATUS / VERDICTS RECENT (raw protocol via socat)"
 if command -v socat >/dev/null 2>&1; then
-    STATUS_RESP="$(printf 'STATUS\n' | socat - "UNIX-CONNECT:$TEST_SOCK_PATH" 2>/tmp/av_socket_socat.log)"
+    STATUS_RESP="$(printf 'STATUS\n' | socat - "UNIX-CONNECT:$TEST_SOCK_PATH" 2>"$SOCAT_LOG")"
     if echo "$STATUS_RESP" | grep -q '^OK$' && echo "$STATUS_RESP" | grep -q '^COUNT 1$'; then
         pass "STATUS returns OK/COUNT 1"
     else
         fail "STATUS response malformed: $STATUS_RESP"
     fi
 
-    VERDICTS_RESP="$(printf 'VERDICTS RECENT 5\n' | socat - "UNIX-CONNECT:$TEST_SOCK_PATH" 2>>/tmp/av_socket_socat.log)"
+    VERDICTS_RESP="$(printf 'VERDICTS RECENT 5\n' | socat - "UNIX-CONNECT:$TEST_SOCK_PATH" 2>>"$SOCAT_LOG")"
     if echo "$VERDICTS_RESP" | grep -q '^OK$'; then
         pass "VERDICTS RECENT 5 returns OK"
     else
         fail "VERDICTS RECENT response malformed: $VERDICTS_RESP"
     fi
 
-    BOGUS_RESP="$(printf 'NOT A REAL COMMAND\n' | socat - "UNIX-CONNECT:$TEST_SOCK_PATH" 2>>/tmp/av_socket_socat.log)"
+    BOGUS_RESP="$(printf 'NOT A REAL COMMAND\n' | socat - "UNIX-CONNECT:$TEST_SOCK_PATH" 2>>"$SOCAT_LOG")"
     if echo "$BOGUS_RESP" | grep -q '^ERR '; then
         pass "unknown command rejected with ERR"
     else
@@ -144,20 +163,20 @@ fi
 
 section "SCAN a clean file"
 printf 'just some harmless test bytes\n' > "$TEST_FILE"
-if "$AVCTL" scan "$TEST_FILE" 2>/tmp/av_socket_avctl.log | grep -q '^CLEAN:'; then
+if "$AVCTL" scan "$TEST_FILE" 2>"$AVCTL_LOG" | grep -q '^CLEAN:'; then
     pass "scan of a harmless file reports CLEAN"
 else
-    fail "expected CLEAN, got: $(cat /tmp/av_socket_avctl.log)"
+    fail "expected CLEAN, got: $(cat "$AVCTL_LOG")"
 fi
 
 section "SCAN the EICAR test string (should convict via YARA)"
 # shellcheck disable=SC2016
 printf 'X5O!P%%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' > "$TEST_FILE"
-SCAN_OUT="$("$AVCTL" scan "$TEST_FILE" 2>/tmp/av_socket_avctl.log)"
+SCAN_OUT="$("$AVCTL" scan "$TEST_FILE" 2>"$AVCTL_LOG")"
 if echo "$SCAN_OUT" | grep -q '^MALICIOUS:'; then
     pass "EICAR scan reports MALICIOUS"
 else
-    fail "expected MALICIOUS, got: $SCAN_OUT ($(cat /tmp/av_socket_avctl.log))"
+    fail "expected MALICIOUS, got: $SCAN_OUT ($(cat "$AVCTL_LOG"))"
 fi
 if [ ! -e "$TEST_FILE" ]; then
     pass "EICAR file was quarantined (original path gone)"
@@ -166,7 +185,7 @@ else
 fi
 
 section "QUARANTINE LIST shows the quarantined EICAR file"
-LIST_OUT="$("$AVCTL" quarantine list 2>/tmp/av_socket_avctl.log)"
+LIST_OUT="$("$AVCTL" quarantine list 2>"$AVCTL_LOG")"
 if echo "$LIST_OUT" | grep -q "$TEST_FILE"; then
     pass "quarantine list shows the original path"
 else
@@ -175,10 +194,10 @@ fi
 QID="$(echo "$LIST_OUT" | tail -n +2 | awk -v f="$TEST_FILE" '$0 ~ f {print $1}' | head -1)"
 
 section "QUARANTINE RESTORE puts it back"
-if [ -n "$QID" ] && "$AVCTL" quarantine restore "$QID" >/tmp/av_socket_avctl.log 2>&1; then
+if [ -n "$QID" ] && "$AVCTL" quarantine restore "$QID" >"$AVCTL_LOG" 2>&1; then
     pass "restore command succeeded"
 else
-    fail "restore command failed: $(cat /tmp/av_socket_avctl.log 2>/dev/null) (id=$QID)"
+    fail "restore command failed: $(cat "$AVCTL_LOG" 2>/dev/null) (id=$QID)"
 fi
 if [ -e "$TEST_FILE" ]; then
     pass "file exists at original path after restore"
@@ -190,10 +209,10 @@ section "re-scan + QUARANTINE DELETE removes it for good"
 "$AVCTL" scan "$TEST_FILE" >/dev/null 2>&1  # re-quarantine (still the EICAR content)
 LIST_OUT="$("$AVCTL" quarantine list 2>/dev/null)"
 QID="$(echo "$LIST_OUT" | tail -n +2 | awk -v f="$TEST_FILE" '$0 ~ f {print $1}' | head -1)"
-if [ -n "$QID" ] && "$AVCTL" quarantine delete "$QID" >/tmp/av_socket_avctl.log 2>&1; then
+if [ -n "$QID" ] && "$AVCTL" quarantine delete "$QID" >"$AVCTL_LOG" 2>&1; then
     pass "delete command succeeded"
 else
-    fail "delete command failed: $(cat /tmp/av_socket_avctl.log 2>/dev/null) (id=$QID)"
+    fail "delete command failed: $(cat "$AVCTL_LOG" 2>/dev/null) (id=$QID)"
 fi
 if "$AVCTL" quarantine list 2>/dev/null | grep -q "$TEST_FILE"; then
     fail "quarantine list still shows the deleted entry"
@@ -210,10 +229,10 @@ if kill "$AVD_PID" 2>/dev/null; then
 else
     fail "could not stop avd"
 fi
-if rmmod av 2>/tmp/av_socket_rmmod.log; then
+if rmmod av 2>"$RMMOD_LOG"; then
     pass "module unloaded cleanly"
 else
-    fail "rmmod failed: $(cat /tmp/av_socket_rmmod.log)"
+    fail "rmmod failed: $(cat "$RMMOD_LOG")"
 fi
 
 echo
