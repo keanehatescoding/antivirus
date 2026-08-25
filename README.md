@@ -33,9 +33,15 @@ scripts/
                         avctl save/load" further down
 docs/
   netlink-protocol.md  - kernel<->daemon protocol design (commands, attrs, flow)
+  avd-socket-protocol.md - avd's Unix control socket (avctl scan/quarantine,
+                        the GUI's reads) - separate channel from netlink above,
+                        see "GUI: av-gui" below
 packaging/
   avd.service          - systemd unit for running avd persistently -
                         see "Running avd persistently" below
+  org.hyprav.avctl.policy - polkit action backing every privileged avctl
+                        command (scan, quarantine restore/delete, and
+                        anything the GUI does) - see "GUI: av-gui" below
 av/                  - the actual antivirus module (single, evolving)
   main.c              - kprobe hooks (execve, openat, unlink, unlinkat,
                         rename, renameat, renameat2), workqueue,
@@ -102,7 +108,14 @@ userspace/
                         in-memory kernel state with no persistence of
                         their own - `avctl save <file>`/`avctl load
                         <file>` dump/replay all of it across an
-                        rmmod+insmod cycle.
+                        rmmod+insmod cycle. Also talks to avd's control
+                        socket (docs/avd-socket-protocol.md) for
+                        `avctl scan <path>` (on-demand scan) and
+                        `avctl quarantine list/restore/delete` -
+                        root-only for scan/restore/delete, same as
+                        every other write command here; see "GUI:
+                        av-gui" below for the polkit-gated path a GUI
+                        uses to run these without a terminal.
     avctl.c
     Makefile
   avd/                - daemon: receives scan requests over netlink, loads
@@ -112,8 +125,17 @@ userspace/
                         (on a miss) fuzzy-hash similarity - ssdeep, then
                         TLSH if ssdeep didn't match either. v1.0.0:
                         quarantines the file on any MALICIOUS verdict
-                        (moves to /var/lib/av-quarantine/, chmod 0000)
+                        (moves to /var/lib/av-quarantine/, chmod 0000).
+                        Also runs a Unix control socket
+                        (/run/avd/control.sock) for avctl/the GUI -
+                        status, recent verdict history, quarantine
+                        list/restore/delete, on-demand scan - see
+                        docs/avd-socket-protocol.md.
     avd.c
+    sha256.c/.h          - self-contained SHA-256, used only to hash
+                        on-demand scans (no kernel-precomputed hash
+                        for those, unlike kernel-triggered ones) -
+                        not linking libcrypto for one hash
     tlsh_shim.h/.cpp     - libtlsh's only public API is a C++ class
                         with no extern "C" surface at all (confirmed
                         against the real upstream header, not
@@ -122,6 +144,20 @@ userspace/
                         avd.c to it. See the Makefile for how the
                         mixed C/C++ build works.
     Makefile
+  av-gui/             - GTK4/Python management console: dashboard,
+                        detections, quarantine, on-demand scan,
+                        signatures/trust/protected-paths/policy - see
+                        "GUI: av-gui" below
+    av_gui/app.py         - Gtk.Application, sidebar navigation
+    av_gui/avd_client.py  - unprivileged control-socket client
+                        (STATUS/VERDICTS/QUARANTINE LIST)
+    av_gui/procfs_client.py - reads state via `avctl save -`, reusing
+                        avctl's existing line format instead of a
+                        second parser
+    av_gui/pkexec_helper.py - runs privileged avctl commands via
+                        `pkexec`, async
+    av_gui/pages/         - one module per page
+    Makefile
 experiments/          - throwaway learning modules, not tagged/released
   hello/              - minimal LKM: module_init/module_exit, dmesg logging
   procfs_demo/        - /proc entry you can read/write from userspace
@@ -129,7 +165,12 @@ experiments/          - throwaway learning modules, not tagged/released
 tests/
   test_sigtable.sh     - avctl/proc protocol tests (add/list/del/reject)
   test_detection.sh    - full build/load/detect/unload integration test
-  run_all.sh           - runs both of the above (used by the pre-push hook)
+  test_avd_socket.sh   - avd control socket tests: STATUS/VERDICTS RECENT,
+                        avctl scan (clean + EICAR), quarantine list/
+                        restore/delete - builds+loads the module AND
+                        starts avd itself, against a throwaway
+                        quarantine dir/socket path
+  run_all.sh           - runs all three of the above (used by the pre-push hook)
   benchmark.sh          - v1.0.0: execve/openat hook overhead, module
                         loaded vs unloaded (needs root, real numbers only
                         from your VM - see the benchmarking section)
@@ -275,6 +316,56 @@ otherwise changing where `avd` itself installs to:
 sudo make install PREFIX=/usr UNITDIR=/lib/systemd/system DESTDIR=/tmp/pkgroot
 ```
 
+## GUI: av-gui
+
+A GTK4/Python management console (`userspace/av-gui/`) sitting on top
+of everything above — dashboard (avd status + counts), detections
+(recent verdict history), quarantine (list/restore/delete), an
+on-demand scan page, and signatures/trust list/protected paths/policy
+management. It's a normal desktop app, not a daemon — nothing to
+enable or start, just launch it when you want it.
+
+**Reads** go through two unprivileged paths: avd's control socket
+directly for status/detections/quarantine (`av_gui/avd_client.py` —
+see `docs/avd-socket-protocol.md`), and `avctl save -` for
+signatures/trust/protected/policy (`av_gui/procfs_client.py` — reuses
+`avctl`'s existing replayable line format instead of a second parser).
+Neither needs root.
+
+**Writes** (every add/remove/restore/delete/scan button) run `pkexec
+avctl ...` (`av_gui/pkexec_helper.py`), gated by the
+`org.hyprav.avctl.policy` polkit action — one authentication prompt
+per action, not a GUI that runs as root for its whole lifetime. `avd`
+independently re-checks the caller's uid via `SO_PEERCRED` on its own
+three privileged verbs regardless of how the request got there, so
+this isn't the only gate either (see docs/avd-socket-protocol.md's
+Authorization section).
+
+```bash
+# avd itself must already be running (see above) - av-gui only talks
+# to it and to avctl, it never touches the kernel module directly.
+cd userspace/avd && make && sudo make install && sudo systemctl enable --now avd.service
+cd ../avctl && make && sudo make install   # installs avctl AND its polkit policy -
+                                            # privileged buttons in the GUI need both
+cd ../av-gui && make && sudo make install
+av-gui   # or find "HyprAV" in your application launcher
+```
+
+**pkexec only authorizes against avctl's *installed* path.** polkit
+action files reference one fixed executable path
+(`org.freedesktop.policykit.exec.path` in
+`packaging/org.hyprav.avctl.policy`) — they can't match an arbitrary
+build-directory location the way the rest of this project's
+run-it-in-place workflow usually allows. Read-only pages work fine
+against a plain `./avctl` built but not installed; every privileged
+button needs the real `sudo make install` step in `userspace/avctl/`
+first (see that Makefile's own comment on this).
+
+Override `AVD_SOCK_PATH` (both `avd` and `avctl`/the GUI read it) and
+`AVCTL_PATH` (the GUI only) for a non-default install or for testing
+against a throwaway instance, same overrides `tests/test_avd_socket.sh`
+uses.
+
 ## A note on kernel version / architecture
 
 The kprobe-based modules (`experiments/kprobe_log`, `av/`) hook the syscall
@@ -359,7 +450,7 @@ avoid that right before tagging a release.
 
 ## Automated tests
 
-`tests/` has two scripts — both run *inside your VM*, not in CI (see
+`tests/` has three scripts — all run *inside your VM*, not in CI (see
 the CI section below for why):
 
 - **`test_sigtable.sh`** — exercises the `avctl`/`/proc` protocol: add,
@@ -379,11 +470,23 @@ the CI section below for why):
   sudo tests/test_detection.sh
   ```
 
+- **`test_avd_socket.sh`** — exercises avd's control socket (see
+  docs/avd-socket-protocol.md): STATUS/VERDICTS RECENT (via `socat`,
+  skipped gracefully if it isn't installed), `avctl scan` on a clean
+  file and on the EICAR string, and `avctl quarantine
+  list/restore/delete`. Builds+loads/unloads the module and starts/stops
+  `avd` itself, against a throwaway quarantine dir and socket path — it
+  never touches your real `/var/lib/av-quarantine` or
+  `/run/avd/control.sock`. Needs root:
+  ```bash
+  sudo tests/test_avd_socket.sh
+  ```
+
 Run `test_detection.sh` from a fresh snapshot when testing anything that
 touches `handler_pre`/`av_work_fn` — same caution as manual testing.
-Both scripts print a pass/fail count and exit non-zero on any failure,
-so they're suitable for a pre-commit or pre-tag check even without CI
-runtime support.
+All three scripts print a pass/fail count and exit non-zero on any
+failure, so they're suitable for a pre-commit or pre-tag check even
+without CI runtime support.
 
 ## Testing signature detection safely
 
