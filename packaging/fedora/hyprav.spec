@@ -60,7 +60,11 @@ Summary:        HyprAV kprobe-based execve/file-event kernel module (DKMS)
 Requires:       dkms
 Requires(post): dkms
 Requires(preun): dkms
-BuildArch:      noarch
+# NOT noarch, despite shipping only source + a dkms.conf: the module
+# hooks x86_64-specific kprobe symbols (see the description below), so
+# a noarch build would let this install - and its %post run dkms -
+# against unsupported architectures.
+ExclusiveArch:  x86_64
 
 %description -n hyprav-dkms
 Out-of-tree kernel module (av.ko) that hooks execve and file events

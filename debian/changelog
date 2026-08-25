@@ -1,4 +1,4 @@
-hyprav (0.9.0-1) unstable; urgency=medium
+hyprav (0.9.0) unstable; urgency=medium
 
   * Initial packaging: hyprav-dkms (av.ko kernel module), hyprav
     (avd daemon + avctl CLI), hyprav-gui (GTK4 console).
