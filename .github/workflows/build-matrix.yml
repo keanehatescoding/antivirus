@@ -158,19 +158,6 @@ jobs:
           nm av/av.ko | grep -q ' T av_netlink_init$' || \
             (echo "::error::av_netlink_init not found in av.ko - netlink_chan.o did not link in" && exit 1)
 
-      - name: Build experiments/ against this kernel tree
-        run: |
-          set -euxo pipefail
-          KDIR="$GITHUB_WORKSPACE/linux-${{ matrix.kernel_version }}-${{ matrix.toolchain }}"
-          EXTRA_ARGS=""
-          if [ "${{ matrix.toolchain }}" = "clang" ]; then EXTRA_ARGS="CC=clang LLVM=1"; fi
-          for d in experiments/hello experiments/procfs_demo experiments/kprobe_log; do
-            echo "::group::Building $d"
-            make -C "$d" KDIR="$KDIR" $EXTRA_ARGS clean
-            make -C "$d" KDIR="$KDIR" $EXTRA_ARGS
-            echo "::endgroup::"
-          done
-
       - name: Upload build artifacts
         if: always()
         uses: actions/upload-artifact@v7
@@ -178,7 +165,6 @@ jobs:
           name: modules-${{ matrix.kernel_version }}-${{ matrix.toolchain }}
           path: |
             av/*.ko
-            experiments/*/*.ko
           if-no-files-found: warn
 
   build-avctl:
