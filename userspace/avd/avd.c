@@ -1793,7 +1793,16 @@ static void cmd_verdicts_recent(int fd, size_t n) {
              snap[i].pid, snap[i].path, snap[i].sha256_hex,
              snap[i].verdict == AV_VERDICT_MALICIOUS ? "MALICIOUS" : "CLEAN",
              snap[i].rule_name, snap[i].score, snap[i].on_demand ? 1 : 0);
-    write_all(fd, row, strlen(row));
+    /* Stop at the first failed write rather than pressing on through
+     * the rest of `take` rows - SO_SNDTIMEO (see control_conn_main())
+     * bounds each individual write_all() call, not this whole loop,
+     * so a client that stops reading would otherwise make this
+     * connection (and its AVD_CONTROL_MAX_CONNS slot) pay a full
+     * timeout interval PER REMAINING ROW instead of just one. */
+    if (write_all(fd, row, strlen(row)) != 0) {
+      free(snap);
+      return;
+    }
   }
   write_all(fd, "END\n", 4);
   free(snap);
@@ -1847,7 +1856,17 @@ static void cmd_quarantine_list(int fd) {
        * than hiding it, just without the extra fields. */
       snprintf(row, sizeof(row), "%s\t?\t0\t?\t?\n", id);
 
-    write_all(fd, row, strlen(row));
+    /* Stop at the first failed write, same reasoning as
+     * cmd_verdicts_recent()'s identical check - still have to free
+     * every remaining scandir() entry (not just the one just used)
+     * before returning, unlike a plain "return" would give us. */
+    if (write_all(fd, row, strlen(row)) != 0) {
+      free(namelist[i]);
+      for (i++; i < n; i++)
+        free(namelist[i]);
+      free(namelist);
+      return;
+    }
     free(namelist[i]);
   }
   free(namelist);
