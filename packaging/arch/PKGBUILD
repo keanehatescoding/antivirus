@@ -22,7 +22,7 @@
 
 pkgbase=hyprav
 pkgname=('hyprav-dkms' 'hyprav' 'hyprav-gui')
-pkgver=0.9.0.r129.g32d9af8
+pkgver=0.9.0.r133.g40a17fd
 pkgrel=1
 arch=('x86_64')
 url="https://github.com/keanehatescoding/antivirus"
@@ -78,7 +78,17 @@ build() {
 package_hyprav-dkms() {
   pkgdesc="HyprAV kprobe-based execve/file-event kernel module (DKMS source package)"
   depends=('dkms')
-  install=hyprav-dkms.install
+
+  # No install= script here on purpose: the `dkms` package itself ships
+  # pacman hooks (/usr/share/libalpm/hooks/70-dkms-install.hook etc.)
+  # that trigger generically on any usr/src/*/dkms.conf and run
+  # `dkms install`/`dkms remove` automatically - a custom postinst
+  # calling `dkms add -v "$1"` here would be not just redundant but
+  # wrong: pacman .install scripts receive $1 as the full
+  # $pkgver-$pkgrel string, not the bare $pkgver this directory is
+  # named after (confirmed the hard way - real install, real "Could
+  # not find module source directory" error, papered over only
+  # because dkms's own hook succeeded independently anyway).
 
   local _dkmsdir="$pkgdir/usr/src/hyprav-av-$pkgver"
   install -dm755 "$_dkmsdir"
@@ -128,8 +138,11 @@ package_hyprav() {
 
   # avd.service's ExecStart points here (see packaging/avd.service) -
   # RuntimeDirectory= covers /run/avd, but this quarantine store under
-  # /var needs to exist ahead of the first detection.
-  install -dm755 "$pkgdir/var/lib/av-quarantine"
+  # /var needs to exist ahead of the first detection. 0700 matches
+  # avd.c's own mkdir(quarantine_dir, 0700) at runtime (it holds
+  # quarantined malware) - 0755 here would've fought that on every
+  # install (confirmed: pacman warned "directory permissions differ").
+  install -dm700 "$pkgdir/var/lib/av-quarantine"
 
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
