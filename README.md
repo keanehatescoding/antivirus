@@ -252,12 +252,6 @@ sudo systemctl enable --now avd.service
 sudo journalctl -u avd -f  # avd's stdout/stderr, same output as running it by hand
 ```
 
-`journalctl` needs `sudo` (or membership in the `systemd-journal` group)
-to read another user's unit logs on most distros' default journald
-config - plain `journalctl -u avd` run as your own user will typically
-just come back empty or permission-denied rather than showing avd's
-output, since the unit runs as `root`.
-
 `install` does **not** enable or start the service itself — reviewing
 `packaging/avd.service` before enabling anything that scans and
 quarantines files with root privileges is worth the extra step. The
@@ -425,29 +419,6 @@ fragility this project has already documented (kprobe symbol offsets,
 `genl_family` struct layout) is versioned by upstream kernel release,
 not by distro patches - so it wouldn't obviously reduce risk beyond
 what the existing version-pinned CI matrix already covers.
-
-## Git hooks (lint on commit, full tests on push)
-
-One-time setup after cloning:
-
-```bash
-scripts/setup-hooks.sh
-```
-
-This points git at the tracked hooks in `.githooks/` instead of the
-default untracked `.git/hooks/`:
-
-- **pre-commit** — fast lint only (cppcheck on `av/` and
-  `userspace/avctl/`, `gcc -fsyntax-only` on the CLI, shellcheck on test
-  scripts). No build, no insmod — stays quick so it doesn't discourage
-  committing.
-- **pre-push** — runs `tests/run_all.sh` (build, insmod, EICAR
-  detection, unload) via sudo, but **only** when the push actually
-  touches `av/` or `userspace/avctl/` — a docs-only push won't load a
-  kernel module.
-
-Both are bypassable with `--no-verify` if you genuinely need to, but
-avoid that right before tagging a release.
 
 ## Automated tests
 
@@ -1430,20 +1401,6 @@ module directly via `init_module(2)`, and drives both checks itself.
 Falls back to TCG (software emulation) when `/dev/kvm` isn't usable,
 since free-tier runners have inconsistent KVM access - both paths are
 exercised and confirmed to work identically.
-
-This tier found a real gap during development: `av.ko`'s kprobe hook
-copies the exec target's pathname via `strncpy_from_user()` in atomic
-(kprobe) context, which can't sleep to fault in a userspace page that
-isn't resident yet - unlike the kernel's own later, in-process copy of
-the same pointer during `execve()`'s normal handling, which can. This
-is not a narrow timing race that needs a well-positioned attacker: any
-process whose exec pathname argument has never been touched before -
-e.g. a freshly execve()'d static binary that does nothing but exec a
-literal path - hits it deterministically. A real shell essentially
-never does, since by the time anything calls `execve()` its own memory
-has had far too much prior activity for a relevant page to still be
-cold, but a minimal launcher doesn't need to work hard to trigger it on
-purpose.
 
 `tests/qemu-boot/init.c` exercises the common case (it touches the
 pathname before exec'ing, so detection works as intended there), while
