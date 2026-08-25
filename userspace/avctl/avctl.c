@@ -17,6 +17,18 @@
  *   avctl policy set <fail-open|fail-closed>
  *   avctl save <file>
  *   avctl load <file>
+ *   avctl scan <absolute-path>
+ *   avctl quarantine list
+ *   avctl quarantine restore <id>
+ *   avctl quarantine delete <id>
+ *
+ * The four /proc-backed groups above (sig/trust/protect/policy) talk
+ * directly to the av kernel module, same as always. scan/quarantine
+ * are different: they talk to avd's control socket instead (see
+ * docs/avd-socket-protocol.md) - avd, not the kernel module, is what
+ * runs YARA/fuzzy/TLSH scanning and owns the quarantine directory.
+ * `avd` must be running for these three commands; the /proc-backed
+ * ones only need the kernel module loaded, independent of avd.
  *
  * This is a plain userspace program (built with the host's regular gcc,
  * NOT the kernel headers/toolchain - see Makefile in this directory).
@@ -29,11 +41,20 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <limits.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #define PROC_PATH "/proc/kernel_av_signatures"
 #define TRUST_PROC_PATH "/proc/kernel_av_trusted"
 #define PROTECTED_PROC_PATH "/proc/kernel_av_protected"
 #define POLICY_PROC_PATH "/proc/kernel_av_daemon_policy"
+
+/* Matches avd's own DEFAULT_CONTROL_SOCK_PATH (userspace/avd/avd.c) -
+ * not shared via a header since the two sides only need to agree on
+ * the plain-text wire protocol (docs/avd-socket-protocol.md), not on
+ * any C struct. Override with AVD_SOCK_PATH, same env var avd itself
+ * accepts, for tests/non-default installs. */
+#define CONTROL_SOCK_PATH_DEFAULT "/run/avd/control.sock"
 
 static void usage(const char *prog)
 {
@@ -50,10 +71,14 @@ static void usage(const char *prog)
         "  %s protect list\n"
         "  %s policy get\n"
         "  %s policy set <fail-open|fail-closed>\n"
-        "  %s save <file>\n"
-        "  %s load <file>\n",
+        "  %s save <file|->\n"
+        "  %s load <file>\n"
+        "  %s scan <absolute-path>\n"
+        "  %s quarantine list\n"
+        "  %s quarantine restore <id>\n"
+        "  %s quarantine delete <id>\n",
         prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog,
-        prog, prog);
+        prog, prog, prog, prog, prog, prog);
 }
 
 static int do_list_generic(const char *path, const char *header_algo)
@@ -199,7 +224,29 @@ static int write_command(const char *cmd)
  * read that goes away) leave a truncated file at `path` with a "success"
  * exit code indistinguishable from a real, complete snapshot. That
  * distinction matters beyond this file: scripts/av-reload.sh trusts
- * do_save()'s exit code alone to decide whether it's safe to rmmod. */
+ * do_save()'s exit code alone to decide whether it's safe to rmmod.
+ *
+ * path == "-": writes the same replayable line format straight to
+ * stdout instead of a file - used by callers that want machine-
+ * parseable current state without a throwaway save file (the GUI's
+ * unprivileged periodic refresh of signatures/trust/protected/policy
+ * runs plain `avctl save -`, no root needed - see
+ * docs/avd-socket-protocol.md's note on why this reuses save's
+ * existing format rather than adding a second read protocol). No
+ * atomic tmp-file+rename dance in this mode: that exists to protect an
+ * ON-DISK snapshot from a mid-write failure leaving a truncated-but-
+ * "successful" file at `path` (see above) - a pipe has no such
+ * leftover-corrupt-file failure mode to protect against. The summary
+ * line goes to stderr instead of stdout in this mode, so stdout stays
+ * pure, directly-parseable data for the caller. */
+static void save_abort(FILE *out, const char *tmp_path, int to_stdout)
+{
+    if (!to_stdout) {
+        fclose(out);
+        unlink(tmp_path);
+    }
+}
+
 static int do_save(const char *path)
 {
     FILE *out;
@@ -208,29 +255,33 @@ static int do_save(const char *path)
     char tmp_path[PATH_MAX + 8];
     int sig_count = 0, trust_count = 0, protect_count = 0;
     int werr = 0;
+    int to_stdout = !strcmp(path, "-");
 
-    if (strlen(path) >= PATH_MAX) {
-        fprintf(stderr, "avctl: path too long (max %d bytes)\n", PATH_MAX - 1);
-        return 1;
+    if (to_stdout) {
+        out = stdout;
+    } else {
+        if (strlen(path) >= PATH_MAX) {
+            fprintf(stderr, "avctl: path too long (max %d bytes)\n", PATH_MAX - 1);
+            return 1;
+        }
+        snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+
+        out = fopen(tmp_path, "w");
+        if (!out) {
+            fprintf(stderr, "avctl: could not open %s for writing: %s\n",
+                    tmp_path, strerror(errno));
+            return 1;
+        }
+
+        werr |= fprintf(out, "# kernel-av state dump - replay with: avctl load %s\n", path) < 0;
     }
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
-
-    out = fopen(tmp_path, "w");
-    if (!out) {
-        fprintf(stderr, "avctl: could not open %s for writing: %s\n",
-                tmp_path, strerror(errno));
-        return 1;
-    }
-
-    werr |= fprintf(out, "# kernel-av state dump - replay with: avctl load %s\n", path) < 0;
 
     in = fopen(PROC_PATH, "r");
     if (!in) {
         fprintf(stderr, "avctl: could not open %s: %s\n"
                          "(is the av module loaded? try: sudo insmod av.ko)\n",
                 PROC_PATH, strerror(errno));
-        fclose(out);
-        unlink(tmp_path);
+        save_abort(out, tmp_path, to_stdout);
         return 1;
     }
     while (fgets(line, sizeof(line), in)) {
@@ -248,8 +299,7 @@ static int do_save(const char *path)
         fprintf(stderr, "avctl: could not open %s: %s\n"
                          "(is the av module loaded? try: sudo insmod av.ko)\n",
                 TRUST_PROC_PATH, strerror(errno));
-        fclose(out);
-        unlink(tmp_path);
+        save_abort(out, tmp_path, to_stdout);
         return 1;
     }
     while (fgets(line, sizeof(line), in)) {
@@ -267,8 +317,7 @@ static int do_save(const char *path)
         fprintf(stderr, "avctl: could not open %s: %s\n"
                          "(is the av module loaded? try: sudo insmod av.ko)\n",
                 PROTECTED_PROC_PATH, strerror(errno));
-        fclose(out);
-        unlink(tmp_path);
+        save_abort(out, tmp_path, to_stdout);
         return 1;
     }
     while (fgets(line, sizeof(line), in)) {
@@ -288,8 +337,7 @@ static int do_save(const char *path)
         fprintf(stderr, "avctl: could not open %s: %s\n"
                          "(is the av module loaded? try: sudo insmod av.ko)\n",
                 POLICY_PROC_PATH, strerror(errno));
-        fclose(out);
-        unlink(tmp_path);
+        save_abort(out, tmp_path, to_stdout);
         return 1;
     }
     if (fgets(line, sizeof(line), in)) {
@@ -301,6 +349,21 @@ static int do_save(const char *path)
             werr |= fprintf(out, "policy %s\n", line) < 0;
     }
     fclose(in);
+
+    if (to_stdout) {
+        if (fflush(out) != 0)
+            werr = 1;
+        if (werr) {
+            fprintf(stderr, "avctl: write error while saving to stdout\n");
+            return 1;
+        }
+        fprintf(stderr,
+                "saved %d signature(s), %d trusted entr%s, %d protected path%s, "
+                "and the daemon-unavailable policy to stdout\n",
+                sig_count, trust_count, trust_count == 1 ? "y" : "ies",
+                protect_count, protect_count == 1 ? "" : "s");
+        return 0;
+    }
 
     if (fclose(out) != 0)
         werr = 1;
@@ -561,6 +624,305 @@ static int do_policy(int argc, char **argv)
     return 0;
 }
 
+/* ------------------------------------------------------------------
+ * avd control socket client - scan/quarantine. See
+ * docs/avd-socket-protocol.md for the wire protocol this speaks.
+ * ------------------------------------------------------------------ */
+
+static const char *control_sock_path(void)
+{
+    const char *p = getenv("AVD_SOCK_PATH");
+    return p ? p : CONTROL_SOCK_PATH_DEFAULT;
+}
+
+/*
+ * Connects to avd's control socket, sends `cmd` followed by a newline,
+ * and reads the whole response into a malloc'd, NUL-terminated buffer
+ * (caller frees it via *out). avd closes the connection after exactly
+ * one response (one command per connection - see
+ * docs/avd-socket-protocol.md), so reading until EOF is how a client
+ * knows the response is complete; no length prefix needed. Returns 0
+ * with *out set on success, -1 (with an error already printed) on any
+ * connection/IO failure.
+ */
+static int control_request(const char *cmd, char **out)
+{
+    struct sockaddr_un addr;
+    char *buf, *grown;
+    size_t cap, len, cmd_len;
+    ssize_t n;
+    char *req;
+    int fd;
+
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        fprintf(stderr, "avctl: socket() failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", control_sock_path());
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr,
+                "avctl: could not connect to avd control socket %s: %s\n"
+                "(is avd running? try: systemctl status avd)\n",
+                control_sock_path(), strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    cmd_len = strlen(cmd);
+    req = malloc(cmd_len + 2);
+    if (!req) {
+        fprintf(stderr, "avctl: out of memory\n");
+        close(fd);
+        return -1;
+    }
+    memcpy(req, cmd, cmd_len);
+    req[cmd_len] = '\n';
+    req[cmd_len + 1] = '\0';
+    n = write(fd, req, cmd_len + 1);
+    free(req);
+    if (n != (ssize_t)(cmd_len + 1)) {
+        fprintf(stderr, "avctl: write to control socket failed: %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    shutdown(fd, SHUT_WR);
+
+    cap = 65536;
+    buf = malloc(cap);
+    if (!buf) {
+        fprintf(stderr, "avctl: out of memory\n");
+        close(fd);
+        return -1;
+    }
+    len = 0;
+    while ((n = read(fd, buf + len, cap - len - 1)) > 0) {
+        len += (size_t)n;
+        if (len >= cap - 1) {
+            cap *= 2;
+            grown = realloc(buf, cap);
+            if (!grown) {
+                fprintf(stderr, "avctl: out of memory\n");
+                free(buf);
+                close(fd);
+                return -1;
+            }
+            buf = grown;
+        }
+    }
+    close(fd);
+
+    if (n < 0) {
+        fprintf(stderr, "avctl: read from control socket failed: %s\n", strerror(errno));
+        free(buf);
+        return -1;
+    }
+
+    buf[len] = '\0';
+    *out = buf;
+    return 0;
+}
+
+/*
+ * Splits *cursor at the next '\n' (mutating the buffer in place, same
+ * way strtok() would - fine here since `resp` is a private, one-shot
+ * heap buffer nothing else reads), returning the line just consumed
+ * and advancing *cursor past it. Returns NULL once *cursor is empty.
+ */
+static char *next_line(char **cursor)
+{
+    char *start = *cursor;
+    char *nl;
+
+    if (!start || !*start)
+        return NULL;
+
+    nl = strchr(start, '\n');
+    if (nl) {
+        *nl = '\0';
+        *cursor = nl + 1;
+    } else {
+        *cursor = start + strlen(start);
+    }
+    return start;
+}
+
+/*
+ * Consumes and checks the response's first line: "OK" returns 1,
+ * leaving *cursor positioned right after it for callers that need
+ * more lines (e.g. do_quarantine_list()'s COUNT/rows). "ERR <msg>"
+ * prints <msg> to stderr and returns 0; anything else is treated as a
+ * protocol error, also reported, also returns 0.
+ */
+static int expect_ok(char **cursor)
+{
+    const char *line = next_line(cursor);
+
+    if (line && !strcmp(line, "OK"))
+        return 1;
+    if (line && !strncmp(line, "ERR ", 4))
+        fprintf(stderr, "avctl: %s\n", line + 4);
+    else
+        fprintf(stderr, "avctl: malformed response from avd control socket\n");
+    return 0;
+}
+
+static int do_scan(const char *path)
+{
+    char cmd[PATH_MAX + 8];
+    char *resp, *cursor;
+    const char *line;
+    int n;
+
+    if (path[0] != '/') {
+        fprintf(stderr, "avctl: scan requires an absolute path\n");
+        return 1;
+    }
+    if (strlen(path) >= PATH_MAX) {
+        fprintf(stderr, "avctl: path too long (max %d bytes)\n", PATH_MAX - 1);
+        return 1;
+    }
+    n = snprintf(cmd, sizeof(cmd), "SCAN %s", path);
+    if (n < 0 || (size_t)n >= sizeof(cmd)) {
+        fprintf(stderr, "avctl: path too long to format\n");
+        return 1;
+    }
+
+    if (control_request(cmd, &resp))
+        return 1;
+
+    cursor = resp;
+    if (!expect_ok(&cursor)) {
+        free(resp);
+        return 1;
+    }
+
+    next_line(&cursor); /* "COUNT 1" - always exactly one row for SCAN */
+    line = next_line(&cursor);
+    if (line) {
+        char verdict[16] = "", rule[128] = "", sha[128] = "";
+        int score = 0;
+
+        sscanf(line, "%15[^\t]\t%127[^\t]\t%d\t%127[^\t\n]", verdict, rule,
+               &score, sha);
+        if (!strcmp(verdict, "MALICIOUS"))
+            printf("MALICIOUS: %s%s%s (score=%d)\nsha256: %s\n", path,
+                   rule[0] ? " - " : "", rule, score, sha);
+        else
+            printf("CLEAN: %s\nsha256: %s\n", path, sha);
+    } else {
+        fprintf(stderr, "avctl: malformed scan response from avd\n");
+        free(resp);
+        return 1;
+    }
+
+    free(resp);
+    return 0;
+}
+
+static int do_quarantine_list(void)
+{
+    char *resp, *cursor;
+    const char *line;
+
+    if (control_request("QUARANTINE LIST", &resp))
+        return 1;
+
+    cursor = resp;
+    if (!expect_ok(&cursor)) {
+        free(resp);
+        return 1;
+    }
+    next_line(&cursor); /* "COUNT n" - row count already implicit in
+                         * how many rows follow before END, no need to
+                         * parse the number out separately here */
+
+    printf("%-40s %-6s %-20s %s\n", "ID", "RULE", "TIMESTAMP", "ORIGINAL PATH");
+    while ((line = next_line(&cursor)) != NULL && strcmp(line, "END")) {
+        char id[256] = "", path[PATH_MAX] = "", rule[128] = "", sha[128] = "";
+        long ts = 0;
+
+        sscanf(line, "%255[^\t]\t%4095[^\t]\t%ld\t%127[^\t]\t%127[^\t\n]", id,
+               path, &ts, rule, sha);
+        (void)sha; /* not shown in the table - avctl quarantine list is a
+                   * human-facing summary; the GUI reads the same
+                   * response and shows the full sha256 itself */
+        printf("%-40s %-6s %-20ld %s\n", id, rule, ts, path);
+    }
+
+    free(resp);
+    return 0;
+}
+
+static int do_quarantine_restore(const char *id)
+{
+    char cmd[300];
+    char *resp, *cursor;
+
+    snprintf(cmd, sizeof(cmd), "QUARANTINE RESTORE %s", id);
+    if (control_request(cmd, &resp))
+        return 1;
+
+    cursor = resp;
+    if (!expect_ok(&cursor)) {
+        free(resp);
+        return 1;
+    }
+    printf("restored: %s\n", id);
+    free(resp);
+    return 0;
+}
+
+static int do_quarantine_delete(const char *id)
+{
+    char cmd[300];
+    char *resp, *cursor;
+
+    snprintf(cmd, sizeof(cmd), "QUARANTINE DELETE %s", id);
+    if (control_request(cmd, &resp))
+        return 1;
+
+    cursor = resp;
+    if (!expect_ok(&cursor)) {
+        free(resp);
+        return 1;
+    }
+    printf("deleted: %s\n", id);
+    free(resp);
+    return 0;
+}
+
+static int do_quarantine(int argc, char **argv)
+{
+    if (argc < 3) {
+        usage(argv[0]);
+        return 1;
+    }
+
+    if (!strcmp(argv[2], "list")) {
+        return do_quarantine_list();
+    } else if (!strcmp(argv[2], "restore")) {
+        if (argc < 4) {
+            usage(argv[0]);
+            return 1;
+        }
+        return do_quarantine_restore(argv[3]);
+    } else if (!strcmp(argv[2], "delete")) {
+        if (argc < 4) {
+            usage(argv[0]);
+            return 1;
+        }
+        return do_quarantine_delete(argv[3]);
+    } else {
+        usage(argv[0]);
+        return 1;
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -588,6 +950,14 @@ int main(int argc, char **argv)
             return 1;
         }
         return do_load(argv[2]);
+    } else if (!strcmp(argv[1], "scan")) {
+        if (argc < 3) {
+            usage(argv[0]);
+            return 1;
+        }
+        return do_scan(argv[2]);
+    } else if (!strcmp(argv[1], "quarantine")) {
+        return do_quarantine(argc, argv);
     } else if (!strcmp(argv[1], "add")) {
         char cmd[256];
 
