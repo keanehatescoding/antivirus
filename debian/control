@@ -1,11 +1,9 @@
-# NOTE: libfuzzy-dev (ssdeep) and libtlsh-dev don't ship a pkg-config
-# file (see userspace/avd/Makefile's comments - confirmed there
-# against the real Debian/Ubuntu package, not assumed), which means
-# they may also lack proper shlibs/symbols metadata for
-# dpkg-shlibdeps to resolve automatically via ${shlibs:Depends} below.
-# If `dh_shlibdeps` errors out ("cannot find dependency information"),
-# add explicit `libfuzzy2, libtlsh1` (or whatever the real runtime
-# package/soname turns out to be) to hyprav's Depends: by hand.
+# Verified on a real Debian 13 (trixie) box via `dpkg-buildpackage -us
+# -uc -b`: dh_shlibdeps resolves ${shlibs:Depends} for libfuzzy-dev
+# (ssdeep) and libtlsh-dev fine despite neither shipping a pkg-config
+# file (they still carry proper shlibs metadata) - computed deps came
+# out as libfuzzy2, libtlsh0, libyara10, libnl-genl-3-200, no manual
+# Depends: needed.
 Source: hyprav
 Section: admin
 Priority: optional
@@ -36,7 +34,14 @@ Description: HyprAV kprobe-based execve/file-event kernel module (DKMS)
 
 Package: hyprav
 Architecture: amd64
-Depends: ${shlibs:Depends}, ${misc:Depends}, policykit-1
+# pkexec, not policykit-1: the latter no longer exists as an
+# installable package on Debian 13/trixie (confirmed - `apt install
+# policykit-1` fails with "Depends: policykit-1 but it is not
+# installable"). pkexec is the actual binary avctl invokes
+# (`pkexec avctl ...`); it split into its own package from the old
+# monolithic policykit-1 and depends on polkitd itself, so this pulls
+# in everything actually needed.
+Depends: ${shlibs:Depends}, ${misc:Depends}, pkexec
 Recommends: hyprav-dkms
 Description: HyprAV userspace scanning daemon and control CLI
  avd is the privileged userspace daemon that the av.ko kernel module
