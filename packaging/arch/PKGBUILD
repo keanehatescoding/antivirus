@@ -22,12 +22,12 @@
 
 pkgbase=hyprav
 pkgname=('hyprav-dkms' 'hyprav' 'hyprav-gui')
-pkgver=0.9.0.r133.g40a17fd
+pkgver=0.9.0.r134.g849b462
 pkgrel=1
 arch=('x86_64')
 url="https://github.com/keanehatescoding/antivirus"
 license=('GPL3')
-makedepends=('git' 'linux-cachyos-headers' 'libnl' 'yara' 'ssdeep' 'tlsh' 'pkgconf')
+makedepends=('git' 'linux-headers' 'libnl' 'yara' 'ssdeep' 'tlsh' 'pkgconf')
 source=("hyprav::git+https://github.com/keanehatescoding/antivirus.git#branch=packaging/distro-packages")
 sha256sums=('SKIP')
 
