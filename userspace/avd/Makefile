@@ -91,8 +91,8 @@ checkdeps:
 		exit 1; \
 	fi
 
-avd: avd.o tlsh_shim.o
-	$(CXX) -o avd avd.o tlsh_shim.o $(LIBNL_LIBS) $(YARA_LIBS) $(FUZZY_LIBS) $(TLSH_LIBS) -lpthread
+avd: avd.o sha256.o tlsh_shim.o
+	$(CXX) -o avd avd.o sha256.o tlsh_shim.o $(LIBNL_LIBS) $(YARA_LIBS) $(FUZZY_LIBS) $(TLSH_LIBS) -lpthread
 
 # avd.c is plain C, built with $(CC) - only tlsh_shim.cpp needs a C++
 # compiler (see tlsh_shim.h for why). The final link above uses $(CXX)
@@ -106,14 +106,21 @@ avd: avd.o tlsh_shim.o
 # run first without making a checkdeps timestamp change trigger a
 # needless rebuild of these objects (checkdeps has no file output to
 # have a timestamp in the first place).
-avd.o: avd.c ../../av/netlink_proto.h tlsh_shim.h | checkdeps
+avd.o: avd.c ../../av/netlink_proto.h sha256.h tlsh_shim.h | checkdeps
 	$(CC) $(CFLAGS) $(LIBNL_CFLAGS) $(YARA_CFLAGS) -c avd.c -o avd.o
+
+# sha256.o needs none of avd's third-party deps (libnl/yara/fuzzy/tlsh)
+# - no "| checkdeps" prerequisite, so `make` in a tree missing those
+# still builds this object on its own (harmless; the final link still
+# needs them regardless).
+sha256.o: sha256.c sha256.h
+	$(CC) $(CFLAGS) -c sha256.c -o sha256.o
 
 tlsh_shim.o: tlsh_shim.cpp tlsh_shim.h | checkdeps
 	$(CXX) $(CXXFLAGS) $(TLSH_CFLAGS) -c tlsh_shim.cpp -o tlsh_shim.o
 
 clean:
-	rm -f avd avd.o tlsh_shim.o
+	rm -f avd avd.o sha256.o tlsh_shim.o
 
 # Installs the binary, the systemd unit, and a default rules/corpus
 # location under SYSCONFDIR - NOT enabled or started automatically

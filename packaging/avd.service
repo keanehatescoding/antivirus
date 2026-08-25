@@ -38,5 +38,16 @@ ExecStart=@BINDIR@/avd @SYSCONFDIR@/rules @SYSCONFDIR@/fuzzy_hashes.txt /var/lib
 Restart=on-failure
 RestartSec=5
 
+# Lets systemd own /run/avd's lifecycle (create it before ExecStart,
+# clean it up on stop) rather than avd creating it itself - avd's
+# control socket (see docs/avd-socket-protocol.md) binds to
+# /run/avd/control.sock by default. avd still creates this directory
+# itself as a fallback for manual/test runs outside systemd (see
+# ensure_parent_dir() in avd.c), so this isn't load-bearing for
+# correctness, just the more idiomatic way to manage it under
+# systemd specifically.
+RuntimeDirectory=avd
+RuntimeDirectoryMode=0755
+
 [Install]
 WantedBy=multi-user.target

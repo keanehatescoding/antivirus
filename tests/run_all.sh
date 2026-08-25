@@ -30,6 +30,12 @@ insmod "$REPO_ROOT/av/av.ko" 2>/dev/null || true
 rmmod av 2>/dev/null || true
 
 echo
+echo "### test_avd_socket.sh (avd control socket / avctl scan+quarantine) ###"
+# Builds+loads/unloads the module and starts/stops avd itself - no
+# reload dance needed here, unlike test_sigtable.sh above.
+"$REPO_ROOT/tests/test_avd_socket.sh" || FAIL=1
+
+echo
 if [ "$FAIL" -ne 0 ]; then
     echo "run_all.sh: one or more test suites FAILED"
     exit 1
