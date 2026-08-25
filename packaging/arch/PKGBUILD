@@ -1,0 +1,109 @@
+# Maintainer: Your Name <you@example.com>
+#
+# Split package: the av.ko kernel module is version-pinned to whatever
+# kernel it's built against, so it ships separately via DKMS
+# (hyprav-dkms) and gets rebuilt automatically on every kernel
+# upgrade. avd/avctl (hyprav) and the GTK4 console (hyprav-gui) are
+# plain userspace and don't need any of that.
+#
+# Tracks the git repo directly (no tagged release covers av-gui yet -
+# see the top-level README). Pin to a specific commit/tag instead by
+# changing the `source` line below to
+# git+https://github.com/keanehatescoding/antivirus.git#tag=vX.Y.Z
+# if you'd rather not build off the moving master branch.
+
+pkgbase=hyprav
+pkgname=('hyprav-dkms' 'hyprav' 'hyprav-gui')
+pkgver=0.9.0.r129.g32d9af8
+pkgrel=1
+arch=('x86_64')
+url="https://github.com/keanehatescoding/antivirus"
+license=('GPL3')
+makedepends=('git' 'linux-headers' 'libnl' 'yara' 'ssdeep' 'tlsh' 'pkgconf')
+source=("hyprav::git+https://github.com/keanehatescoding/antivirus.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd hyprav
+  git describe --long --tags | sed 's/^v//; s/-/.r/; s/-/./'
+}
+
+build() {
+  cd hyprav
+
+  # Compile-sanity check against the builder's own kernel headers only
+  # - this build output is NOT what gets installed. hyprav-dkms ships
+  # the module *source*; dkms compiles it fresh against every kernel
+  # it's actually installed under (see package_hyprav-dkms below).
+  make -C av
+
+  make -C userspace/avd
+  make -C userspace/avctl
+}
+
+package_hyprav-dkms() {
+  pkgdesc="HyprAV kprobe-based execve/file-event kernel module (DKMS source package)"
+  depends=('dkms')
+  install=hyprav-dkms.install
+
+  local _dkmsdir="$pkgdir/usr/src/hyprav-av-$pkgver"
+  install -dm755 "$_dkmsdir"
+  cp -r hyprav/av/* "$_dkmsdir/"
+  # Drop the compile-sanity build() left behind - dkms needs a clean
+  # source tree, it builds its own .o/.ko under /var/lib/dkms/.
+  rm -f "$_dkmsdir"/*.o "$_dkmsdir"/*.ko "$_dkmsdir"/.*.cmd \
+        "$_dkmsdir"/Module.symvers "$_dkmsdir"/modules.order
+  rm -rf "$_dkmsdir"/.tmp_versions
+
+  # KDIR is passed explicitly because dkms builds against a target
+  # kernel that may not be the currently *running* one (e.g. mid
+  # kernel-upgrade transaction, pre-reboot) - av/Makefile's own
+  # `KDIR ?= /lib/modules/$(shell uname -r)/build` default would
+  # silently build against the wrong kernel in that case. dkms sets
+  # $kernel_source_dir/$kernelver as shell vars before evaluating
+  # these MAKE[]/CLEAN lines.
+  cat > "$_dkmsdir/dkms.conf" <<EOF
+PACKAGE_NAME="hyprav-av"
+PACKAGE_VERSION="$pkgver"
+BUILT_MODULE_NAME[0]="av"
+DEST_MODULE_LOCATION[0]="/kernel/drivers/misc"
+AUTOINSTALL="yes"
+MAKE[0]="make KDIR=\${kernel_source_dir}"
+CLEAN="make KDIR=\${kernel_source_dir} clean"
+EOF
+
+  install -Dm644 hyprav/LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
+
+package_hyprav() {
+  pkgdesc="HyprAV userspace scanning daemon (avd) and control CLI (avctl) - YARA/entropy/fuzzy-hash detection, quarantine"
+  depends=('libnl' 'yara' 'ssdeep' 'tlsh' 'polkit' 'systemd')
+  optdepends=('hyprav-dkms: kernel-level execve/file interception; avd refuses to start without av.ko loaded')
+  backup=('etc/hyprav/rules/heuristics.yar'
+          'etc/hyprav/rules/elf_analysis.yar'
+          'etc/hyprav/rules/entropy.yar'
+          'etc/hyprav/rules/test.yar'
+          'etc/hyprav/fuzzy_hashes.txt'
+          'etc/hyprav/tlsh_hashes.txt')
+
+  cd hyprav
+  make -C userspace/avd install DESTDIR="$pkgdir" PREFIX=/usr
+  make -C userspace/avctl install DESTDIR="$pkgdir" PREFIX=/usr
+
+  # avd.service's ExecStart points here (see packaging/avd.service) -
+  # RuntimeDirectory= covers /run/avd, but this quarantine store under
+  # /var needs to exist ahead of the first detection.
+  install -dm755 "$pkgdir/var/lib/av-quarantine"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
+
+package_hyprav-gui() {
+  pkgdesc="GTK4 management console for HyprAV (dashboard, detections, quarantine, signatures/trust/policy)"
+  depends=('python-gobject' 'gtk4' 'hyprav')
+
+  cd hyprav/userspace/av-gui
+  make install DESTDIR="$pkgdir" PREFIX=/usr
+
+  install -Dm644 ../../LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

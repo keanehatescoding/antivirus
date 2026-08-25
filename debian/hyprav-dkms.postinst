@@ -1,0 +1,25 @@
+#!/bin/sh
+# Same dkms add/build/install dance as packaging/arch/hyprav-dkms.install
+# (manual maintainer-script version, not dh_dkms - see debian/rules).
+#
+# The version isn't hardcoded here - maintainer scripts are static
+# files, not templated by debhelper, so it's derived at runtime from
+# the /usr/src/hyprav-av-<version>/ directory debian/rules created
+# (named after DEB_VERSION_UPSTREAM at build time).
+set -e
+
+DKMS_DIR=$(ls -d /usr/src/hyprav-av-*/ 2>/dev/null | head -n1)
+DKMS_VER=$(basename "$DKMS_DIR" | sed 's/^hyprav-av-//')
+
+case "$1" in
+    configure)
+        if [ -n "$DKMS_VER" ]; then
+            dkms add -m hyprav-av -v "$DKMS_VER" || true
+            dkms autoinstall -m hyprav-av -v "$DKMS_VER" || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

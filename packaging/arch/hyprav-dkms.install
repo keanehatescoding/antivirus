@@ -1,0 +1,19 @@
+# Standard dkms add/build/install-on-(un)install dance, same pattern
+# used by most -dkms packages on the AUR (r8168-dkms, acpi_call-dkms,
+# etc). $1/$2 here are pacman's install-script args: new pkgver on
+# post_install/post_upgrade, old pkgver as $2 on post_upgrade, pkgver
+# being removed on pre_remove.
+
+post_install() {
+    dkms add -m hyprav-av -v "$1"
+    dkms autoinstall -m hyprav-av -v "$1" || true
+}
+
+post_upgrade() {
+    pre_remove "$2"
+    post_install "$1"
+}
+
+pre_remove() {
+    dkms remove -m hyprav-av -v "$1" --all || true
+}

@@ -1,0 +1,64 @@
+# NOTE: libfuzzy-dev (ssdeep) and libtlsh-dev don't ship a pkg-config
+# file (see userspace/avd/Makefile's comments - confirmed there
+# against the real Debian/Ubuntu package, not assumed), which means
+# they may also lack proper shlibs/symbols metadata for
+# dpkg-shlibdeps to resolve automatically via ${shlibs:Depends} below.
+# If `dh_shlibdeps` errors out ("cannot find dependency information"),
+# add explicit `libfuzzy2, libtlsh1` (or whatever the real runtime
+# package/soname turns out to be) to hyprav's Depends: by hand.
+Source: hyprav
+Section: admin
+Priority: optional
+Maintainer: Your Name <you@example.com>
+Build-Depends: debhelper-compat (= 13),
+               pkg-config,
+               libnl-genl-3-dev,
+               libyara-dev,
+               libfuzzy-dev,
+               libtlsh-dev,
+               python3
+Standards-Version: 4.6.2
+Homepage: https://github.com/keanehatescoding/antivirus
+Rules-Requires-Root: no
+
+Package: hyprav-dkms
+Architecture: amd64
+Depends: dkms, ${misc:Depends}
+Description: HyprAV kprobe-based execve/file-event kernel module (DKMS)
+ Out-of-tree kernel module (av.ko) that hooks execve and file events via
+ kprobes, does fast hash/counter checks in-kernel, and talks to the avd
+ userspace daemon over netlink for anything heavier (YARA, entropy,
+ fuzzy hashing). Ships as DKMS source and is rebuilt automatically
+ against every installed kernel.
+ .
+ x86_64 only as shipped - the module hooks __x64_sys_execve by symbol
+ name; arm64 needs source changes to hook __arm64_sys_execve instead.
+
+Package: hyprav
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}, policykit-1
+Recommends: hyprav-dkms
+Description: HyprAV userspace scanning daemon and control CLI
+ avd is the privileged userspace daemon that the av.ko kernel module
+ defers heavyweight checks to: YARA matching, ELF structural analysis,
+ entropy scoring, ssdeep/TLSH fuzzy hashing, and quarantine
+ (move + chmod 0000) of anything avd itself flags. avctl is the CLI
+ (and polkit-gated privileged entry point) for managing avd's
+ signatures, trust list, protected paths, policy, on-demand scans, and
+ quarantine.
+ .
+ avd fails fast and keeps retrying if av.ko (from hyprav-dkms) isn't
+ loaded yet - install that package too for the kernel-level
+ execve/file interception this project is built around.
+
+Package: hyprav-gui
+Architecture: all
+Depends: ${misc:Depends}, python3, python3-gi, gir1.2-gtk-4.0, hyprav (= ${binary:Version})
+Description: GTK4 management console for HyprAV
+ Dashboard (avd status + counts), detections (recent verdict history),
+ quarantine (list/restore/delete), an on-demand scan page, and
+ signatures/trust list/protected paths/policy management, sitting on
+ top of avd and avctl. A normal desktop app, not a daemon - nothing to
+ enable or start, just launch it. Privileged actions go through
+ pkexec avctl, gated by the org.hyprav.avctl.manage polkit action
+ installed by the hyprav package.
