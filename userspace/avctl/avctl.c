@@ -700,7 +700,21 @@ static int control_request(const char *cmd, char **out)
         return -1;
     }
     len = 0;
-    while ((n = read(fd, buf + len, cap - len - 1)) > 0) {
+    for (;;) {
+        n = read(fd, buf + len, cap - len - 1);
+        if (n < 0) {
+            /* A signal arriving mid-read makes read() return -1/EINTR
+             * even though the connection is fine and more of the
+             * response may still be coming - retry rather than
+             * treating an interrupted call as a real failure (same
+             * EINTR handling as write_all()/read_line() on avd's side
+             * of this same protocol). */
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (n == 0)
+            break;
         len += (size_t)n;
         if (len >= cap - 1) {
             cap *= 2;
@@ -844,10 +858,24 @@ static int do_quarantine_list(void)
     printf("%-40s %-6s %-20s %s\n", "ID", "RULE", "TIMESTAMP", "ORIGINAL PATH");
     while ((line = next_line(&cursor)) != NULL && strcmp(line, "END")) {
         char id[256] = "", path[PATH_MAX] = "", rule[128] = "", sha[128] = "";
+        /* Path field width built from sizeof(path) - 1, not a
+         * hardcoded 4095 - scanf field widths can't take a runtime
+         * '*' argument the way printf precision can, so the format
+         * string itself is built at runtime instead. This keeps the
+         * width tied to the actual buffer size even if PATH_MAX (or
+         * this array) ever changes, rather than a magic number that
+         * could silently drift out of sync with it. */
+        char fmt[64];
         long ts = 0;
+        int fmt_len;
 
-        sscanf(line, "%255[^\t]\t%4095[^\t]\t%ld\t%127[^\t]\t%127[^\t\n]", id,
-               path, &ts, rule, sha);
+        fmt_len = snprintf(fmt, sizeof(fmt),
+                            "%%255[^\t]\t%%%zu[^\t]\t%%ld\t%%127[^\t]\t%%127[^\t\n]",
+                            sizeof(path) - 1);
+        if (fmt_len < 0 || (size_t)fmt_len >= sizeof(fmt))
+            continue; /* shouldn't happen - fmt is generously sized */
+
+        sscanf(line, fmt, id, path, &ts, rule, sha);
         (void)sha; /* not shown in the table - avctl quarantine list is a
                    * human-facing summary; the GUI reads the same
                    * response and shows the full sha256 itself */
@@ -862,8 +890,18 @@ static int do_quarantine_restore(const char *id)
 {
     char cmd[300];
     char *resp, *cursor;
+    int n;
 
-    snprintf(cmd, sizeof(cmd), "QUARANTINE RESTORE %s", id);
+    /* Reject up front rather than letting snprintf() silently
+     * truncate: a truncated id would ask avd to restore a DIFFERENT
+     * (shorter, likely nonexistent) quarantine entry than the one
+     * named on the command line, with no error either side - same
+     * reasoning as do_protect()'s identical up-front length check. */
+    n = snprintf(cmd, sizeof(cmd), "QUARANTINE RESTORE %s", id);
+    if (n < 0 || (size_t)n >= sizeof(cmd)) {
+        fprintf(stderr, "avctl: quarantine id too long\n");
+        return 1;
+    }
     if (control_request(cmd, &resp))
         return 1;
 
@@ -881,8 +919,15 @@ static int do_quarantine_delete(const char *id)
 {
     char cmd[300];
     char *resp, *cursor;
+    int n;
 
-    snprintf(cmd, sizeof(cmd), "QUARANTINE DELETE %s", id);
+    /* See do_quarantine_restore()'s identical check for why this
+     * rejects rather than lets snprintf() silently truncate. */
+    n = snprintf(cmd, sizeof(cmd), "QUARANTINE DELETE %s", id);
+    if (n < 0 || (size_t)n >= sizeof(cmd)) {
+        fprintf(stderr, "avctl: quarantine id too long\n");
+        return 1;
+    }
     if (control_request(cmd, &resp))
         return 1;
 
