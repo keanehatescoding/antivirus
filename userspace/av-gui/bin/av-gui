@@ -1,0 +1,23 @@
+#!/bin/sh
+#
+# av-gui launcher - sets PYTHONPATH to wherever the av_gui package
+# actually lives and execs the module.
+#
+# @LIBDIR@ is a template placeholder (same convention as
+# packaging/avd.service's @BINDIR@/@SYSCONFDIR@ and
+# packaging/org.hyprav.avctl.policy's @BINDIR@), rendered by this
+# directory's Makefile install target via sed - this file as checked
+# in is a template, not something a shell can run directly once
+# installed.
+#
+# Also works UNINSTALLED, run straight from a git checkout
+# (./bin/av-gui) - if the placeholder was never substituted, fall back
+# to resolving av_gui/ relative to this script's own location, same as
+# every other component in this repo being buildable/runnable in place
+# without `make install` first (see the top-level README).
+LIBDIR="@LIBDIR@"
+if [ "$LIBDIR" = "@LIBDIR@" ]; then
+    LIBDIR="$(cd "$(dirname "$0")/.." && pwd)"
+fi
+
+PYTHONPATH="$LIBDIR${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m av_gui.app "$@"

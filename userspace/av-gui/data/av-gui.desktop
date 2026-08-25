@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=HyprAV
+Comment=Manage HyprAV signatures, trust list, protected paths, detections, and quarantine
+Exec=@BINDIR@/av-gui
+Icon=security-high-symbolic
+Terminal=false
+Categories=System;Security;
