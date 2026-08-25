@@ -38,9 +38,21 @@ build() {
   #
   # av/Makefile's own CC=clang/LLVM=1 support (see its comments) is
   # for matching a Clang-built kernel (e.g. some CachyOS variants) -
-  # inherit whatever the caller passed for CC/CXX/LLVM here.
+  # inherit whatever the caller passed for CC/CXX/LLVM here. Cleaned
+  # first for the same stale-object reason as userspace below, in
+  # case an earlier retry used a different CC/LLVM combination.
+  make -C av clean
   make -C av
 
+  # `make clean` first, unconditionally: makepkg reuses $srcdir across
+  # retries of a failed build rather than wiping it (that only happens
+  # with --cleanbuild), so a .o left over from a build that used a
+  # different CC/CXX can otherwise survive - Make only checks
+  # timestamps, not which compiler produced a file, and will happily
+  # skip recompiling a stale object and hand it straight to the
+  # linker. Hit exactly this: a clang-compiled avd.o from a prior
+  # attempt outlived the CC=gcc fix below and broke the link anyway.
+  #
   # userspace/avd and userspace/avctl have no kernel-ABI dependency
   # and don't need to match the running kernel's compiler at all -
   # pin plain gcc/g++ explicitly rather than letting a CC=clang meant
@@ -49,7 +61,9 @@ build() {
   # avd.o (LLVM bitcode) with a g++-compiled tlsh_shim.o (GCC bitcode)
   # at link time fails ("file not recognized") since the two
   # compilers' LTO object formats aren't interchangeable.
+  make -C userspace/avd clean
   make -C userspace/avd CC=gcc CXX=g++
+  make -C userspace/avctl clean
   make -C userspace/avctl CC=gcc
 }
 
