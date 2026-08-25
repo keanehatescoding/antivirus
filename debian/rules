@@ -48,6 +48,16 @@ override_dh_auto_install:
 	$(MAKE) -C userspace/av-gui install \
 		DESTDIR=$(CURDIR)/debian/hyprav-gui PREFIX=/usr
 
+# dh_fixperms (standard part of the dh sequence) normalizes every
+# shipped directory back toward 0755 regardless of what
+# override_dh_auto_install set - confirmed on a real Debian 13 box:
+# the built .deb still recorded av-quarantine as drwxr-xr-x despite
+# the install -dm700 above. Re-apply 0700 after the normal fixperms
+# pass runs rather than fighting it earlier in the sequence.
+override_dh_fixperms:
+	dh_fixperms
+	chmod 0700 debian/hyprav/var/lib/av-quarantine
+
 # hyprav's own install intentionally doesn't enable/start avd.service -
 # it scans and quarantines files system-wide as root, unsandboxed (see
 # packaging/avd.service's comments and the top-level README); a fresh
