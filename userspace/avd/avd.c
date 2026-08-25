@@ -86,6 +86,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <time.h>
@@ -128,6 +129,19 @@
  * av_policy's maxlen fields below: nothing legitimate needs more than
  * this, so reject rather than silently truncate. */
 #define AVD_SOCK_LINE_MAX (PATH_MAX + 256)
+/* Caps how many control-socket connections avd will service at once -
+ * the socket is 0666 (see start_control_socket()'s comment), so
+ * without this any local user could open connections without limit,
+ * each spawning its own detached thread, and exhaust the daemon's
+ * threads/fds. Deliberately generous relative to real concurrent
+ * avctl/GUI usage (a handful at most) rather than tightly tuned. */
+#define AVD_CONTROL_MAX_CONNS 32
+/* Bounds how long a single control connection may sit idle waiting for
+ * its request line - without this, a client that connects and never
+ * sends a newline (or a slow/hostile one trickling bytes) would block
+ * that connection's thread, and therefore one of AVD_CONTROL_MAX_CONNS
+ * slots, indefinitely. */
+#define AVD_CONTROL_RECV_TIMEOUT_SECS 5
 /* Bounded, in-memory, ring-buffered verdict history for the control
  * socket's VERDICTS command - deliberately NOT persisted to disk (lost
  * on daemon restart). This is an explicit, documented limitation, not
@@ -1902,6 +1916,7 @@ static void cmd_quarantine_delete(int fd, const char *id) {
 static void cmd_scan(int fd, const char *path) {
   struct scan_result result;
   char row[PATH_MAX + 256];
+  struct stat st;
   int sfd;
 
   if (path[0] != '/') {
@@ -1909,9 +1924,35 @@ static void cmd_scan(int fd, const char *path) {
     return;
   }
 
-  sfd = open(path, O_RDONLY);
+  /* O_NONBLOCK: without it, opening a FIFO for read-only blocks this
+   * connection's own thread until a writer opens the other end -
+   * given AVD_CONTROL_MAX_CONNS bounds those threads (see
+   * control_accept_main()'s comment), a client repeatedly SCANning a
+   * FIFO path could tie up every slot indefinitely. With O_NONBLOCK
+   * the open succeeds immediately regardless, and the fstat()+
+   * S_ISREG() check right below rejects it before perform_scan() ever
+   * touches it - along with every other non-regular-file case
+   * (character/block devices, sockets, directories). */
+  sfd = open(path, O_RDONLY | O_NONBLOCK);
   if (sfd < 0) {
     send_err(fd, "could not open path for scanning");
+    return;
+  }
+
+  if (fstat(sfd, &st) != 0 || !S_ISREG(st.st_mode)) {
+    close(sfd);
+    send_err(fd, "path is not a regular file");
+    return;
+  }
+
+  /* Clear O_NONBLOCK now that the file is known-regular (where the
+   * flag has no real read() effect anyway) - keeps this fd behaving
+   * identically to every other scan path's plain O_RDONLY open from
+   * here on, rather than leaving a flag set for a FIFO/device case
+   * that's already been ruled out. */
+  if (fcntl(sfd, F_SETFL, O_RDONLY) != 0) {
+    close(sfd);
+    send_err(fd, "could not prepare file for scanning");
     return;
   }
 
@@ -1998,13 +2039,36 @@ struct control_conn_ctx {
   int fd;
 };
 
+/* Guards control_conn_count, incremented (with the AVD_CONTROL_MAX_CONNS
+ * check) in control_accept_main() before a connection thread is
+ * spawned, decremented here on every exit from control_conn_main() -
+ * there is exactly one exit point below, so one decrement covers it. */
+static pthread_mutex_t control_conn_count_lock = PTHREAD_MUTEX_INITIALIZER;
+static int control_conn_count;
+
 static void *control_conn_main(void *arg) {
   struct control_conn_ctx *ctx = arg;
   char line[AVD_SOCK_LINE_MAX];
   struct ucred cred;
   socklen_t cred_len = sizeof(cred);
+  struct timeval tv;
   bool is_root = false;
   ssize_t len;
+
+  /* Bounds how long this connection's thread (and therefore its
+   * AVD_CONTROL_MAX_CONNS slot) can be tied up waiting on a client
+   * that connects and then sends nothing - read_line() below already
+   * treats any read() error other than EINTR as failure, so a timeout
+   * (EAGAIN/EWOULDBLOCK once this fires) falls out as the same
+   * "malformed request" response as any other read failure, with no
+   * separate handling needed there. Best-effort: a failure to set
+   * this is logged but doesn't refuse the connection outright - worst
+   * case it behaves like it did before this fix. */
+  tv.tv_sec = AVD_CONTROL_RECV_TIMEOUT_SECS;
+  tv.tv_usec = 0;
+  if (setsockopt(ctx->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0)
+    fprintf(stderr, "avd: could not set control connection timeout: %s\n",
+            strerror(errno));
 
   /* SO_PEERCRED is valid any time on a connected AF_UNIX stream socket
    * (not just immediately post-accept), and returns credentials the
@@ -2018,7 +2082,8 @@ static void *control_conn_main(void *arg) {
 
   len = read_line(ctx->fd, line, sizeof(line));
   if (len < 0)
-    send_err(ctx->fd, "malformed request (missing newline, or line too long)");
+    send_err(ctx->fd,
+             "malformed request (missing newline, line too long, or timed out)");
   else if (len > 0)
     handle_control_line(ctx->fd, line, is_root);
   /* len == 0: peer connected and disconnected without sending
@@ -2026,6 +2091,11 @@ static void *control_conn_main(void *arg) {
 
   close(ctx->fd);
   free(ctx);
+
+  pthread_mutex_lock(&control_conn_count_lock);
+  control_conn_count--;
+  pthread_mutex_unlock(&control_conn_count_lock);
+
   return NULL;
 }
 
@@ -2131,9 +2201,32 @@ static void *control_accept_main(void *arg) {
       continue;
     }
 
+    {
+      bool slot_reserved;
+
+      pthread_mutex_lock(&control_conn_count_lock);
+      slot_reserved = control_conn_count < AVD_CONTROL_MAX_CONNS;
+      if (slot_reserved)
+        control_conn_count++;
+      pthread_mutex_unlock(&control_conn_count_lock);
+
+      if (!slot_reserved) {
+        /* Reject outright rather than queueing - see
+         * AVD_CONTROL_MAX_CONNS's comment. A real client (avctl/GUI)
+         * gets a clear error and can just retry shortly; a client
+         * trying to exhaust connections gets nothing to hold onto. */
+        send_err(cfd, "too many concurrent control connections - try again shortly");
+        close(cfd);
+        continue;
+      }
+    }
+
     ctx = malloc(sizeof(*ctx));
     if (!ctx) {
       close(cfd);
+      pthread_mutex_lock(&control_conn_count_lock);
+      control_conn_count--;
+      pthread_mutex_unlock(&control_conn_count_lock);
       continue;
     }
     ctx->fd = cfd;
@@ -2141,6 +2234,9 @@ static void *control_accept_main(void *arg) {
     if (pthread_create(&tid, NULL, control_conn_main, ctx) != 0) {
       close(cfd);
       free(ctx);
+      pthread_mutex_lock(&control_conn_count_lock);
+      control_conn_count--;
+      pthread_mutex_unlock(&control_conn_count_lock);
       continue;
     }
     pthread_detach(tid);
@@ -2186,6 +2282,20 @@ int main(int argc, char **argv) {
 
   signal(SIGINT, handle_sigint);
   signal(SIGTERM, handle_sigint);
+  /* Without this, any write()/send() into a control-socket connection
+   * whose peer already closed (a killed avctl, the GUI navigating
+   * away mid-request, a network hiccup on a remote mount of the
+   * socket path, etc.) raises SIGPIPE - whose default disposition is
+   * to terminate the WHOLE PROCESS, not just that connection's
+   * thread. Found by testing (a harness closing many client fds while
+   * avd was still mid-response killed the entire daemon, not just
+   * those connections). write_all()/send_err() already treat a
+   * failed write as "give up on this one response" (they check the
+   * return value and just stop, no retry-forever loop), so ignoring
+   * SIGPIPE here is sufficient - write()/send() then simply return -1
+   * with errno EPIPE instead of raising the signal, and existing error
+   * handling takes it from there. */
+  signal(SIGPIPE, SIG_IGN);
 
   if (load_rules(rules_dir) != 0) {
     fprintf(stderr, "avd: failed to initialize YARA - aborting\n");

@@ -39,6 +39,12 @@ loosening `GENL_ADMIN_PERM`, both worse than a purpose-built socket.
   request line, reads the response until the server closes the
   connection (EOF - there is no length prefix), then disconnects.
   There is no session/keepalive concept.
+- At most `AVD_CONTROL_MAX_CONNS` (32) connections open at once - a
+  connection beyond that gets `ERR too many concurrent control
+  connections - try again shortly` and is closed immediately. Each
+  connection also has an `AVD_CONTROL_RECV_TIMEOUT_SECS` (5s) idle
+  timeout on receiving its request line, so a client that connects and
+  never sends anything can't hold a slot open indefinitely.
 
 ## Wire format
 
@@ -137,13 +143,16 @@ it gets there.
   absolute path is exactly what `SCAN` is *for* (scan any file the
   daemon's own privileges can read), so there's nothing to restrict
   there beyond the existing root-only gate.
-- **No rate limiting.** A root-authenticated client issuing many
-  `SCAN` requests back-to-back shares the same bounded scan queue and
-  worker pool as kernel-triggered scans (`AVD_SCAN_QUEUE_MAX`,
-  `AVD_SCAN_THREADS`) - see `docs/netlink-protocol.md`'s own
-  known-limitations section for the equivalent kernel-side queue
-  behavior. Not a new exposure class, just worth knowing the two scan
-  sources aren't prioritized against each other.
+- **`SCAN` is not rate-limited and does not share the kernel-triggered
+  scan queue.** Unlike `AV_C_SCAN_REQUEST` (which goes through the
+  bounded `AVD_SCAN_QUEUE_MAX`/`AVD_SCAN_THREADS` worker pool - see
+  `docs/netlink-protocol.md`), a control-socket `SCAN` command calls
+  `perform_scan()` directly on that connection's own thread. Bounded
+  only by `AVD_CONTROL_MAX_CONNS` (how many control connections can be
+  open at once) and each connection's `AVD_CONTROL_RECV_TIMEOUT_SECS`
+  idle timeout, not by anything specific to scanning - a root-
+  authenticated client issuing many `SCAN` requests can run that many
+  scans concurrently, uncoordinated with kernel-triggered scans.
 - **`avd` must already be registered with the kernel module for the
   control socket to exist at all** - `main()` in `avd.c` still exits
   before starting the control socket if `genl_connect()`/
