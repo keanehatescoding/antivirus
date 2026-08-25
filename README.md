@@ -160,10 +160,6 @@ userspace/
                         `pkexec`, async
     av_gui/pages/         - one module per page
     Makefile
-experiments/          - throwaway learning modules, not tagged/released
-  hello/              - minimal LKM: module_init/module_exit, dmesg logging
-  procfs_demo/        - /proc entry you can read/write from userspace
-  kprobe_log/         - kprobe on execve that just logs filenames (no blocking)
 tests/
   test_sha256.sh       - FIPS 180-4 known-answer tests for
                         userspace/avd/sha256.c - no kernel module or
@@ -230,7 +226,7 @@ sudo apt install build-essential linux-headers-$(uname -r) git
 ## Building
 
 ```bash
-cd av              # or experiments/hello, experiments/procfs_demo, etc.
+cd av
 make
 sudo insmod av.ko
 dmesg | tail -20
@@ -373,7 +369,7 @@ uses.
 
 ## A note on kernel version / architecture
 
-The kprobe-based modules (`experiments/kprobe_log`, `av/`) hook the syscall
+The kprobe-based `av/` module hooks the syscall
 entry point by symbol name. On x86_64 kernels 5.7+, the actual syscall
 wrapper is named `__x64_sys_execve` and its argument layout differs from
 older kernels (arguments live inside an inner `struct pt_regs`, not
@@ -1416,7 +1412,7 @@ versions (currently 6.12.96 LTS, 6.18.21 LTS, 7.1.4 stable — bump
 these as kernel.org publishes new point releases):
 
 **Tier 1 - `.github/workflows/build-matrix.yml`**: compile-tests
-`av/` (and the `experiments/` modules) against gcc and clang. Catches
+`av/` against gcc and clang. Catches
 API breakage across kernel versions (e.g. the `proc_ops`/
 `file_operations` split, syscall wrapper argument layout changes) -
 exactly the version-fragility risk called out above. Compile-only,
