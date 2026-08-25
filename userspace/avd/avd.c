@@ -1671,16 +1671,43 @@ static void send_err(int fd, const char *msg) {
  * than fast, which is fine here: control-socket commands are rare
  * relative to the actual scan path and never more than
  * AVD_SOCK_LINE_MAX bytes. Returns the line length on success, 0 on a
- * clean EOF before any data, -1 on a read error or on exceeding
- * `bufsz` without finding a newline (a line this long can only be a
- * malformed/hostile client - see AVD_SOCK_LINE_MAX's comment).
+ * clean EOF before any data, -1 on a read error, a timeout, or on
+ * exceeding `bufsz` without finding a newline (a line this long can
+ * only be a malformed/hostile client - see AVD_SOCK_LINE_MAX's
+ * comment).
+ *
+ * Enforces its own ABSOLUTE deadline (AVD_CONTROL_RECV_TIMEOUT_SECS
+ * from the first call), on top of whatever SO_RCVTIMEO the caller may
+ * have set on `fd` - SO_RCVTIMEO alone only bounds each individual
+ * read() call, so a client trickling one byte just under that
+ * interval at a time would never trip any single call's timeout and
+ * could hold a connection (and its AVD_CONTROL_MAX_CONNS slot) open
+ * for up to AVD_SOCK_LINE_MAX reads' worth of that interval -
+ * effectively unbounded in practice. This function has exactly one
+ * caller (control_conn_main()), so hardcoding the same constant here
+ * rather than threading a deadline parameter through is the simpler
+ * choice for now.
  */
 static ssize_t read_line(int fd, char *buf, size_t bufsz) {
   size_t len = 0;
+  struct timespec deadline;
+
+  clock_gettime(CLOCK_MONOTONIC, &deadline);
+  deadline.tv_sec += AVD_CONTROL_RECV_TIMEOUT_SECS;
 
   while (len + 1 < bufsz) {
+    struct timespec now;
     char c;
-    ssize_t n = read(fd, &c, 1);
+    ssize_t n;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (now.tv_sec > deadline.tv_sec ||
+        (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
+      errno = ETIMEDOUT;
+      return -1;
+    }
+
+    n = read(fd, &c, 1);
 
     if (n < 0) {
       if (errno == EINTR)
@@ -1852,41 +1879,72 @@ static void cmd_quarantine_restore(int fd, const char *id) {
     return;
   }
 
-  if (lstat(dest, &st) != 0) {
-    send_err(fd, "quarantined file not found");
-    return;
-  }
+  /* Opened once, here, by path only this one time - every step below
+   * that can act through this fd instead (fchmod/fchown, not
+   * chmod/chown by path) does, precisely so that once meta.original_path
+   * becomes reachable (the rename() below), the file already has its
+   * final mode/owner and there is no later path-based operation left
+   * for anything to race against it. */
+  {
+    int qfd = open(dest, O_RDONLY);
 
-  /* No clobbering - if something already occupies the original path,
-   * refuse rather than guess. Documented, narrow limitation: extend
-   * later with an explicit alternate-destination argument if this
-   * turns out to matter in practice. */
-  if (lstat(meta.original_path, &st) == 0) {
-    send_err(fd, "original path is occupied - move or remove it first");
-    return;
-  }
+    if (qfd < 0) {
+      send_err(fd, "quarantined file not found");
+      return;
+    }
 
-  if (chmod(dest, meta.original_mode) != 0) {
-    send_err(fd, "chmod failed");
-    return;
-  }
+    if (fstat(qfd, &st) != 0 || !S_ISREG(st.st_mode)) {
+      close(qfd);
+      send_err(fd, "quarantined file is not a regular file - refusing to restore");
+      return;
+    }
 
-  if (rename(dest, meta.original_path) != 0) {
-    /* Leave it chmod'd back to its original mode but still under
-     * quarantine_dir rather than deleting the .meta - the operator can
-     * still recover it manually (e.g. the two directories are on
-     * different filesystems), and losing the recovery record here
-     * would be strictly worse than a restore that has to be retried. */
-    send_err(fd, "rename failed (different filesystem? check "
-                "/var/lib/av-quarantine manually)");
-    return;
-  }
+    /* No clobbering - if something already occupies the original path,
+     * refuse rather than guess. Documented, narrow limitation: extend
+     * later with an explicit alternate-destination argument if this
+     * turns out to matter in practice. */
+    if (lstat(meta.original_path, &st) == 0) {
+      close(qfd);
+      send_err(fd, "original path is occupied - move or remove it first");
+      return;
+    }
 
-  if (chown(meta.original_path, meta.original_uid, meta.original_gid) != 0)
-    fprintf(stderr,
-            "avd: quarantine restore: chown of \"%s\" failed: %s (file "
-            "restored under avd's own uid/gid instead)\n",
-            meta.original_path, strerror(errno));
+    if (fchmod(qfd, meta.original_mode) != 0) {
+      close(qfd);
+      send_err(fd, "chmod failed");
+      return;
+    }
+
+    /* fchown() on the already-open fd, NOT chown(meta.original_path,
+     * ...) after rename() - a path-based chown() done AFTER the file
+     * is reachable at meta.original_path has a TOCTOU: anything with
+     * write access to that path's parent directory could swap in a
+     * symlink between the rename() succeeding and the chown() call,
+     * and chown() follows symlinks - letting that attacker redirect a
+     * root-run chown() to an arbitrary target of their choosing.
+     * fchown() on this fd is immune: it always acts on the exact
+     * inode opened above, and happens before the file is reachable at
+     * meta.original_path at all, so there is nothing left to swap. */
+    if (fchown(qfd, meta.original_uid, meta.original_gid) != 0)
+      fprintf(stderr,
+              "avd: quarantine restore: fchown of \"%s\" failed: %s (file "
+              "will be restored under avd's own uid/gid instead)\n",
+              dest, strerror(errno));
+
+    if (rename(dest, meta.original_path) != 0) {
+      /* Leave it chmod'd/chown'd back to original but still under
+       * quarantine_dir rather than deleting the .meta - the operator
+       * can still recover it manually (e.g. the two directories are
+       * on different filesystems), and losing the recovery record
+       * here would be strictly worse than a restore that has to be
+       * retried. */
+      close(qfd);
+      send_err(fd, "rename failed (different filesystem? check "
+                  "/var/lib/av-quarantine manually)");
+      return;
+    }
+    close(qfd);
+  }
 
   unlink(meta_path);
   printf("avd: RESTORED \"%s\" -> \"%s\"\n", dest, meta.original_path);
@@ -2056,18 +2114,32 @@ static void *control_conn_main(void *arg) {
   ssize_t len;
 
   /* Bounds how long this connection's thread (and therefore its
-   * AVD_CONTROL_MAX_CONNS slot) can be tied up waiting on a client
-   * that connects and then sends nothing - read_line() below already
-   * treats any read() error other than EINTR as failure, so a timeout
+   * AVD_CONTROL_MAX_CONNS slot) can be tied up on a single blocking
+   * read()/write() call - read_line() below already treats any
+   * read() error other than EINTR as failure, so a timeout
    * (EAGAIN/EWOULDBLOCK once this fires) falls out as the same
    * "malformed request" response as any other read failure, with no
-   * separate handling needed there. Best-effort: a failure to set
-   * this is logged but doesn't refuse the connection outright - worst
-   * case it behaves like it did before this fix. */
+   * separate handling needed there; write_all() (used by every cmd_*
+   * response below) already does the same for write() errors. This
+   * alone is NOT sufficient against a client trickling one byte just
+   * under this interval at a time (SO_RCVTIMEO only bounds each
+   * individual call, not the cumulative time to read a whole line) -
+   * read_line() additionally enforces its own absolute deadline for
+   * exactly that reason; SO_RCVTIMEO stays as a second layer under
+   * it. SO_SNDTIMEO has no such second layer today, but write_all()
+   * only ever sends a bounded, small response (a handful of KB at
+   * most for e.g. VERDICTS RECENT), so a client that stops reading
+   * mid-response is the only way to hit it, not a slow-trickle
+   * variant of the same problem. Best-effort: a failure to set either
+   * is logged but doesn't refuse the connection outright - worst case
+   * it behaves like it did before this fix. */
   tv.tv_sec = AVD_CONTROL_RECV_TIMEOUT_SECS;
   tv.tv_usec = 0;
   if (setsockopt(ctx->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0)
-    fprintf(stderr, "avd: could not set control connection timeout: %s\n",
+    fprintf(stderr, "avd: could not set control connection receive timeout: %s\n",
+            strerror(errno));
+  if (setsockopt(ctx->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0)
+    fprintf(stderr, "avd: could not set control connection send timeout: %s\n",
             strerror(errno));
 
   /* SO_PEERCRED is valid any time on a connected AF_UNIX stream socket
