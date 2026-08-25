@@ -1,0 +1,165 @@
+# avd Control Socket Protocol (Unix Domain Socket)
+
+Management channel between `avd` and its clients (`avctl`, and the
+planned GTK4 GUI) - status, recent verdict history, quarantine
+list/restore/delete, and on-demand scanning. Separate from the
+kernel↔daemon Generic Netlink channel described in
+[`netlink-protocol.md`](netlink-protocol.md): that channel is
+kernel-initiated only, requires `CAP_NET_ADMIN`, and supports exactly
+one registered daemon - none of which fits an interactive management
+client. See `userspace/avd/avd.c`'s control-socket section for the
+implementation and `userspace/avctl/avctl.c`'s `control_request()` for
+the reference client.
+
+## Why a second channel instead of extending netlink
+
+Netlink's `AV_C_*` commands exist to let the *kernel* ask *avd* to
+analyze a file it just intercepted, correlated by a kernel-generated
+`REQID` - fundamentally kernel-initiated request/response. A
+management client asking "what got quarantined recently?" or "scan
+this file right now" is the opposite direction and has no kernel
+involvement at all; forcing it through the netlink family would mean
+either a second daemon "registering" (the kernel only tracks one
+`daemon_portid` - see `netlink-protocol.md`'s known limitations) or
+loosening `GENL_ADMIN_PERM`, both worse than a purpose-built socket.
+
+## Transport
+
+- `AF_UNIX`, `SOCK_STREAM`, path `/run/avd/control.sock` by default
+  (systemd's `RuntimeDirectory=avd` in `packaging/avd.service` owns
+  `/run/avd`'s lifecycle; `avd` also creates the directory itself as a
+  fallback for manual/test runs - see `ensure_parent_dir()` in
+  `avd.c`). Override with the `AVD_SOCK_PATH` environment variable
+  (both `avd` and `avctl` read it) or, for `avd`, the 5th positional
+  argument.
+- `avd` `chmod`s the socket file `0666` after `bind()` - every client
+  can connect. What a connection is allowed to *do* is gated per
+  command, not per connection (see Authorization below).
+- **One command per connection.** A client connects, sends exactly one
+  request line, reads the response until the server closes the
+  connection (EOF - there is no length prefix), then disconnects.
+  There is no session/keepalive concept.
+- At most `AVD_CONTROL_MAX_CONNS` (32) connections open at once - a
+  connection beyond that gets `ERR too many concurrent control
+  connections - try again shortly` and is closed immediately. Each
+  connection also has an `AVD_CONTROL_RECV_TIMEOUT_SECS` (5s) idle
+  timeout on receiving its request line, so a client that connects and
+  never sends anything can't hold a slot open indefinitely.
+
+## Wire format
+
+Request: one line, `\n`-terminated:
+
+```
+VERB [ARG ...]\n
+```
+
+Bounded by `AVD_SOCK_LINE_MAX` (`PATH_MAX + 256`) in `avd.c` - a
+request that doesn't fit, or never sends a newline, is rejected as
+malformed rather than silently truncated.
+
+Response, always starting with one of:
+
+```
+OK\n
+```
+```
+ERR <message>\n
+```
+
+`OK` responses that carry data continue with a row count and the rows
+themselves, terminated by `END` - deliberately explicit on both ends
+(`COUNT`, then `END`) rather than trusting the count alone, so a
+client that mis-parses one row can still resynchronize by scanning
+for `END`:
+
+```
+OK\n
+COUNT <n>\n
+<row 1>\n
+...
+<row n>\n
+END\n
+```
+
+Row fields are **tab-separated**. Known limitation, same class as
+`avctl save`/`load`'s documented one (see `do_save()` in `avctl.c`):
+a field value containing a literal tab or newline (a path or rule name
+could, in principle, on Linux) will misparse. Not addressed here for
+the same reason it wasn't addressed there - narrow, real-world-rare,
+and would need a heavier framing format to fully close.
+
+## Commands
+
+| Command | Auth | Response |
+|---|---|---|
+| `STATUS` | any | 1 row: `uptime_secs\trules_loaded(0/1)\tfuzzy_corpus_count\ttlsh_corpus_count\tscan_queue_len\tscan_threads` |
+| `VERDICTS RECENT <n>` | any | up to `n` most-recent rows (newest first): `id\ttimestamp\tpid\tpath\tsha256\tverdict(CLEAN/MALICIOUS)\trule_name\tscore\ton_demand(0/1)` |
+| `QUARANTINE LIST` | any | one row per quarantined file: `id\toriginal_path\ttimestamp\trule_name\tsha256` |
+| `SCAN <absolute-path>` | **root** | 1 row: `verdict(CLEAN/MALICIOUS)\trule_name\tscore\tsha256` |
+| `QUARANTINE RESTORE <id>` | **root** | `OK` only, no rows |
+| `QUARANTINE DELETE <id>` | **root** | `OK` only, no rows |
+
+`<id>` is a quarantined file's basename with the `.quarantined` suffix
+stripped (exactly what `QUARANTINE LIST` returns in its first field) -
+not a path, must not contain `/`.
+
+## Authorization
+
+Gated **per command, not per connection** - matches this codebase's
+existing precedent of world-readable `/proc` state (e.g.
+`/proc/kernel_av_signatures` is `0644`) with writes checked
+separately, rather than two sockets with two different modes. Right
+after `accept()`, `avd` reads the connecting process's credentials via
+`SO_PEERCRED` (kernel-populated at `connect()` time from the actual
+peer process - not attacker-writable, same trust boundary as
+`nlmsg_get_src()` in `msg_handler()` on the netlink side). `STATUS`,
+`VERDICTS`, and `QUARANTINE LIST` answer any peer; `SCAN`,
+`QUARANTINE RESTORE`, and `QUARANTINE DELETE` require `uid == 0`,
+returning `ERR permission denied ...` otherwise.
+
+Callers that need one of the three privileged verbs use `pkexec avctl
+scan|quarantine restore|quarantine delete ...` (see
+`packaging/org.hyprav.avctl.policy`) rather than talking to the socket
+directly as root themselves - this gives two independent checks in
+practice: polkit's authorization prompt gates whether `pkexec` runs
+`avctl` as root at all, and `avd`'s own `SO_PEERCRED` check
+independently verifies the connecting process actually is root once
+it gets there.
+
+## Known limitations
+
+- **Verdict history is in-memory only**, a bounded ring buffer
+  (`AVD_VERDICT_HISTORY_MAX`, 500 entries) - lost on every `avd`
+  restart. Deliberate, matching this codebase's existing convention
+  that kernel/avd runtime state is memory-only unless a save/load
+  mechanism was added as its own explicit feature (see `avctl
+  save`/`load` for the kernel-state equivalent). Not addressed here;
+  a future on-disk log is a reasonable follow-up if this turns out to
+  matter in practice.
+- **Tab/newline in a field value misparses** - see Wire format above.
+- **No path-traversal protection needed on `SCAN`'s argument** beyond
+  requiring it to be absolute - unlike quarantine `<id>`, an arbitrary
+  absolute path is exactly what `SCAN` is *for* (scan any file the
+  daemon's own privileges can read), so there's nothing to restrict
+  there beyond the existing root-only gate.
+- **`SCAN` is not rate-limited and does not share the kernel-triggered
+  scan queue.** Unlike `AV_C_SCAN_REQUEST` (which goes through the
+  bounded `AVD_SCAN_QUEUE_MAX`/`AVD_SCAN_THREADS` worker pool - see
+  `docs/netlink-protocol.md`), a control-socket `SCAN` command calls
+  `perform_scan()` directly on that connection's own thread. Bounded
+  only by `AVD_CONTROL_MAX_CONNS` (how many control connections can be
+  open at once) and each connection's `AVD_CONTROL_RECV_TIMEOUT_SECS`
+  idle timeout, not by anything specific to scanning - a root-
+  authenticated client issuing many `SCAN` requests can run that many
+  scans concurrently, uncoordinated with kernel-triggered scans.
+- **`avd` must already be registered with the kernel module for the
+  control socket to exist at all** - `main()` in `avd.c` still exits
+  before starting the control socket if `genl_connect()`/
+  `genl_ctrl_resolve()` fail (see that function). This means
+  `av.ko` must be `insmod`'d before `avd` (and therefore before
+  `avctl scan`/`quarantine`/any GUI use) will work at all, even though
+  none of this protocol itself touches netlink. Making `avd` tolerate
+  a missing module (retry registration in the background) would be a
+  real behavior change to existing, tested startup logic - explicitly
+  out of scope here.

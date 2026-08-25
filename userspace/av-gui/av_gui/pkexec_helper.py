@@ -1,0 +1,56 @@
+"""Runs privileged avctl commands via pkexec, asynchronously (so the
+GTK main loop never blocks on the polkit authentication prompt). See
+docs/avd-socket-protocol.md's Authorization section and
+packaging/org.hyprav.avctl.policy for the polkit action this relies
+on.
+
+One-shot subprocess per action, not a persistent privileged helper
+process kept alive by the GUI - a long-lived root-owned helper would
+itself be a second always-on privileged surface to secure, worse than
+a stateless call whose entire trust boundary is pkexec plus the one
+policy file.
+"""
+import os
+
+import gi
+
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib
+
+# pkexec only authorizes against avctl's INSTALLED path (see
+# org.freedesktop.policykit.exec.path in packaging/org.hyprav.avctl.policy,
+# and userspace/avctl/Makefile install target's own comment on why) -
+# this must match that install location, not wherever av-gui itself
+# happens to be run from.
+AVCTL_PATH = os.environ.get("AVCTL_PATH", "/usr/local/bin/avctl")
+
+
+def run_privileged(args, on_done):
+    """Runs `pkexec <AVCTL_PATH> *args` asynchronously.
+
+    `on_done(ok, stdout, stderr)` is called back on the GTK main loop
+    once the subprocess exits. `ok` is True only on exit code 0 - a
+    denied polkit prompt just exits non-zero like any other avctl
+    failure, so callers don't need to special-case "denied" vs. "some
+    other error", both show up the same way (an error message from
+    stderr/stdout).
+    """
+    argv = ["pkexec", AVCTL_PATH] + list(args)
+    try:
+        proc = Gio.Subprocess.new(
+            argv,
+            Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
+        )
+    except GLib.Error as exc:
+        on_done(False, "", str(exc))
+        return
+
+    def _finished(source, result, _user_data=None):
+        try:
+            _, stdout, stderr = source.communicate_utf8_finish(result)
+        except GLib.Error as exc:
+            on_done(False, "", str(exc))
+            return
+        on_done(source.get_exit_status() == 0, stdout or "", stderr or "")
+
+    proc.communicate_utf8_async(None, None, _finished)

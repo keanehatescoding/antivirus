@@ -59,11 +59,24 @@
  * libfuzzy-dev libtlsh-dev
  *
  * See docs/netlink-protocol.md for the full protocol design.
+ *
+ * (post-v1.0.0, GUI backend): a Unix domain control socket
+ * (AVD_CONTROL_SOCK_PATH) for the avctl/GUI management path - status,
+ * recent verdict history, quarantine list/restore/delete, and
+ * on-demand scan. Separate from the kernel netlink channel above;
+ * see docs/avd-socket-protocol.md for the wire protocol and
+ * docs/netlink-protocol.md for why this couldn't just reuse that
+ * channel (kernel-initiated only, CAP_NET_ADMIN, single daemon slot).
  */
+
+/* struct ucred (SO_PEERCRED) is only visible with _GNU_SOURCE defined
+ * before any system header pulls in <bits/socket.h> - must come first. */
+#define _GNU_SOURCE
 
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <libgen.h>
 #include <limits.h>
 #include <pthread.h>
 #include <signal.h>
@@ -71,8 +84,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -84,6 +100,7 @@
 #include <yara.h>
 
 #include "../../av/netlink_proto.h"
+#include "sha256.h"
 #include "tlsh_shim.h"
 
 #ifndef AT_EMPTY_PATH
@@ -100,6 +117,39 @@
 #define DEFAULT_CORPUS_FILE "corpus/fuzzy_hashes.txt"
 #define DEFAULT_TLSH_CORPUS_FILE "corpus/tlsh_hashes.txt"
 #define DEFAULT_QUARANTINE_DIR "/var/lib/av-quarantine"
+/* Matches packaging/avd.service's RuntimeDirectory=avd, which systemd
+ * creates/cleans as /run/avd for us. Overridable (argv[5] or
+ * AVD_SOCK_PATH) mainly for tests/manual runs outside systemd - see
+ * ensure_parent_dir()'s use in start_control_socket() for the
+ * non-systemd case, where avd creates the directory itself. */
+#define DEFAULT_CONTROL_SOCK_PATH "/run/avd/control.sock"
+/* Bounds one control-socket request/response line - generous enough
+ * for a full PATH_MAX path plus the small fixed fields alongside it
+ * (see docs/avd-socket-protocol.md). Defense in depth, same posture as
+ * av_policy's maxlen fields below: nothing legitimate needs more than
+ * this, so reject rather than silently truncate. */
+#define AVD_SOCK_LINE_MAX (PATH_MAX + 256)
+/* Caps how many control-socket connections avd will service at once -
+ * the socket is 0666 (see start_control_socket()'s comment), so
+ * without this any local user could open connections without limit,
+ * each spawning its own detached thread, and exhaust the daemon's
+ * threads/fds. Deliberately generous relative to real concurrent
+ * avctl/GUI usage (a handful at most) rather than tightly tuned. */
+#define AVD_CONTROL_MAX_CONNS 32
+/* Bounds how long a single control connection may sit idle waiting for
+ * its request line - without this, a client that connects and never
+ * sends a newline (or a slow/hostile one trickling bytes) would block
+ * that connection's thread, and therefore one of AVD_CONTROL_MAX_CONNS
+ * slots, indefinitely. */
+#define AVD_CONTROL_RECV_TIMEOUT_SECS 5
+/* Bounded, in-memory, ring-buffered verdict history for the control
+ * socket's VERDICTS command - deliberately NOT persisted to disk (lost
+ * on daemon restart). This is an explicit, documented limitation, not
+ * an oversight - see docs/avd-socket-protocol.md's "Known limitations"
+ * section: it matches this codebase's existing convention that
+ * kernel/avd runtime state is memory-only unless a save/load mechanism
+ * was added as its own deliberate feature (see avctl's save/load). */
+#define AVD_VERDICT_HISTORY_MAX 500
 #define SCAN_TIMEOUT_SECS 10
 #define MALICIOUS_SCORE_THRESHOLD 100
 /* handle_scan_request() (YARA scan, up to SCAN_TIMEOUT_SECS, plus the
@@ -213,6 +263,54 @@ static pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t queue_not_empty = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t queue_not_full = PTHREAD_COND_INITIALIZER;
 static bool shutting_down;
+
+static time_t start_time;
+
+/* One completed scan, kernel-triggered or on-demand (via the control
+ * socket's SCAN command - see cmd_scan()). Written by
+ * record_verdict_history(), called once from the single exit path of
+ * perform_scan() so every completed scan gets an entry regardless of
+ * which branch produced the verdict. */
+struct verdict_record {
+  uint64_t id;
+  time_t timestamp;
+  uint32_t pid; /* 0 for on-demand scans - no owning process */
+  char path[PATH_MAX];
+  char sha256_hex[65];
+  uint8_t verdict; /* AV_VERDICT_CLEAN / AV_VERDICT_MALICIOUS */
+  char rule_name[AV_RULE_NAME_MAXLEN + 1];
+  int score;
+  bool on_demand;
+};
+
+/* Fixed-size ring buffer, not a linked list like the scan queue above -
+ * this one is bounded by design (AVD_VERDICT_HISTORY_MAX) rather than
+ * needing backpressure, so there's no unbounded-growth case to guard
+ * against and a plain array avoids the malloc/free churn of a list for
+ * something written on every single scan. verdict_history_next is the
+ * slot the NEXT record will be written to; the most recent entry is
+ * therefore at (verdict_history_next - 1) mod MAX. */
+static struct verdict_record verdict_history[AVD_VERDICT_HISTORY_MAX];
+static size_t verdict_history_count;
+static size_t verdict_history_next;
+static uint64_t verdict_history_next_id = 1;
+static pthread_mutex_t verdict_history_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Durable quarantine sidecar - see write_quarantine_meta()'s comment on
+ * quarantine_file() for why this exists and read_quarantine_meta() for
+ * the parse side. */
+struct quarantine_meta {
+  char original_path[PATH_MAX];
+  mode_t original_mode;
+  uid_t original_uid;
+  gid_t original_gid;
+  time_t timestamp;
+  char rule_name[AV_RULE_NAME_MAXLEN + 1];
+  char sha256_hex[65];
+};
+
+static const char *control_sock_path = DEFAULT_CONTROL_SOCK_PATH;
+static int control_sock_fd = -1;
 
 static void handle_sigint(int signum) {
   (void)signum;
@@ -745,6 +843,142 @@ static int yara_callback(YR_SCAN_CONTEXT *context, int message,
   return CALLBACK_CONTINUE;
 }
 
+/*
+ * Records one completed scan into the ring buffer described by struct
+ * verdict_record above. Called exactly once, from perform_scan()'s
+ * single exit path, so every scan - kernel-triggered or on-demand,
+ * clean or malicious, YARA/fuzzy/TLSH/no-rules-loaded - gets an entry.
+ */
+static void record_verdict_history(uint32_t pid, const char *path,
+                                    const char *sha256_hex, uint8_t verdict,
+                                    const char *rule_name, int score,
+                                    bool on_demand) {
+  struct verdict_record *rec;
+
+  pthread_mutex_lock(&verdict_history_lock);
+  rec = &verdict_history[verdict_history_next];
+  rec->id = verdict_history_next_id++;
+  rec->timestamp = time(NULL);
+  rec->pid = pid;
+  snprintf(rec->path, sizeof(rec->path), "%s", path ? path : "");
+  snprintf(rec->sha256_hex, sizeof(rec->sha256_hex), "%s",
+           sha256_hex ? sha256_hex : "");
+  rec->verdict = verdict;
+  snprintf(rec->rule_name, sizeof(rec->rule_name), "%s",
+           rule_name ? rule_name : "");
+  rec->score = score;
+  rec->on_demand = on_demand;
+
+  verdict_history_next = (verdict_history_next + 1) % AVD_VERDICT_HISTORY_MAX;
+  if (verdict_history_count < AVD_VERDICT_HISTORY_MAX)
+    verdict_history_count++;
+  pthread_mutex_unlock(&verdict_history_lock);
+}
+
+/*
+ * Parses one quarantine sidecar file (see write_quarantine_meta()) into
+ * `out`. Returns 0 on success, -1 if the file couldn't be opened or had
+ * no ORIGINAL_PATH= line (the one field restore/list genuinely can't
+ * proceed without). Unrecognized lines are ignored rather than treated
+ * as an error - forward compatible with new fields added later.
+ */
+static int read_quarantine_meta(const char *meta_path,
+                                struct quarantine_meta *out) {
+  FILE *f = fopen(meta_path, "r");
+  char line[PATH_MAX + 64];
+
+  if (!f)
+    return -1;
+
+  memset(out, 0, sizeof(*out));
+  out->original_mode = 0600; /* sane fallback if ORIGINAL_MODE is
+                              * missing or unparseable */
+
+  while (fgets(line, sizeof(line), f)) {
+    size_t len = strlen(line);
+
+    if (len > 0 && line[len - 1] == '\n')
+      line[--len] = '\0';
+
+    /* "%.*s" with an explicit precision, not a bare "%s" - `line` is a
+     * PATH_MAX+64 stack buffer whose actual content length gcc can't
+     * bound at compile time, so a bare "%s" into these smaller fixed
+     * struct fields trips -Wformat-truncation. Same pattern already
+     * used by load_fuzzy_corpus()/load_tlsh_corpus() above for the
+     * identical reason. */
+    if (!strncmp(line, "ORIGINAL_PATH=", 14))
+      snprintf(out->original_path, sizeof(out->original_path), "%.*s",
+               (int)sizeof(out->original_path) - 1, line + 14);
+    else if (!strncmp(line, "ORIGINAL_MODE=", 14))
+      out->original_mode = (mode_t)strtoul(line + 14, NULL, 8);
+    else if (!strncmp(line, "ORIGINAL_UID=", 13))
+      out->original_uid = (uid_t)strtoul(line + 13, NULL, 10);
+    else if (!strncmp(line, "ORIGINAL_GID=", 13))
+      out->original_gid = (gid_t)strtoul(line + 13, NULL, 10);
+    else if (!strncmp(line, "TIMESTAMP=", 10))
+      out->timestamp = (time_t)strtoll(line + 10, NULL, 10);
+    else if (!strncmp(line, "RULE_NAME=", 10))
+      snprintf(out->rule_name, sizeof(out->rule_name), "%.*s",
+               (int)sizeof(out->rule_name) - 1, line + 10);
+    else if (!strncmp(line, "SHA256=", 7))
+      snprintf(out->sha256_hex, sizeof(out->sha256_hex), "%.*s",
+               (int)sizeof(out->sha256_hex) - 1, line + 7);
+  }
+  fclose(f);
+
+  if (out->original_path[0] == '\0')
+    return -1;
+
+  return 0;
+}
+
+/*
+ * Writes the sidecar `<dest>.meta` next to a quarantined file, called
+ * from quarantine_file() before that function chmod's the quarantine
+ * copy to 0000 - see quarantine_file()'s own comment for why this has
+ * to happen first. `orig_st` (may be NULL if the pre-quarantine fstat()
+ * failed) supplies the mode/uid/gid to restore later; without it,
+ * restore falls back to 0600/root:root rather than failing outright.
+ *
+ * ORIGINAL_PATH is written LAST and has no field after it - Linux
+ * filenames may legally contain a literal newline (never NUL or '/'),
+ * which would otherwise let a pathological path corrupt whatever line
+ * came after it when this file is read back with fgets(). Putting it
+ * last means that edge case can only truncate the path itself on
+ * restore, never a different field - the same kind of narrow,
+ * documented limitation as avctl's save/load format (see do_save()'s
+ * comment in avctl.c for the equivalent caveat there).
+ */
+static int write_quarantine_meta(const char *dest, const struct stat *orig_st,
+                                 const char *orig_path, const char *rule_name,
+                                 const char *sha256_hex) {
+  /* PATH_MAX + 8, not PATH_MAX - `dest` is itself a PATH_MAX buffer, so
+   * appending ".meta" needs headroom beyond it for gcc's
+   * -Wformat-truncation to prove this can't overflow (same margin
+   * avctl.c's do_save() uses for its own "%s.tmp" append). */
+  char meta_path[PATH_MAX + 8];
+  FILE *f;
+
+  snprintf(meta_path, sizeof(meta_path), "%s.meta", dest);
+  f = fopen(meta_path, "w");
+  if (!f)
+    return -1;
+
+  fprintf(f, "ORIGINAL_MODE=%o\n", orig_st ? (orig_st->st_mode & 07777) : 0600);
+  fprintf(f, "ORIGINAL_UID=%d\n", orig_st ? (int)orig_st->st_uid : 0);
+  fprintf(f, "ORIGINAL_GID=%d\n", orig_st ? (int)orig_st->st_gid : 0);
+  fprintf(f, "TIMESTAMP=%lld\n", (long long)time(NULL));
+  fprintf(f, "RULE_NAME=%s\n", rule_name ? rule_name : "");
+  fprintf(f, "SHA256=%s\n", sha256_hex ? sha256_hex : "");
+  fprintf(f, "ORIGINAL_PATH=%s\n", orig_path);
+
+  if (fclose(f) != 0) {
+    unlink(meta_path);
+    return -1;
+  }
+  return 0;
+}
+
 static int ensure_quarantine_dir(void) {
   if (mkdir(quarantine_dir, 0700) == 0)
     return 0;
@@ -849,16 +1083,34 @@ static int copy_fd_to(int fd, const char *dst) {
  * Has_RWX_Segment's scope note) - but unlike the old design, a
  * mismatch here only means the original wasn't also cleaned up from
  * its old location, never that the wrong content got quarantined.
+ *
+ * `rule_name`/`sha256_hex` (may be NULL/empty) are passed through only
+ * for write_quarantine_meta()'s sidecar - purely informational, no
+ * effect on the quarantine/unlink logic itself.
  */
-static void quarantine_file(int fd, const char *path) {
+static void quarantine_file(int fd, const char *path, const char *rule_name,
+                            const char *sha256_hex) {
   char dest[PATH_MAX];
   const char *base;
   struct timespec ts;
   struct stat fd_st;
+  struct stat orig_st;
+  bool have_orig_st;
   bool linked;
 
   if (ensure_quarantine_dir() != 0)
     return;
+
+  /* Captured before linkat()/chmod() below - once linkat() succeeds,
+   * `dest` is a second directory entry for fd's SAME inode (a
+   * hardlink, not a copy), so chmod(dest, 0000) further down would
+   * otherwise also be the last read of the original's own mode. This
+   * is the one place in this function that needs the pre-quarantine
+   * permissions, for write_quarantine_meta()'s restore record - not to
+   * be confused with the fd_st fstat() later on, which is a distinct,
+   * unrelated identity recheck immediately before the original's
+   * unlink(). */
+  have_orig_st = (fstat(fd, &orig_st) == 0);
 
   base = strrchr(path, '/');
   base = base ? base + 1 : path;
@@ -890,6 +1142,21 @@ static void quarantine_file(int fd, const char *path) {
       return;
     }
   }
+
+  /* Sidecar metadata written before the chmod(dest, 0000) below, and
+   * before the original is touched at all - the whole point of this
+   * file is to survive even if a later step here fails, so the
+   * quarantine stays restorable. Best-effort: a metadata write failure
+   * is logged but doesn't abort the quarantine itself - an
+   * unrestorable-by-GUI quarantine is still a successful quarantine,
+   * same "logging failure isn't a quarantine failure" stance as
+   * everywhere else in this function. */
+  if (write_quarantine_meta(dest, have_orig_st ? &orig_st : NULL, path,
+                            rule_name, sha256_hex) != 0)
+    fprintf(stderr,
+            "avd: could not write quarantine metadata for \"%s\" - restore "
+            "via avctl will not be possible for this file\n",
+            dest);
 
   /* Lock down the quarantine copy before touching the original at
    * all - this is what matters for "can this be re-executed". A
@@ -971,15 +1238,183 @@ static void quarantine_file(int fd, const char *path) {
            linked ? "" : " (copy fallback)");
 }
 
-static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
-                                const char *sha256_hex) {
+struct scan_result {
+  uint8_t verdict; /* AV_VERDICT_CLEAN / AV_VERDICT_MALICIOUS */
+  char rule_name[AV_RULE_NAME_MAXLEN + 1];
+  int score; /* YARA aggregate score - 0 for a fuzzy/TLSH-only match or
+             * a clean result; supplementary info, not authoritative */
+  char sha256_hex[65];
+};
+
+/*
+ * Shared core of file analysis - YARA, then fuzzy/TLSH fallback,
+ * quarantine on MALICIOUS, and a verdict_history record either way.
+ * Used by both handle_scan_request() (kernel-triggered, netlink) and
+ * cmd_scan() (on-demand, control socket) - see each caller for how
+ * they report `out` over their own transport; this function touches
+ * neither.
+ *
+ * `fd` must already be open for reading - opening is the caller's
+ * responsibility, deliberately kept out of this shared core since a
+ * failed open means something different to each caller (fail-open and
+ * tell the kernel CLEAN for the netlink path, vs. an ERR reply for the
+ * interactive on-demand path). `sha256_hex` may be NULL/empty - kernel
+ * scans always have one (precomputed via av/sigtable.c), on-demand
+ * scans never do, and this fills one in via sha256_fd() either way.
+ * `pid` is 0 for on-demand scans (no owning process - see struct
+ * verdict_record's own comment).
+ */
+static void perform_scan(int fd, const char *path, const char *sha256_hex,
+                         uint32_t pid, bool on_demand,
+                         struct scan_result *out) {
   struct yara_match_ctx ctx = {.matched = 0,
                                .match_count = 0,
                                .score = 0,
                                .override_matched = 0,
                                .rule_name = ""};
-  int fd;
+  char sha256_buf[65] = "";
+  const char *hash;
   int ret;
+
+  memset(out, 0, sizeof(*out));
+  out->verdict = AV_VERDICT_CLEAN;
+
+  if (sha256_hex && sha256_hex[0])
+    hash = sha256_hex;
+  else if (sha256_fd(fd, sha256_buf) == 0)
+    hash = sha256_buf;
+  else
+    hash = ""; /* on-demand scan of a file sha256_fd() couldn't hash -
+               * proceed without one rather than failing the scan
+               * over it */
+
+  printf("avd: %sscan \"%s\" pid=%u sha256=%s\n",
+         on_demand ? "on-demand " : "", path, pid, hash[0] ? hash : "(unknown)");
+
+  if (!compiled_rules)
+    goto record;
+
+  ret = yr_rules_scan_fd(compiled_rules, fd, 0, yara_callback, &ctx,
+                         SCAN_TIMEOUT_SECS);
+  if (ret != ERROR_SUCCESS) {
+    /* File vanished, permission denied, scan timeout, etc. - fail
+     * open here too, matching the kernel side's own fail-open
+     * stance on inconclusive information (see docs/netlink-protocol.md). */
+    fprintf(stderr, "avd: yr_rules_scan_fd(\"%s\") failed: error %d\n", path,
+            ret);
+    goto record;
+  }
+
+  if (ctx.matched) {
+    /* Sum of matched rules' weights has to clear
+     * MALICIOUS_SCORE_THRESHOLD before this convicts - a single
+     * low-confidence import heuristic (or even one "verified"
+     * structural rule alone) is logged for visibility but no
+     * longer enough by itself. See the threshold's own comment
+     * for why: real testing killed zsh/sh/uwsm on exactly this
+     * single-weak-match pattern before this existed.
+     *
+     * EXCEPT: a small, deliberately narrow set of rules carry
+     * `override = true` and convict on their own regardless of
+     * score - added after discovering that pure additive scoring
+     * let the v0.9.0 entropy-dilution evasion through the WHOLE
+     * pipeline (not just the entropy layer) once Entry_Point_
+     * Outside_Text's weight was reduced for its own false
+     * positive. See elf_analysis.yar's header comment and
+     * docs/evasion-findings.md for the full story. */
+    if (ctx.override_matched || ctx.score >= MALICIOUS_SCORE_THRESHOLD) {
+      printf("avd: MATCH \"%s\" -> %d rule(s), score=%d, override=%d: \"%s\"\n",
+             path, ctx.match_count, ctx.score, ctx.override_matched,
+             ctx.rule_name);
+      out->verdict = AV_VERDICT_MALICIOUS;
+      snprintf(out->rule_name, sizeof(out->rule_name), "%s", ctx.rule_name);
+      out->score = ctx.score;
+      quarantine_file(fd, path, out->rule_name, hash);
+      goto record;
+    }
+
+    printf("avd: %d rule(s) matched \"%s\" but score=%d is below "
+           "threshold (%d) and no override rule fired - not "
+           "convicting: \"%s\"\n",
+           ctx.match_count, path, ctx.score, MALICIOUS_SCORE_THRESHOLD,
+           ctx.rule_name);
+    out->score = ctx.score;
+    /* Falls through to the fuzzy-hash check below rather than
+     * declaring clean immediately - a below-threshold YARA match
+     * plus a fuzzy-hash hit against the known-bad corpus is still
+     * worth convicting on, even though neither alone was enough. */
+  }
+
+  /* No YARA rule fired - try fuzzy-hash similarity against the
+   * corpus before declaring clean. This catches near-identical
+   * variants of a known-bad file that would evade both the kernel's
+   * exact hash check (av/sigtable.c) and exact YARA string/structure
+   * matches. */
+  {
+    char fuzzy_name[128];
+    int fuzzy_score = 0;
+    int fret =
+        check_fuzzy_corpus(fd, fuzzy_name, sizeof(fuzzy_name), &fuzzy_score);
+
+    if (fret == 1) {
+      /* fuzzy_compare()'s documented range is 0-100; clamping
+       * here (defensive, should never actually trigger) also
+       * gives the compiler's range analysis what it needs to
+       * prove the snprintf below can't truncate. */
+      if (fuzzy_score < 0)
+        fuzzy_score = 0;
+      if (fuzzy_score > 100)
+        fuzzy_score = 100;
+
+      out->verdict = AV_VERDICT_MALICIOUS;
+      snprintf(out->rule_name, sizeof(out->rule_name), "Fuzzy:%.40s(%d)",
+               fuzzy_name, fuzzy_score);
+      printf("avd: FUZZY MATCH \"%s\" -> \"%s\" score=%d\n", path, fuzzy_name,
+             fuzzy_score);
+      quarantine_file(fd, path, out->rule_name, hash);
+      goto record;
+    }
+    if (fret < 0)
+      fprintf(stderr, "avd: fuzzy hash of \"%s\" failed\n", path);
+  }
+
+  /* ssdeep didn't match either - try TLSH before declaring clean.
+   * Complementary, not redundant: the two algorithms fingerprint
+   * files differently (ssdeep's rolling-hash context-triggered
+   * piecewise hashing vs. TLSH's locality-sensitive quartile/bucket
+   * histogram), so a variant that happens to fall below one
+   * algorithm's similarity threshold isn't guaranteed to fall below
+   * the other's too - running both is real defense in depth, not
+   * just running the same check twice. */
+  {
+    char tlsh_name[128];
+    int tlsh_diff = 0;
+    int tret =
+        check_tlsh_corpus(fd, tlsh_name, sizeof(tlsh_name), &tlsh_diff);
+
+    if (tret == 1) {
+      out->verdict = AV_VERDICT_MALICIOUS;
+      snprintf(out->rule_name, sizeof(out->rule_name), "TLSH:%.40s(%d)",
+               tlsh_name, tlsh_diff);
+      printf("avd: TLSH MATCH \"%s\" -> \"%s\" diff=%d\n", path, tlsh_name,
+             tlsh_diff);
+      quarantine_file(fd, path, out->rule_name, hash);
+      goto record;
+    }
+    if (tret < 0)
+      fprintf(stderr, "avd: TLSH hash of \"%s\" failed\n", path);
+  }
+
+record:
+  snprintf(out->sha256_hex, sizeof(out->sha256_hex), "%s", hash);
+  record_verdict_history(pid, path, out->sha256_hex, out->verdict,
+                         out->rule_name, out->score, on_demand);
+}
+
+static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
+                                const char *sha256_hex) {
+  struct scan_result result;
+  int fd;
 
   printf("avd: scan request reqid=%llu pid=%u path=\"%s\" sha256=%s\n",
          (unsigned long long)reqid, pid, path, sha256_hex);
@@ -1005,135 +1440,15 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
     return;
   }
 
-  if (!compiled_rules) {
-    send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
-    close(fd);
-    return;
-  }
+  perform_scan(fd, path, sha256_hex, pid, false, &result);
 
-  ret = yr_rules_scan_fd(compiled_rules, fd, 0, yara_callback, &ctx,
-                         SCAN_TIMEOUT_SECS);
-  if (ret != ERROR_SUCCESS) {
-    /* File vanished, permission denied, scan timeout, etc. - fail
-     * open here too, matching the kernel side's own fail-open
-     * stance on inconclusive information (see docs/netlink-protocol.md). */
-    fprintf(stderr, "avd: yr_rules_scan_fd(\"%s\") failed: error %d\n", path,
-            ret);
-    send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
-    close(fd);
-    return;
-  }
+  if (send_verdict(reqid, result.verdict, result.rule_name) < 0)
+    fprintf(stderr,
+            "avd: failed to send %s verdict for reqid=%llu \"%s\" - "
+            "kernel side will fail open on timeout\n",
+            result.verdict == AV_VERDICT_MALICIOUS ? "MALICIOUS" : "CLEAN",
+            (unsigned long long)reqid, path);
 
-  if (ctx.matched) {
-    /* Sum of matched rules' weights has to clear
-     * MALICIOUS_SCORE_THRESHOLD before this convicts - a single
-     * low-confidence import heuristic (or even one "verified"
-     * structural rule alone) is logged for visibility but no
-     * longer enough by itself. See the threshold's own comment
-     * for why: real testing killed zsh/sh/uwsm on exactly this
-     * single-weak-match pattern before this existed.
-     *
-     * EXCEPT: a small, deliberately narrow set of rules carry
-     * `override = true` and convict on their own regardless of
-     * score - added after discovering that pure additive scoring
-     * let the v0.9.0 entropy-dilution evasion through the WHOLE
-     * pipeline (not just the entropy layer) once Entry_Point_
-     * Outside_Text's weight was reduced for its own false
-     * positive. See elf_analysis.yar's header comment and
-     * docs/evasion-findings.md for the full story. */
-    if (ctx.override_matched || ctx.score >= MALICIOUS_SCORE_THRESHOLD) {
-      printf("avd: MATCH \"%s\" -> %d rule(s), score=%d, override=%d: \"%s\"\n",
-             path, ctx.match_count, ctx.score, ctx.override_matched,
-             ctx.rule_name);
-      quarantine_file(fd, path);
-      if (send_verdict(reqid, AV_VERDICT_MALICIOUS, ctx.rule_name) < 0)
-        fprintf(stderr,
-                "avd: failed to send MALICIOUS verdict for "
-                "reqid=%llu \"%s\" - kernel side will fail "
-                "open on timeout\n",
-                (unsigned long long)reqid, path);
-      close(fd);
-      return;
-    }
-
-    printf("avd: %d rule(s) matched \"%s\" but score=%d is below "
-           "threshold (%d) and no override rule fired - not "
-           "convicting: \"%s\"\n",
-           ctx.match_count, path, ctx.score, MALICIOUS_SCORE_THRESHOLD,
-           ctx.rule_name);
-    /* Falls through to the fuzzy-hash check below rather than
-     * returning CLEAN immediately - a below-threshold YARA match
-     * plus a fuzzy-hash hit against the known-bad corpus is still
-     * worth convicting on, even though neither alone was enough. */
-  }
-
-  /* No YARA rule fired - try fuzzy-hash similarity against the
-   * corpus before declaring clean. This catches near-identical
-   * variants of a known-bad file that would evade both the kernel's
-   * exact hash check (av/sigtable.c) and exact YARA string/structure
-   * matches. */
-  {
-    char fuzzy_name[128];
-    int fuzzy_score = 0;
-    int fret =
-        check_fuzzy_corpus(fd, fuzzy_name, sizeof(fuzzy_name), &fuzzy_score);
-
-    if (fret == 1) {
-      char verdict_name[AV_RULE_NAME_MAXLEN + 1];
-
-      /* fuzzy_compare()'s documented range is 0-100; clamping
-       * here (defensive, should never actually trigger) also
-       * gives the compiler's range analysis what it needs to
-       * prove the snprintf below can't truncate. */
-      if (fuzzy_score < 0)
-        fuzzy_score = 0;
-      if (fuzzy_score > 100)
-        fuzzy_score = 100;
-
-      snprintf(verdict_name, sizeof(verdict_name), "Fuzzy:%.40s(%d)",
-               fuzzy_name, fuzzy_score);
-      printf("avd: FUZZY MATCH \"%s\" -> \"%s\" score=%d\n", path, fuzzy_name,
-             fuzzy_score);
-      quarantine_file(fd, path);
-      send_verdict(reqid, AV_VERDICT_MALICIOUS, verdict_name);
-      close(fd);
-      return;
-    }
-    if (fret < 0)
-      fprintf(stderr, "avd: fuzzy hash of \"%s\" failed\n", path);
-  }
-
-  /* ssdeep didn't match either - try TLSH before declaring clean.
-   * Complementary, not redundant: the two algorithms fingerprint
-   * files differently (ssdeep's rolling-hash context-triggered
-   * piecewise hashing vs. TLSH's locality-sensitive quartile/bucket
-   * histogram), so a variant that happens to fall below one
-   * algorithm's similarity threshold isn't guaranteed to fall below
-   * the other's too - running both is real defense in depth, not
-   * just running the same check twice. */
-  {
-    char tlsh_name[128];
-    int tlsh_diff = 0;
-    int tret =
-        check_tlsh_corpus(fd, tlsh_name, sizeof(tlsh_name), &tlsh_diff);
-
-    if (tret == 1) {
-      char verdict_name[AV_RULE_NAME_MAXLEN + 1];
-
-      snprintf(verdict_name, sizeof(verdict_name), "TLSH:%.40s(%d)",
-               tlsh_name, tlsh_diff);
-      printf("avd: TLSH MATCH \"%s\" -> \"%s\" diff=%d\n", path, tlsh_name,
-             tlsh_diff);
-      quarantine_file(fd, path);
-      send_verdict(reqid, AV_VERDICT_MALICIOUS, verdict_name);
-      close(fd);
-      return;
-    }
-    if (tret < 0)
-      fprintf(stderr, "avd: TLSH hash of \"%s\" failed\n", path);
-  }
-
-  send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
   close(fd);
 }
 
@@ -1321,6 +1636,706 @@ static int register_with_kernel(void) {
   return ret < 0 ? -1 : 0;
 }
 
+/* ------------------------------------------------------------------
+ * Control socket - avctl/GUI management path. See
+ * docs/avd-socket-protocol.md for the full wire protocol; this is the
+ * implementation side of that document.
+ * ------------------------------------------------------------------ */
+
+static int write_all(int fd, const char *buf, size_t len) {
+  size_t off = 0;
+
+  while (off < len) {
+    ssize_t n = write(fd, buf + off, len - off);
+
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      return -1;
+    }
+    off += (size_t)n;
+  }
+  return 0;
+}
+
+static void send_err(int fd, const char *msg) {
+  char buf[256];
+
+  snprintf(buf, sizeof(buf), "ERR %s\n", msg);
+  write_all(fd, buf, strlen(buf));
+}
+
+/*
+ * Reads one newline-terminated line from `fd` into `buf` (NUL
+ * terminated, newline stripped), one byte at a time - simple rather
+ * than fast, which is fine here: control-socket commands are rare
+ * relative to the actual scan path and never more than
+ * AVD_SOCK_LINE_MAX bytes. Returns the line length on success, 0 on a
+ * clean EOF before any data, -1 on a read error, a timeout, or on
+ * exceeding `bufsz` without finding a newline (a line this long can
+ * only be a malformed/hostile client - see AVD_SOCK_LINE_MAX's
+ * comment).
+ *
+ * Enforces its own ABSOLUTE deadline (AVD_CONTROL_RECV_TIMEOUT_SECS
+ * from the first call), on top of whatever SO_RCVTIMEO the caller may
+ * have set on `fd` - SO_RCVTIMEO alone only bounds each individual
+ * read() call, so a client trickling one byte just under that
+ * interval at a time would never trip any single call's timeout and
+ * could hold a connection (and its AVD_CONTROL_MAX_CONNS slot) open
+ * for up to AVD_SOCK_LINE_MAX reads' worth of that interval -
+ * effectively unbounded in practice. This function has exactly one
+ * caller (control_conn_main()), so hardcoding the same constant here
+ * rather than threading a deadline parameter through is the simpler
+ * choice for now.
+ */
+static ssize_t read_line(int fd, char *buf, size_t bufsz) {
+  size_t len = 0;
+  struct timespec deadline;
+
+  clock_gettime(CLOCK_MONOTONIC, &deadline);
+  deadline.tv_sec += AVD_CONTROL_RECV_TIMEOUT_SECS;
+
+  while (len + 1 < bufsz) {
+    struct timespec now;
+    char c;
+    ssize_t n;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (now.tv_sec > deadline.tv_sec ||
+        (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
+      errno = ETIMEDOUT;
+      return -1;
+    }
+
+    n = read(fd, &c, 1);
+
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      return -1;
+    }
+    if (n == 0)
+      return len == 0 ? 0 : -1; /* EOF mid-line - treat as malformed,
+                                * not as "here's a valid short line" */
+    if (c == '\n') {
+      buf[len] = '\0';
+      return (ssize_t)len;
+    }
+    buf[len++] = c;
+  }
+  return -1; /* line too long */
+}
+
+/* id must be a bare basename (no '/', not "." or ".."), matching what
+ * cmd_quarantine_list() returns - reconstructed into a path below via
+ * plain snprintf(), so this is the only thing standing between a
+ * hostile QUARANTINE RESTORE/DELETE argument and a path-traversal
+ * escape out of quarantine_dir. */
+static int quarantine_id_valid(const char *id) {
+  if (!id[0] || strchr(id, '/'))
+    return 0;
+  if (!strcmp(id, ".") || !strcmp(id, ".."))
+    return 0;
+  if (strlen(id) >= PATH_MAX - 32) /* leaves room for the .quarantined.meta suffix */
+    return 0;
+  return 1;
+}
+
+static void cmd_status(int fd) {
+  char row[256];
+  size_t qlen;
+
+  pthread_mutex_lock(&queue_lock);
+  qlen = queue_len;
+  pthread_mutex_unlock(&queue_lock);
+
+  write_all(fd, "OK\n", 3);
+  write_all(fd, "COUNT 1\n", 8);
+  snprintf(row, sizeof(row), "%ld\t%d\t%zu\t%zu\t%zu\t%d\n",
+           (long)(time(NULL) - start_time), compiled_rules ? 1 : 0,
+           fuzzy_corpus_count, tlsh_corpus_count, qlen, AVD_SCAN_THREADS);
+  write_all(fd, row, strlen(row));
+  write_all(fd, "END\n", 4);
+}
+
+static void cmd_verdicts_recent(int fd, size_t n) {
+  struct verdict_record *snap;
+  char hdr[32];
+  size_t avail, take, i;
+
+  pthread_mutex_lock(&verdict_history_lock);
+  avail = verdict_history_count;
+  take = n < avail ? n : avail;
+  snap = take ? malloc(take * sizeof(*snap)) : NULL;
+  if (take && !snap) {
+    pthread_mutex_unlock(&verdict_history_lock);
+    send_err(fd, "out of memory");
+    return;
+  }
+  for (i = 0; i < take; i++) {
+    /* Newest first - see verdict_history_next's own comment for why
+     * (verdict_history_next - 1 - i) mod MAX is the i-th most recent
+     * entry. */
+    size_t idx = (verdict_history_next + AVD_VERDICT_HISTORY_MAX - 1 - i) %
+                AVD_VERDICT_HISTORY_MAX;
+    snap[i] = verdict_history[idx];
+  }
+  pthread_mutex_unlock(&verdict_history_lock);
+
+  write_all(fd, "OK\n", 3);
+  snprintf(hdr, sizeof(hdr), "COUNT %zu\n", take);
+  write_all(fd, hdr, strlen(hdr));
+  for (i = 0; i < take; i++) {
+    char row[PATH_MAX + 256];
+
+    snprintf(row, sizeof(row), "%llu\t%ld\t%u\t%s\t%s\t%s\t%s\t%d\t%d\n",
+             (unsigned long long)snap[i].id, (long)snap[i].timestamp,
+             snap[i].pid, snap[i].path, snap[i].sha256_hex,
+             snap[i].verdict == AV_VERDICT_MALICIOUS ? "MALICIOUS" : "CLEAN",
+             snap[i].rule_name, snap[i].score, snap[i].on_demand ? 1 : 0);
+    /* Stop at the first failed write rather than pressing on through
+     * the rest of `take` rows - SO_SNDTIMEO (see control_conn_main())
+     * bounds each individual write_all() call, not this whole loop,
+     * so a client that stops reading would otherwise make this
+     * connection (and its AVD_CONTROL_MAX_CONNS slot) pay a full
+     * timeout interval PER REMAINING ROW instead of just one. */
+    if (write_all(fd, row, strlen(row)) != 0) {
+      free(snap);
+      return;
+    }
+  }
+  write_all(fd, "END\n", 4);
+  free(snap);
+}
+
+static int filter_quarantined(const struct dirent *de) {
+  static const char suffix[] = ".quarantined";
+  size_t suflen = sizeof(suffix) - 1;
+  size_t len = strlen(de->d_name);
+
+  return len > suflen && !strcmp(de->d_name + len - suflen, suffix);
+}
+
+static void cmd_quarantine_list(int fd) {
+  struct dirent **namelist;
+  char hdr[32];
+  int n, i;
+
+  n = scandir(quarantine_dir, &namelist, filter_quarantined, alphasort);
+  if (n < 0) {
+    send_err(fd, "could not read quarantine directory");
+    return;
+  }
+
+  write_all(fd, "OK\n", 3);
+  snprintf(hdr, sizeof(hdr), "COUNT %d\n", n);
+  write_all(fd, hdr, strlen(hdr));
+
+  for (i = 0; i < n; i++) {
+    static const char suffix[] = ".quarantined";
+    size_t suflen = sizeof(suffix) - 1;
+    size_t namelen = strlen(namelist[i]->d_name);
+    char id[PATH_MAX];
+    char meta_path[PATH_MAX + 72]; /* see cmd_quarantine_restore()'s comment */
+    struct quarantine_meta meta;
+    char row[PATH_MAX * 2 + 256];
+
+    snprintf(id, sizeof(id), "%.*s", (int)(namelen - suflen),
+             namelist[i]->d_name);
+    snprintf(meta_path, sizeof(meta_path), "%s/%s.meta", quarantine_dir,
+             namelist[i]->d_name);
+
+    if (read_quarantine_meta(meta_path, &meta) == 0)
+      snprintf(row, sizeof(row), "%s\t%s\t%ld\t%s\t%s\n", id,
+               meta.original_path, (long)meta.timestamp, meta.rule_name,
+               meta.sha256_hex);
+    else
+      /* No metadata - quarantined before this feature existed, or the
+       * sidecar write itself failed (see quarantine_file()'s comment).
+       * Still list it (it's a real quarantined file on disk) rather
+       * than hiding it, just without the extra fields. */
+      snprintf(row, sizeof(row), "%s\t?\t0\t?\t?\n", id);
+
+    /* Stop at the first failed write, same reasoning as
+     * cmd_verdicts_recent()'s identical check - still have to free
+     * every remaining scandir() entry (not just the one just used)
+     * before returning, unlike a plain "return" would give us. */
+    if (write_all(fd, row, strlen(row)) != 0) {
+      free(namelist[i]);
+      for (i++; i < n; i++)
+        free(namelist[i]);
+      free(namelist);
+      return;
+    }
+    free(namelist[i]);
+  }
+  free(namelist);
+  write_all(fd, "END\n", 4);
+}
+
+static void cmd_quarantine_restore(int fd, const char *id) {
+  /* PATH_MAX*2 headroom: `quarantine_dir` and `id` are each bounded to
+   * well under PATH_MAX at runtime (quarantine_id_valid() checked
+   * above), but gcc's -Wformat-truncation can't see that dynamic
+   * bound, only that both are `const char *` with no static length
+   * limit it can prove - same margin used throughout this file's other
+   * multi-component path buffers. */
+  char dest[PATH_MAX * 2], meta_path[PATH_MAX * 2 + 8];
+  struct quarantine_meta meta;
+  struct stat st;
+
+  if (!quarantine_id_valid(id)) {
+    send_err(fd, "invalid id");
+    return;
+  }
+
+  snprintf(dest, sizeof(dest), "%s/%s.quarantined", quarantine_dir, id);
+  snprintf(meta_path, sizeof(meta_path), "%s.meta", dest);
+
+  if (read_quarantine_meta(meta_path, &meta) != 0) {
+    send_err(fd, "no metadata for this id (quarantined before this feature "
+                "existed, or corrupt) - cannot determine where to restore it");
+    return;
+  }
+
+  /* Opened once, here, by path only this one time - every step below
+   * that can act through this fd instead (fchmod/fchown, not
+   * chmod/chown by path) does, precisely so that once meta.original_path
+   * becomes reachable (the rename() below), the file already has its
+   * final mode/owner and there is no later path-based operation left
+   * for anything to race against it. */
+  {
+    int qfd = open(dest, O_RDONLY);
+
+    if (qfd < 0) {
+      send_err(fd, "quarantined file not found");
+      return;
+    }
+
+    if (fstat(qfd, &st) != 0 || !S_ISREG(st.st_mode)) {
+      close(qfd);
+      send_err(fd, "quarantined file is not a regular file - refusing to restore");
+      return;
+    }
+
+    /* No clobbering - if something already occupies the original path,
+     * refuse rather than guess. Documented, narrow limitation: extend
+     * later with an explicit alternate-destination argument if this
+     * turns out to matter in practice. */
+    if (lstat(meta.original_path, &st) == 0) {
+      close(qfd);
+      send_err(fd, "original path is occupied - move or remove it first");
+      return;
+    }
+
+    if (fchmod(qfd, meta.original_mode) != 0) {
+      close(qfd);
+      send_err(fd, "chmod failed");
+      return;
+    }
+
+    /* fchown() on the already-open fd, NOT chown(meta.original_path,
+     * ...) after rename() - a path-based chown() done AFTER the file
+     * is reachable at meta.original_path has a TOCTOU: anything with
+     * write access to that path's parent directory could swap in a
+     * symlink between the rename() succeeding and the chown() call,
+     * and chown() follows symlinks - letting that attacker redirect a
+     * root-run chown() to an arbitrary target of their choosing.
+     * fchown() on this fd is immune: it always acts on the exact
+     * inode opened above, and happens before the file is reachable at
+     * meta.original_path at all, so there is nothing left to swap. */
+    if (fchown(qfd, meta.original_uid, meta.original_gid) != 0)
+      fprintf(stderr,
+              "avd: quarantine restore: fchown of \"%s\" failed: %s (file "
+              "will be restored under avd's own uid/gid instead)\n",
+              dest, strerror(errno));
+
+    if (rename(dest, meta.original_path) != 0) {
+      /* Leave it chmod'd/chown'd back to original but still under
+       * quarantine_dir rather than deleting the .meta - the operator
+       * can still recover it manually (e.g. the two directories are
+       * on different filesystems), and losing the recovery record
+       * here would be strictly worse than a restore that has to be
+       * retried. */
+      close(qfd);
+      send_err(fd, "rename failed (different filesystem? check "
+                  "/var/lib/av-quarantine manually)");
+      return;
+    }
+    close(qfd);
+  }
+
+  unlink(meta_path);
+  printf("avd: RESTORED \"%s\" -> \"%s\"\n", dest, meta.original_path);
+  write_all(fd, "OK\n", 3);
+}
+
+static void cmd_quarantine_delete(int fd, const char *id) {
+  char dest[PATH_MAX * 2], meta_path[PATH_MAX * 2 + 8]; /* see cmd_quarantine_restore()'s comment */
+
+  if (!quarantine_id_valid(id)) {
+    send_err(fd, "invalid id");
+    return;
+  }
+
+  snprintf(dest, sizeof(dest), "%s/%s.quarantined", quarantine_dir, id);
+  snprintf(meta_path, sizeof(meta_path), "%s.meta", dest);
+
+  if (unlink(dest) != 0 && errno != ENOENT) {
+    send_err(fd, "delete failed");
+    return;
+  }
+  unlink(meta_path); /* best effort - dest is already gone either way */
+  printf("avd: DELETED quarantined file \"%s\"\n", dest);
+  write_all(fd, "OK\n", 3);
+}
+
+static void cmd_scan(int fd, const char *path) {
+  struct scan_result result;
+  char row[PATH_MAX + 256];
+  struct stat st;
+  int sfd;
+
+  if (path[0] != '/') {
+    send_err(fd, "path must be absolute");
+    return;
+  }
+
+  /* O_NONBLOCK: without it, opening a FIFO for read-only blocks this
+   * connection's own thread until a writer opens the other end -
+   * given AVD_CONTROL_MAX_CONNS bounds those threads (see
+   * control_accept_main()'s comment), a client repeatedly SCANning a
+   * FIFO path could tie up every slot indefinitely. With O_NONBLOCK
+   * the open succeeds immediately regardless, and the fstat()+
+   * S_ISREG() check right below rejects it before perform_scan() ever
+   * touches it - along with every other non-regular-file case
+   * (character/block devices, sockets, directories). */
+  sfd = open(path, O_RDONLY | O_NONBLOCK);
+  if (sfd < 0) {
+    send_err(fd, "could not open path for scanning");
+    return;
+  }
+
+  if (fstat(sfd, &st) != 0 || !S_ISREG(st.st_mode)) {
+    close(sfd);
+    send_err(fd, "path is not a regular file");
+    return;
+  }
+
+  /* Clear O_NONBLOCK now that the file is known-regular (where the
+   * flag has no real read() effect anyway) - keeps this fd behaving
+   * identically to every other scan path's plain O_RDONLY open from
+   * here on, rather than leaving a flag set for a FIFO/device case
+   * that's already been ruled out. */
+  if (fcntl(sfd, F_SETFL, O_RDONLY) != 0) {
+    close(sfd);
+    send_err(fd, "could not prepare file for scanning");
+    return;
+  }
+
+  perform_scan(sfd, path, NULL, 0, true, &result);
+  close(sfd);
+
+  write_all(fd, "OK\n", 3);
+  write_all(fd, "COUNT 1\n", 8);
+  snprintf(row, sizeof(row), "%s\t%s\t%d\t%s\n",
+           result.verdict == AV_VERDICT_MALICIOUS ? "MALICIOUS" : "CLEAN",
+           result.rule_name, result.score, result.sha256_hex);
+  write_all(fd, row, strlen(row));
+  write_all(fd, "END\n", 4);
+}
+
+/*
+ * One control-socket connection, one command. Every state-changing
+ * verb (SCAN, QUARANTINE RESTORE/DELETE) requires `is_root` - resolved
+ * once by the caller via SO_PEERCRED, NOT re-checked per verb inside
+ * here, so this is the single gate all three go through. Read-only
+ * verbs (STATUS, VERDICTS, QUARANTINE LIST) answer any peer, matching
+ * this codebase's existing precedent of world-readable /proc state
+ * (e.g. /proc/kernel_av_signatures is 0644) with writes gated
+ * separately - see docs/avd-socket-protocol.md.
+ */
+/*
+ * sizeof(literal) - 1, NOT a hand-counted length - a manually-counted
+ * prefix length here previously drifted from the actual string length
+ * (17 vs. the real 16 for "VERDICTS RECENT ", 20 vs. 19 for
+ * "QUARANTINE RESTORE ", 19 vs. 18 for "QUARANTINE DELETE "), which
+ * silently broke every one of those commands: strncmp() with too LONG
+ * an n implicitly requires line[n-1] to be the prefix's own NUL
+ * terminator too, so it never matches a real command with an argument
+ * after it. Caught by tests/test_avd_socket.sh - see that file's
+ * comment for the exact repro. sizeof(literal)-1 can't drift from the
+ * literal it's computed from.
+ */
+#define PREFIX_MATCH(line, literal) \
+  (!strncmp((line), (literal), sizeof(literal) - 1))
+
+static void handle_control_line(int fd, const char *line, bool is_root) {
+  unsigned long n;
+  char *end;
+
+  if (!strcmp(line, "STATUS")) {
+    cmd_status(fd);
+  } else if (PREFIX_MATCH(line, "VERDICTS RECENT ")) {
+    const char *arg = line + sizeof("VERDICTS RECENT ") - 1;
+
+    n = strtoul(arg, &end, 10);
+    if (end == arg) {
+      send_err(fd, "malformed VERDICTS RECENT (expected a count)");
+      return;
+    }
+    cmd_verdicts_recent(fd, (size_t)n);
+  } else if (!strcmp(line, "QUARANTINE LIST")) {
+    cmd_quarantine_list(fd);
+  } else if (PREFIX_MATCH(line, "QUARANTINE RESTORE ")) {
+    if (!is_root) {
+      send_err(fd, "permission denied (use: pkexec avctl quarantine restore "
+                   "<id>)");
+      return;
+    }
+    cmd_quarantine_restore(fd, line + sizeof("QUARANTINE RESTORE ") - 1);
+  } else if (PREFIX_MATCH(line, "QUARANTINE DELETE ")) {
+    if (!is_root) {
+      send_err(fd, "permission denied (use: pkexec avctl quarantine delete "
+                   "<id>)");
+      return;
+    }
+    cmd_quarantine_delete(fd, line + sizeof("QUARANTINE DELETE ") - 1);
+  } else if (PREFIX_MATCH(line, "SCAN ")) {
+    if (!is_root) {
+      send_err(fd, "permission denied (use: pkexec avctl scan <path>)");
+      return;
+    }
+    cmd_scan(fd, line + sizeof("SCAN ") - 1);
+  } else {
+    send_err(fd, "unknown command");
+  }
+}
+
+struct control_conn_ctx {
+  int fd;
+};
+
+/* Guards control_conn_count, incremented (with the AVD_CONTROL_MAX_CONNS
+ * check) in control_accept_main() before a connection thread is
+ * spawned, decremented here on every exit from control_conn_main() -
+ * there is exactly one exit point below, so one decrement covers it. */
+static pthread_mutex_t control_conn_count_lock = PTHREAD_MUTEX_INITIALIZER;
+static int control_conn_count;
+
+static void *control_conn_main(void *arg) {
+  struct control_conn_ctx *ctx = arg;
+  char line[AVD_SOCK_LINE_MAX];
+  struct ucred cred;
+  socklen_t cred_len = sizeof(cred);
+  struct timeval tv;
+  bool is_root = false;
+  ssize_t len;
+
+  /* Bounds how long this connection's thread (and therefore its
+   * AVD_CONTROL_MAX_CONNS slot) can be tied up on a single blocking
+   * read()/write() call - read_line() below already treats any
+   * read() error other than EINTR as failure, so a timeout
+   * (EAGAIN/EWOULDBLOCK once this fires) falls out as the same
+   * "malformed request" response as any other read failure, with no
+   * separate handling needed there; write_all() (used by every cmd_*
+   * response below) already does the same for write() errors. This
+   * alone is NOT sufficient against a client trickling one byte just
+   * under this interval at a time (SO_RCVTIMEO only bounds each
+   * individual call, not the cumulative time to read a whole line) -
+   * read_line() additionally enforces its own absolute deadline for
+   * exactly that reason; SO_RCVTIMEO stays as a second layer under
+   * it. SO_SNDTIMEO has no such second layer today, but write_all()
+   * only ever sends a bounded, small response (a handful of KB at
+   * most for e.g. VERDICTS RECENT), so a client that stops reading
+   * mid-response is the only way to hit it, not a slow-trickle
+   * variant of the same problem. Best-effort: a failure to set either
+   * is logged but doesn't refuse the connection outright - worst case
+   * it behaves like it did before this fix. */
+  tv.tv_sec = AVD_CONTROL_RECV_TIMEOUT_SECS;
+  tv.tv_usec = 0;
+  if (setsockopt(ctx->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0)
+    fprintf(stderr, "avd: could not set control connection receive timeout: %s\n",
+            strerror(errno));
+  if (setsockopt(ctx->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0)
+    fprintf(stderr, "avd: could not set control connection send timeout: %s\n",
+            strerror(errno));
+
+  /* SO_PEERCRED is valid any time on a connected AF_UNIX stream socket
+   * (not just immediately post-accept), and returns credentials the
+   * KERNEL captured at connect() time from the connecting process -
+   * not attacker-writable, same trust boundary as nlmsg_get_src() in
+   * msg_handler() above. A failure here (should not happen for a
+   * genuine AF_UNIX peer) fails closed: is_root stays false, so every
+   * privileged verb gets rejected rather than silently trusted. */
+  if (getsockopt(ctx->fd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) == 0)
+    is_root = (cred.uid == 0);
+
+  len = read_line(ctx->fd, line, sizeof(line));
+  if (len < 0)
+    send_err(ctx->fd,
+             "malformed request (missing newline, line too long, or timed out)");
+  else if (len > 0)
+    handle_control_line(ctx->fd, line, is_root);
+  /* len == 0: peer connected and disconnected without sending
+   * anything - nothing to respond to, not an error. */
+
+  close(ctx->fd);
+  free(ctx);
+
+  pthread_mutex_lock(&control_conn_count_lock);
+  control_conn_count--;
+  pthread_mutex_unlock(&control_conn_count_lock);
+
+  return NULL;
+}
+
+/* Best-effort mkdir of `path`'s parent directory - mirrors
+ * ensure_quarantine_dir()'s stance (not fatal if it already exists,
+ * loud if it can't be created for some other reason). Needed for
+ * manual/test runs of avd outside systemd; under avd.service,
+ * RuntimeDirectory=avd already creates /run/avd before avd starts, so
+ * this is a no-op there (mkdir returns EEXIST). dirname() may modify
+ * its argument, hence the local scratch copy. */
+static int ensure_parent_dir(const char *path, mode_t mode) {
+  char buf[PATH_MAX];
+  char *dir;
+
+  snprintf(buf, sizeof(buf), "%s", path);
+  dir = dirname(buf);
+  if (mkdir(dir, mode) == 0 || errno == EEXIST)
+    return 0;
+  fprintf(stderr, "avd: could not create directory \"%s\": %s\n", dir,
+          strerror(errno));
+  return -1;
+}
+
+static int start_control_socket(void) {
+  struct sockaddr_un addr;
+
+  if (ensure_parent_dir(control_sock_path, 0755) != 0)
+    return -1;
+
+  if (strlen(control_sock_path) >= sizeof(addr.sun_path)) {
+    fprintf(stderr, "avd: control socket path \"%s\" too long\n",
+            control_sock_path);
+    return -1;
+  }
+
+  /* A stale socket file from a previous unclean shutdown (kill -9,
+   * crash) would otherwise make bind() fail with EADDRINUSE even
+   * though nothing is listening on it any more. */
+  unlink(control_sock_path);
+
+  control_sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (control_sock_fd < 0) {
+    fprintf(stderr, "avd: control socket() failed: %s\n", strerror(errno));
+    return -1;
+  }
+
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", control_sock_path);
+
+  if (bind(control_sock_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    fprintf(stderr, "avd: could not bind control socket \"%s\": %s\n",
+            control_sock_path, strerror(errno));
+    close(control_sock_fd);
+    control_sock_fd = -1;
+    return -1;
+  }
+
+  /* World-writable-connect, not world-writable-privileged: every verb
+   * that mutates state is separately gated by the SO_PEERCRED check in
+   * control_conn_main()/handle_control_line() above, so this mode is
+   * what actually lets an unprivileged GUI process reach the read-only
+   * verbs at all - same "gate specific commands, not the whole
+   * channel" pattern as GENL_ADMIN_PERM in av/netlink_chan.c. */
+  if (chmod(control_sock_path, 0666) != 0)
+    fprintf(stderr,
+            "avd: chmod of control socket \"%s\" failed: %s - unprivileged "
+            "clients (e.g. the GUI) may not be able to connect\n",
+            control_sock_path, strerror(errno));
+
+  if (listen(control_sock_fd, 16) != 0) {
+    fprintf(stderr, "avd: control socket listen() failed: %s\n",
+            strerror(errno));
+    close(control_sock_fd);
+    control_sock_fd = -1;
+    unlink(control_sock_path);
+    return -1;
+  }
+
+  return 0;
+}
+
+/* Accept loop - one thread, spawns a short-lived detached thread per
+ * connection (control_conn_main() above) since each connection handles
+ * exactly one command and then closes; a full worker-pool-plus-queue
+ * like the scan path's is unwarranted here; these connections are rare
+ * (interactive avctl/GUI use, not a hot path) and each one is brief. */
+static void *control_accept_main(void *arg) {
+  (void)arg;
+
+  while (running) {
+    struct control_conn_ctx *ctx;
+    pthread_t tid;
+    int cfd = accept(control_sock_fd, NULL, NULL);
+
+    if (cfd < 0) {
+      if (errno == EINTR)
+        continue;
+      if (!running) /* expected - see main()'s shutdown sequence, which
+                    * closes control_sock_fd to unblock this accept() */
+        break;
+      fprintf(stderr, "avd: control accept() failed: %s\n", strerror(errno));
+      continue;
+    }
+
+    {
+      bool slot_reserved;
+
+      pthread_mutex_lock(&control_conn_count_lock);
+      slot_reserved = control_conn_count < AVD_CONTROL_MAX_CONNS;
+      if (slot_reserved)
+        control_conn_count++;
+      pthread_mutex_unlock(&control_conn_count_lock);
+
+      if (!slot_reserved) {
+        /* Reject outright rather than queueing - see
+         * AVD_CONTROL_MAX_CONNS's comment. A real client (avctl/GUI)
+         * gets a clear error and can just retry shortly; a client
+         * trying to exhaust connections gets nothing to hold onto. */
+        send_err(cfd, "too many concurrent control connections - try again shortly");
+        close(cfd);
+        continue;
+      }
+    }
+
+    ctx = malloc(sizeof(*ctx));
+    if (!ctx) {
+      close(cfd);
+      pthread_mutex_lock(&control_conn_count_lock);
+      control_conn_count--;
+      pthread_mutex_unlock(&control_conn_count_lock);
+      continue;
+    }
+    ctx->fd = cfd;
+
+    if (pthread_create(&tid, NULL, control_conn_main, ctx) != 0) {
+      close(cfd);
+      free(ctx);
+      pthread_mutex_lock(&control_conn_count_lock);
+      control_conn_count--;
+      pthread_mutex_unlock(&control_conn_count_lock);
+      continue;
+    }
+    pthread_detach(tid);
+  }
+
+  return NULL;
+}
+
 int main(int argc, char **argv) {
   const char *rules_dir = DEFAULT_RULES_DIR;
   const char *corpus_file = DEFAULT_CORPUS_FILE;
@@ -1346,10 +2361,32 @@ int main(int argc, char **argv) {
   else if (getenv("AVD_TLSH_CORPUS_FILE"))
     tlsh_corpus_file = getenv("AVD_TLSH_CORPUS_FILE");
 
+  if (argc > 5)
+    control_sock_path = argv[5];
+  else if (getenv("AVD_SOCK_PATH"))
+    control_sock_path = getenv("AVD_SOCK_PATH");
+
   printf("avd: quarantine directory: %s\n", quarantine_dir);
+  printf("avd: control socket: %s\n", control_sock_path);
+
+  start_time = time(NULL);
 
   signal(SIGINT, handle_sigint);
   signal(SIGTERM, handle_sigint);
+  /* Without this, any write()/send() into a control-socket connection
+   * whose peer already closed (a killed avctl, the GUI navigating
+   * away mid-request, a network hiccup on a remote mount of the
+   * socket path, etc.) raises SIGPIPE - whose default disposition is
+   * to terminate the WHOLE PROCESS, not just that connection's
+   * thread. Found by testing (a harness closing many client fds while
+   * avd was still mid-response killed the entire daemon, not just
+   * those connections). write_all()/send_err() already treat a
+   * failed write as "give up on this one response" (they check the
+   * return value and just stop, no retry-forever loop), so ignoring
+   * SIGPIPE here is sufficient - write()/send() then simply return -1
+   * with errno EPIPE instead of raising the signal, and existing error
+   * handling takes it from there. */
+  signal(SIGPIPE, SIG_IGN);
 
   if (load_rules(rules_dir) != 0) {
     fprintf(stderr, "avd: failed to initialize YARA - aborting\n");
@@ -1405,6 +2442,8 @@ int main(int argc, char **argv) {
 
   {
     pthread_t workers[AVD_SCAN_THREADS];
+    pthread_t control_thread;
+    bool control_started;
     int i, spawned = 0;
 
     for (i = 0; i < AVD_SCAN_THREADS; i++) {
@@ -1426,6 +2465,28 @@ int main(int argc, char **argv) {
               "reduced concurrency\n",
               spawned, AVD_SCAN_THREADS);
 
+    /* Not fatal if this fails (permissions, read-only /run, etc.) -
+     * the daemon's actual job (kernel-triggered scanning) doesn't
+     * depend on it, so avd degrades to "no GUI/avctl management path"
+     * rather than refusing to start entirely. */
+    control_started = (start_control_socket() == 0);
+    if (control_started) {
+      if (pthread_create(&control_thread, NULL, control_accept_main, NULL) !=
+          0) {
+        fprintf(stderr, "avd: pthread_create failed for control socket: %s\n",
+                strerror(errno));
+        close(control_sock_fd);
+        control_sock_fd = -1;
+        unlink(control_sock_path);
+        control_started = false;
+      }
+    } else {
+      fprintf(stderr,
+              "avd: control socket unavailable - avctl/GUI management "
+              "commands will not work, kernel-triggered scanning is "
+              "unaffected\n");
+    }
+
     while (running) {
       int ret = nl_recvmsgs_default(sock);
       if (ret < 0 && ret != -NLE_INTR) {
@@ -1444,6 +2505,43 @@ int main(int argc, char **argv) {
 
     for (i = 0; i < spawned; i++)
       pthread_join(workers[i], NULL);
+
+    if (control_started) {
+      /* Closing control_sock_fd out from under control_accept_main()'s
+       * blocked accept() call does NOT reliably unblock it - verified
+       * empirically while testing this (see
+       * tests/test_avd_socket.sh's comment): unlike a blocking read()
+       * on a pipe, another thread closing an fd out from under a
+       * thread already parked in accept() on it is not guaranteed by
+       * POSIX to interrupt that call, and in practice it just hangs.
+       * The reliable fix is the classic self-pipe trick adapted to a
+       * listening socket: connect to our own control socket to hand
+       * accept() a real (if pointless) connection, which wakes the
+       * loop up so it can observe `running == 0` and exit on its own.
+       * That dummy connection gets a short-lived handler thread
+       * spawned for it like any other (control_conn_main() below,
+       * reading an empty line from a peer that's already gone -
+       * harmless), which is fine since this only happens once, at
+       * shutdown. */
+      {
+        int wake_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+
+        if (wake_fd >= 0) {
+          struct sockaddr_un wake_addr;
+
+          memset(&wake_addr, 0, sizeof(wake_addr));
+          wake_addr.sun_family = AF_UNIX;
+          snprintf(wake_addr.sun_path, sizeof(wake_addr.sun_path), "%s",
+                   control_sock_path);
+          connect(wake_fd, (struct sockaddr *)&wake_addr, sizeof(wake_addr));
+          close(wake_fd);
+        }
+      }
+      pthread_join(control_thread, NULL);
+      close(control_sock_fd);
+      control_sock_fd = -1;
+      unlink(control_sock_path);
+    }
   }
 
   nl_socket_free(sock);

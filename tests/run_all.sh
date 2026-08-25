@@ -18,6 +18,12 @@ echo "### building avctl ###"
 make -C "$REPO_ROOT/userspace/avctl" || FAIL=1
 
 echo
+echo "### test_sha256.sh (known-answer tests for userspace/avd/sha256.c) ###"
+# No kernel module/root needed for this one, unlike everything else
+# here - it just doesn't hurt to run it under the same sudo invocation.
+"$REPO_ROOT/tests/test_sha256.sh" || FAIL=1
+
+echo
 echo "### test_detection.sh (build av/, load, exercise clean+EICAR, unload) ###"
 "$REPO_ROOT/tests/test_detection.sh" || FAIL=1
 
@@ -28,6 +34,12 @@ echo "### test_sigtable.sh (avctl/proc protocol) ###"
 insmod "$REPO_ROOT/av/av.ko" 2>/dev/null || true
 "$REPO_ROOT/tests/test_sigtable.sh" || FAIL=1
 rmmod av 2>/dev/null || true
+
+echo
+echo "### test_avd_socket.sh (avd control socket / avctl scan+quarantine) ###"
+# Builds+loads/unloads the module and starts/stops avd itself - no
+# reload dance needed here, unlike test_sigtable.sh above.
+"$REPO_ROOT/tests/test_avd_socket.sh" || FAIL=1
 
 echo
 if [ "$FAIL" -ne 0 ]; then
