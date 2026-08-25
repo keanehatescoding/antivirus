@@ -42,6 +42,19 @@ BuildRequires:  yara-devel
 BuildRequires:  ssdeep-devel
 BuildRequires:  tlsh-devel
 BuildRequires:  systemd-rpm-macros
+# userspace/av-gui/Makefile's `install` target (invoked in %install
+# below) depends on `checkdeps`, which imports gi and loads GTK4
+# before staging any files - needed at build time, not just via
+# hyprav-gui's own runtime Requires further down.
+BuildRequires:  python3-gobject
+BuildRequires:  gtk4
+
+# avctl is invoked as `pkexec avctl ...` by hyprav-gui (see
+# pkexec_helper.py) and this package installs the polkit action
+# (org.hyprav.avctl.policy) that authorizes it - pkexec itself isn't
+# auto-pulled by RPM's dependency generator (that only covers shared
+# libraries, not exec'd binaries), so it needs an explicit Requires.
+Requires:       /usr/bin/pkexec
 
 %description
 HyprAV is a kprobe-based kernel module (av.ko) that hooks execve and
