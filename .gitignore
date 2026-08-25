@@ -17,3 +17,7 @@ tests/qemu-boot/cold_launcher
 tests/qemu-boot/root/
 tests/qemu-boot/initramfs.cpio.gz
 tests/qemu-boot/serial.log
+packaging/arch/pkg/
+packaging/arch/src/
+packaging/arch/*.pkg.tar.*
+packaging/arch/hyprav/

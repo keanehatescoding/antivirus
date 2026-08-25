@@ -19,7 +19,7 @@ pkgrel=1
 arch=('x86_64')
 url="https://github.com/keanehatescoding/antivirus"
 license=('GPL3')
-makedepends=('git' 'linux-headers' 'libnl' 'yara' 'ssdeep' 'tlsh' 'pkgconf')
+makedepends=('git' 'linux-cachyos-headers' 'libnl' 'yara' 'ssdeep' 'tlsh' 'pkgconf')
 source=("hyprav::git+https://github.com/keanehatescoding/antivirus.git")
 sha256sums=('SKIP')
 
@@ -35,10 +35,22 @@ build() {
   # - this build output is NOT what gets installed. hyprav-dkms ships
   # the module *source*; dkms compiles it fresh against every kernel
   # it's actually installed under (see package_hyprav-dkms below).
+  #
+  # av/Makefile's own CC=clang/LLVM=1 support (see its comments) is
+  # for matching a Clang-built kernel (e.g. some CachyOS variants) -
+  # inherit whatever the caller passed for CC/CXX/LLVM here.
   make -C av
 
-  make -C userspace/avd
-  make -C userspace/avctl
+  # userspace/avd and userspace/avctl have no kernel-ABI dependency
+  # and don't need to match the running kernel's compiler at all -
+  # pin plain gcc/g++ explicitly rather than letting a CC=clang meant
+  # for the kernel module leak in here too. That matters because
+  # Arch's default CFLAGS enable -flto=auto: mixing a clang-compiled
+  # avd.o (LLVM bitcode) with a g++-compiled tlsh_shim.o (GCC bitcode)
+  # at link time fails ("file not recognized") since the two
+  # compilers' LTO object formats aren't interchangeable.
+  make -C userspace/avd CC=gcc CXX=g++
+  make -C userspace/avctl CC=gcc
 }
 
 package_hyprav-dkms() {
@@ -87,8 +99,10 @@ package_hyprav() {
           'etc/hyprav/tlsh_hashes.txt')
 
   cd hyprav
-  make -C userspace/avd install DESTDIR="$pkgdir" PREFIX=/usr
-  make -C userspace/avctl install DESTDIR="$pkgdir" PREFIX=/usr
+  # Same CC/CXX pin as build() above - avd/avctl have no kernel-ABI
+  # dependency and must not inherit a CC=clang meant for av.ko.
+  make -C userspace/avd install DESTDIR="$pkgdir" PREFIX=/usr CC=gcc CXX=g++
+  make -C userspace/avctl install DESTDIR="$pkgdir" PREFIX=/usr CC=gcc
 
   # avd.service's ExecStart points here (see packaging/avd.service) -
   # RuntimeDirectory= covers /run/avd, but this quarantine store under
