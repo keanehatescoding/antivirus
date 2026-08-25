@@ -1,0 +1,68 @@
+#!/usr/bin/make -f
+
+include /usr/share/dpkg/pkg-info.mk
+
+export DH_VERBOSE = 1
+
+%:
+	dh $@
+
+# Only avd/avctl are actually compiled at package-build time. av.ko
+# (hyprav-dkms) ships as source only - dkms compiles it on the target
+# machine against whatever kernel is actually installed there, same
+# reasoning as packaging/arch/PKGBUILD's build().
+override_dh_auto_build:
+	$(MAKE) -C userspace/avd
+	$(MAKE) -C userspace/avctl
+
+override_dh_auto_install:
+	$(MAKE) -C userspace/avd install \
+		DESTDIR=$(CURDIR)/debian/hyprav PREFIX=/usr
+	$(MAKE) -C userspace/avctl install \
+		DESTDIR=$(CURDIR)/debian/hyprav PREFIX=/usr
+	# 0700, not 0755: matches avd.c's own mkdir(quarantine_dir, 0700) -
+	# it holds quarantined malware. Confirmed on a real Debian 13 box
+	# that 0755 here just fights that at runtime for no reason.
+	install -dm700 $(CURDIR)/debian/hyprav/var/lib/av-quarantine
+
+	install -dm755 $(CURDIR)/debian/hyprav-dkms/usr/src/hyprav-av-$(DEB_VERSION_UPSTREAM)
+	cp -r av/* $(CURDIR)/debian/hyprav-dkms/usr/src/hyprav-av-$(DEB_VERSION_UPSTREAM)/
+	# KDIR override for the same reason as the Arch PKGBUILD: dkms may
+	# build against a kernel that isn't the one currently `uname -r`
+	# reports (e.g. mid kernel-upgrade, before reboot).
+	echo 'PACKAGE_NAME="hyprav-av"' \
+		> $(CURDIR)/debian/hyprav-dkms/usr/src/hyprav-av-$(DEB_VERSION_UPSTREAM)/dkms.conf
+	echo 'PACKAGE_VERSION="$(DEB_VERSION_UPSTREAM)"' \
+		>> $(CURDIR)/debian/hyprav-dkms/usr/src/hyprav-av-$(DEB_VERSION_UPSTREAM)/dkms.conf
+	echo 'BUILT_MODULE_NAME[0]="av"' \
+		>> $(CURDIR)/debian/hyprav-dkms/usr/src/hyprav-av-$(DEB_VERSION_UPSTREAM)/dkms.conf
+	echo 'DEST_MODULE_LOCATION[0]="/kernel/drivers/misc"' \
+		>> $(CURDIR)/debian/hyprav-dkms/usr/src/hyprav-av-$(DEB_VERSION_UPSTREAM)/dkms.conf
+	echo 'AUTOINSTALL="yes"' \
+		>> $(CURDIR)/debian/hyprav-dkms/usr/src/hyprav-av-$(DEB_VERSION_UPSTREAM)/dkms.conf
+	echo 'MAKE[0]="make KDIR=$${kernel_source_dir}"' \
+		>> $(CURDIR)/debian/hyprav-dkms/usr/src/hyprav-av-$(DEB_VERSION_UPSTREAM)/dkms.conf
+	echo 'CLEAN="make KDIR=$${kernel_source_dir} clean"' \
+		>> $(CURDIR)/debian/hyprav-dkms/usr/src/hyprav-av-$(DEB_VERSION_UPSTREAM)/dkms.conf
+
+	$(MAKE) -C userspace/av-gui install \
+		DESTDIR=$(CURDIR)/debian/hyprav-gui PREFIX=/usr
+
+# dh_fixperms (standard part of the dh sequence) normalizes every
+# shipped directory back toward 0755 regardless of what
+# override_dh_auto_install set - confirmed on a real Debian 13 box:
+# the built .deb still recorded av-quarantine as drwxr-xr-x despite
+# the install -dm700 above. Re-apply 0700 after the normal fixperms
+# pass runs rather than fighting it earlier in the sequence.
+override_dh_fixperms:
+	dh_fixperms
+	chmod 0700 debian/hyprav/var/lib/av-quarantine
+
+# hyprav's own install intentionally doesn't enable/start avd.service -
+# it scans and quarantines files system-wide as root, unsandboxed (see
+# packaging/avd.service's comments and the top-level README); a fresh
+# install shouldn't silently turn that on. Debian's dh_installsystemd
+# defaults to enable+start, so override that default explicitly rather
+# than relying on it happening to match. daemon-reload still runs.
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start

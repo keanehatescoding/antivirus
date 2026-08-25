@@ -1,0 +1,158 @@
+# Maintainer: Your Name <you@example.com>
+#
+# Split package: the av.ko kernel module is version-pinned to whatever
+# kernel it's built against, so it ships separately via DKMS
+# (hyprav-dkms) and gets rebuilt automatically on every kernel
+# upgrade. avd/avctl (hyprav) and the GTK4 console (hyprav-gui) are
+# plain userspace and don't need any of that.
+#
+# Tracks the git repo directly (no tagged release covers av-gui yet -
+# see the top-level README). Pin to a specific commit/tag instead by
+# changing the `source` line below to
+# git+https://github.com/keanehatescoding/antivirus.git#tag=vX.Y.Z
+# if you'd rather not build off the moving master branch.
+#
+# TEMPORARY: pinned to #branch=packaging/distro-packages because this
+# very PKGBUILD (and LICENSE, which package_hyprav-dkms()/package_hyprav()
+# below both install) only exists on that branch, not yet on master -
+# makepkg's git source clones from GitHub over the network, so it has
+# no idea this file was edited locally. Revert to the plain
+# `git+https://github.com/keanehatescoding/antivirus.git` URL (no
+# #branch=) once PR #29 merges to master.
+
+pkgbase=hyprav
+pkgname=('hyprav-dkms' 'hyprav' 'hyprav-gui')
+pkgver=0.9.0.r134.g849b462
+pkgrel=1
+arch=('x86_64')
+url="https://github.com/keanehatescoding/antivirus"
+license=('GPL3')
+makedepends=('git' 'linux-headers' 'libnl' 'yara' 'ssdeep' 'tlsh' 'pkgconf')
+source=("hyprav::git+https://github.com/keanehatescoding/antivirus.git#branch=packaging/distro-packages")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd hyprav
+  git describe --long --tags | sed 's/^v//; s/-/.r/; s/-/./'
+}
+
+build() {
+  cd hyprav
+
+  # Compile-sanity check against the builder's own kernel headers only
+  # - this build output is NOT what gets installed. hyprav-dkms ships
+  # the module *source*; dkms compiles it fresh against every kernel
+  # it's actually installed under (see package_hyprav-dkms below).
+  #
+  # av/Makefile's own CC=clang/LLVM=1 support (see its comments) is
+  # for matching a Clang-built kernel (e.g. some CachyOS variants) -
+  # inherit whatever the caller passed for CC/CXX/LLVM here. Cleaned
+  # first for the same stale-object reason as userspace below, in
+  # case an earlier retry used a different CC/LLVM combination.
+  make -C av clean
+  make -C av
+
+  # `make clean` first, unconditionally: makepkg reuses $srcdir across
+  # retries of a failed build rather than wiping it (that only happens
+  # with --cleanbuild), so a .o left over from a build that used a
+  # different CC/CXX can otherwise survive - Make only checks
+  # timestamps, not which compiler produced a file, and will happily
+  # skip recompiling a stale object and hand it straight to the
+  # linker. Hit exactly this: a clang-compiled avd.o from a prior
+  # attempt outlived the CC=gcc fix below and broke the link anyway.
+  #
+  # userspace/avd and userspace/avctl have no kernel-ABI dependency
+  # and don't need to match the running kernel's compiler at all -
+  # pin plain gcc/g++ explicitly rather than letting a CC=clang meant
+  # for the kernel module leak in here too. That matters because
+  # Arch's default CFLAGS enable -flto=auto: mixing a clang-compiled
+  # avd.o (LLVM bitcode) with a g++-compiled tlsh_shim.o (GCC bitcode)
+  # at link time fails ("file not recognized") since the two
+  # compilers' LTO object formats aren't interchangeable.
+  make -C userspace/avd clean
+  make -C userspace/avd CC=gcc CXX=g++
+  make -C userspace/avctl clean
+  make -C userspace/avctl CC=gcc
+}
+
+package_hyprav-dkms() {
+  pkgdesc="HyprAV kprobe-based execve/file-event kernel module (DKMS source package)"
+  depends=('dkms')
+
+  # No install= script here on purpose: the `dkms` package itself ships
+  # pacman hooks (/usr/share/libalpm/hooks/70-dkms-install.hook etc.)
+  # that trigger generically on any usr/src/*/dkms.conf and run
+  # `dkms install`/`dkms remove` automatically - a custom postinst
+  # calling `dkms add -v "$1"` here would be not just redundant but
+  # wrong: pacman .install scripts receive $1 as the full
+  # $pkgver-$pkgrel string, not the bare $pkgver this directory is
+  # named after (confirmed the hard way - real install, real "Could
+  # not find module source directory" error, papered over only
+  # because dkms's own hook succeeded independently anyway).
+
+  local _dkmsdir="$pkgdir/usr/src/hyprav-av-$pkgver"
+  install -dm755 "$_dkmsdir"
+  cp -r hyprav/av/* "$_dkmsdir/"
+  # Drop the compile-sanity build() left behind - dkms needs a clean
+  # source tree, it builds its own .o/.ko under /var/lib/dkms/.
+  rm -f "$_dkmsdir"/*.o "$_dkmsdir"/*.ko "$_dkmsdir"/.*.cmd \
+        "$_dkmsdir"/Module.symvers "$_dkmsdir"/modules.order
+  rm -rf "$_dkmsdir"/.tmp_versions
+
+  # KDIR is passed explicitly because dkms builds against a target
+  # kernel that may not be the currently *running* one (e.g. mid
+  # kernel-upgrade transaction, pre-reboot) - av/Makefile's own
+  # `KDIR ?= /lib/modules/$(shell uname -r)/build` default would
+  # silently build against the wrong kernel in that case. dkms sets
+  # $kernel_source_dir/$kernelver as shell vars before evaluating
+  # these MAKE[]/CLEAN lines.
+  cat > "$_dkmsdir/dkms.conf" <<EOF
+PACKAGE_NAME="hyprav-av"
+PACKAGE_VERSION="$pkgver"
+BUILT_MODULE_NAME[0]="av"
+DEST_MODULE_LOCATION[0]="/kernel/drivers/misc"
+AUTOINSTALL="yes"
+MAKE[0]="make KDIR=\${kernel_source_dir}"
+CLEAN="make KDIR=\${kernel_source_dir} clean"
+EOF
+
+  install -Dm644 hyprav/LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
+
+package_hyprav() {
+  pkgdesc="HyprAV userspace scanning daemon (avd) and control CLI (avctl) - YARA/entropy/fuzzy-hash detection, quarantine"
+  depends=('libnl' 'yara' 'ssdeep' 'tlsh' 'polkit' 'systemd')
+  optdepends=('hyprav-dkms: kernel-level execve/file interception; avd refuses to start without av.ko loaded')
+  backup=('etc/hyprav/rules/heuristics.yar'
+          'etc/hyprav/rules/elf_analysis.yar'
+          'etc/hyprav/rules/entropy.yar'
+          'etc/hyprav/rules/test.yar'
+          'etc/hyprav/fuzzy_hashes.txt'
+          'etc/hyprav/tlsh_hashes.txt')
+
+  cd hyprav
+  # Same CC/CXX pin as build() above - avd/avctl have no kernel-ABI
+  # dependency and must not inherit a CC=clang meant for av.ko.
+  make -C userspace/avd install DESTDIR="$pkgdir" PREFIX=/usr CC=gcc CXX=g++
+  make -C userspace/avctl install DESTDIR="$pkgdir" PREFIX=/usr CC=gcc
+
+  # avd.service's ExecStart points here (see packaging/avd.service) -
+  # RuntimeDirectory= covers /run/avd, but this quarantine store under
+  # /var needs to exist ahead of the first detection. 0700 matches
+  # avd.c's own mkdir(quarantine_dir, 0700) at runtime (it holds
+  # quarantined malware) - 0755 here would've fought that on every
+  # install (confirmed: pacman warned "directory permissions differ").
+  install -dm700 "$pkgdir/var/lib/av-quarantine"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
+
+package_hyprav-gui() {
+  pkgdesc="GTK4 management console for HyprAV (dashboard, detections, quarantine, signatures/trust/policy)"
+  depends=('python-gobject' 'gtk4' 'hyprav')
+
+  cd hyprav/userspace/av-gui
+  make install DESTDIR="$pkgdir" PREFIX=/usr
+
+  install -Dm644 ../../LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

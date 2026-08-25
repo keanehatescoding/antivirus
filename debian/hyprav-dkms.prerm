@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+
+DKMS_DIR=$(ls -d /usr/src/hyprav-av-*/ 2>/dev/null | head -n1)
+DKMS_VER=$(basename "$DKMS_DIR" | sed 's/^hyprav-av-//')
+
+case "$1" in
+    remove|deconfigure|upgrade)
+        # Also on upgrade: this runs against the OLD version's
+        # /usr/src/hyprav-av-<version>/ before dpkg unpacks the new
+        # one, so skipping "upgrade" here would leave a stale dkms
+        # registration behind every time the package version changes.
+        if [ -n "$DKMS_VER" ]; then
+            dkms remove -m hyprav-av -v "$DKMS_VER" --all || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
