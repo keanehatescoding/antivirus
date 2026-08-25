@@ -20,7 +20,10 @@ override_dh_auto_install:
 		DESTDIR=$(CURDIR)/debian/hyprav PREFIX=/usr
 	$(MAKE) -C userspace/avctl install \
 		DESTDIR=$(CURDIR)/debian/hyprav PREFIX=/usr
-	install -dm755 $(CURDIR)/debian/hyprav/var/lib/av-quarantine
+	# 0700, not 0755: matches avd.c's own mkdir(quarantine_dir, 0700) -
+	# it holds quarantined malware. Confirmed on a real Debian 13 box
+	# that 0755 here just fights that at runtime for no reason.
+	install -dm700 $(CURDIR)/debian/hyprav/var/lib/av-quarantine
 
 	install -dm755 $(CURDIR)/debian/hyprav-dkms/usr/src/hyprav-av-$(DEB_VERSION_UPSTREAM)
 	cp -r av/* $(CURDIR)/debian/hyprav-dkms/usr/src/hyprav-av-$(DEB_VERSION_UPSTREAM)/

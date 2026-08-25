@@ -97,7 +97,11 @@ make -C userspace/avctl
 %install
 make -C userspace/avd install DESTDIR=%{buildroot} PREFIX=%{_prefix} UNITDIR=%{_unitdir}
 make -C userspace/avctl install DESTDIR=%{buildroot} PREFIX=%{_prefix} POLKIT_ACTIONDIR=%{_datadir}/polkit-1/actions
-install -dm755 %{buildroot}%{_localstatedir}/lib/av-quarantine
+# 0700, not 0755: matches avd.c's own mkdir(quarantine_dir, 0700) -
+# it holds quarantined malware. Confirmed on a real Debian 13 box
+# (same underlying bug, different distro) that 0755 here just fights
+# that at runtime for no reason.
+install -dm700 %{buildroot}%{_localstatedir}/lib/av-quarantine
 
 install -dm755 %{buildroot}%{_usrsrc}/hyprav-av-%{version}
 cp -r av/* %{buildroot}%{_usrsrc}/hyprav-av-%{version}/
@@ -144,7 +148,7 @@ dkms remove -m hyprav-av -v %{version} --all || :
 %config(noreplace) %{_sysconfdir}/hyprav/rules/*.yar
 %config(noreplace) %{_sysconfdir}/hyprav/fuzzy_hashes.txt
 %config(noreplace) %{_sysconfdir}/hyprav/tlsh_hashes.txt
-%dir %{_localstatedir}/lib/av-quarantine
+%attr(0700,root,root) %dir %{_localstatedir}/lib/av-quarantine
 
 %files -n hyprav-dkms
 %license LICENSE
