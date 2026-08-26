@@ -1,0 +1,176 @@
+name: Build distro packages
+
+# Builds the .deb (Debian/Ubuntu), .pkg.tar.zst (Arch), and .rpm
+# (Fedora) packages under packaging/ on every push/PR, so a packaging
+# regression (a missing BuildRequires, a broken Makefile override, a
+# stale pinned source) gets caught the same way build-matrix.yml
+# catches a kernel-compat regression. Unlike that workflow, none of
+# these three jobs touch av.ko at all: hyprav-dkms ships it as DKMS
+# *source* in every one of these formats (see debian/rules,
+# packaging/arch/PKGBUILD, and packaging/fedora/hyprav.spec's own
+# comments) - actually compiling it happens later, on the end user's
+# machine, against whatever kernel is really installed there, not at
+# package-build time. This only verifies the PACKAGES build.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-latest
+    # Debian/Ubuntu, not a generic ubuntu-latest apt install: these
+    # exact build-dep package names (notably libtlsh-dev,
+    # gir1.2-gtk-4.0) were confirmed against a real Debian 13 (trixie)
+    # box (see debian/control's own comment) - Ubuntu's repos aren't
+    # guaranteed to carry the same names/versions.
+    container: debian:trixie
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            build-essential dpkg-dev debhelper \
+            pkg-config libnl-genl-3-dev libyara-dev libfuzzy-dev libtlsh-dev \
+            python3-gi gir1.2-gtk-4.0
+
+      - name: dpkg-buildpackage
+        # Unsigned (-us -uc) - no GPG key available in CI, and these
+        # aren't meant to be published as-is.
+        run: dpkg-buildpackage -us -uc -b
+
+      - name: Upload .deb packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: deb-packages
+          # dpkg-buildpackage places output one directory ABOVE the
+          # source tree it was invoked in, not inside it.
+          path: ${{ github.workspace }}/../*.deb
+          if-no-files-found: error
+
+  build-arch:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # PKGBUILD's pkgver() runs `git describe --long --tags`,
+          # which needs full tag history - the default shallow
+          # (depth-1) checkout has none of it.
+          fetch-depth: 0
+
+      - name: Install bootstrap dependencies
+        # Only what's needed to get makepkg itself running as a
+        # non-root user - `makepkg -s` below auto-installs every real
+        # package makedepend (libnl/yara/ssdeep/tlsh/pkgconf/
+        # python-gobject/gtk4/...) straight from PKGBUILD itself, so
+        # duplicating that list here would just be a second place it
+        # could silently drift out of sync.
+        run: |
+          pacman -Syu --noconfirm --quiet
+          pacman -S --noconfirm --needed --quiet git sudo
+
+      - name: makepkg (as a non-root builder user)
+        run: |
+          set -euxo pipefail
+          # makepkg refuses to run as root, and root is this
+          # container's only user - create an unprivileged builder,
+          # matching every real Arch install, and let it sudo back to
+          # root for the pacman calls `makepkg -s` needs to pull in
+          # makedepends.
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          su builder -c "
+            set -euxo pipefail
+            cd '$GITHUB_WORKSPACE/packaging/arch'
+            # HYPRAV_CI_SOURCE: PKGBUILD's git source otherwise always
+            # fetches from GitHub regardless of what's checked out
+            # locally, which would build whatever's currently on the
+            # default branch instead of the commit/PR this job is
+            # actually testing - point it at this checkout instead
+            # (see PKGBUILD's own comment on this variable).
+            export HYPRAV_CI_SOURCE='file://$GITHUB_WORKSPACE'
+            # HYPRAV_SKIP_AV_KO_CHECK: this container shares the CI
+            # runner's real host kernel, but Arch's linux-headers
+            # package only provides headers for Arch's OWN kernel
+            # package, never for an arbitrary foreign host kernel - see
+            # PKGBUILD's own comment on this variable for why that's
+            # fine to skip here (build-matrix.yml already covers av/
+            # compiling correctly, far more rigorously, elsewhere).
+            export HYPRAV_SKIP_AV_KO_CHECK=1
+            makepkg -s --noconfirm
+          "
+
+      - name: Upload .pkg.tar.zst packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: arch-packages
+          path: packaging/arch/*.pkg.tar.zst
+          if-no-files-found: error
+
+  build-rpm:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    # See packaging/fedora/hyprav.spec's own header comment:
+    # BuildRequires: tlsh-devel does not resolve on any currently
+    # shipping Fedora release - confirmed against a real `dnf install
+    # tlsh-devel` (f41 through rawhide), not assumed; no COPR
+    # providing an equivalent was found either. continue-on-error
+    # keeps this job from permanently blocking CI/PRs over a known,
+    # tracked, pre-existing upstream gap (see the spec's comment for
+    # what fixing it would actually take - vendoring TLSH's C++ source,
+    # or dropping TLSH support for the Fedora build specifically)
+    # rather than either hiding the job or leaving CI permanently red.
+    # Drop this once that's resolved.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install rpmbuild tooling
+        run: dnf install -y -q rpm-build rpmdevtools dnf-plugins-core git
+
+      - name: Build a source tarball from THIS checkout
+        # hyprav.spec's Source0 names a specific historical commit's
+        # tarball fetched from GitHub (%global gitcommit) - same
+        # "designed for a real release, not a local CI checkout"
+        # mismatch as packaging/arch/PKGBUILD's git source (see that
+        # job's own comment). rpmbuild never actually fetches Source0
+        # itself though (that URL is documentation for humans/tools
+        # like spectool, not something rpmbuild executes) - it just
+        # expects a local file under _sourcedir matching Source0's
+        # basename, so regenerating that from the actual commit under
+        # test is enough to make this validate the real tree once
+        # unblocked, not a stale pinned commit.
+        run: |
+          set -euxo pipefail
+          GITCOMMIT="$(git rev-parse --short=7 HEAD)"
+          echo "GITCOMMIT=$GITCOMMIT" >> "$GITHUB_ENV"
+          mkdir -p rpmbuild-sources
+          git archive --prefix="antivirus-$GITCOMMIT/" HEAD \
+            -o "rpmbuild-sources/antivirus-$GITCOMMIT.tar.gz"
+
+      - name: Install BuildRequires (dnf builddep)
+        run: |
+          dnf builddep -y --define "gitcommit $GITCOMMIT" \
+            packaging/fedora/hyprav.spec
+
+      - name: rpmbuild
+        run: |
+          rpmbuild -bb \
+            --define "gitcommit $GITCOMMIT" \
+            --define "_sourcedir $GITHUB_WORKSPACE/rpmbuild-sources" \
+            --define "_rpmdir $GITHUB_WORKSPACE/rpmbuild-out" \
+            packaging/fedora/hyprav.spec
+
+      - name: Upload .rpm packages
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rpm-packages
+          path: rpmbuild-out/**/*.rpm
+          if-no-files-found: warn

@@ -12,13 +12,14 @@
 # git+https://github.com/keanehatescoding/antivirus.git#tag=vX.Y.Z
 # if you'd rather not build off the moving master branch.
 #
-# TEMPORARY: pinned to #branch=packaging/distro-packages because this
-# very PKGBUILD (and LICENSE, which package_hyprav-dkms()/package_hyprav()
-# below both install) only exists on that branch, not yet on master -
-# makepkg's git source clones from GitHub over the network, so it has
-# no idea this file was edited locally. Revert to the plain
-# `git+https://github.com/keanehatescoding/antivirus.git` URL (no
-# #branch=) once PR #29 merges to master.
+# HYPRAV_CI_SOURCE overrides the git URL below (default: the real
+# GitHub repo) - CI (.github/workflows/build-packages.yml) points this
+# at a file:// clone of the exact commit under test instead, since
+# makepkg's git source otherwise always fetches from GitHub regardless
+# of what's checked out locally, which would validate whatever's
+# currently on the default branch rather than the commit/PR CI is
+# actually testing. Real end users building this PKGBUILD normally
+# never set this and get the plain GitHub URL.
 
 pkgbase=hyprav
 pkgname=('hyprav-dkms' 'hyprav' 'hyprav-gui')
@@ -27,8 +28,17 @@ pkgrel=1
 arch=('x86_64')
 url="https://github.com/keanehatescoding/antivirus"
 license=('GPL3')
-makedepends=('git' 'linux-headers' 'libnl' 'yara' 'ssdeep' 'tlsh' 'pkgconf')
-source=("hyprav::git+https://github.com/keanehatescoding/antivirus.git#branch=packaging/distro-packages")
+# python-gobject/gtk4 are needed at BUILD time, not just runtime:
+# package_hyprav-gui()'s `make install` (userspace/av-gui/Makefile)
+# depends on `checkdeps`, which imports gi and loads GTK4 before
+# staging any files - confirmed the hard way, a real `makepkg -s`
+# build on a clean Arch container failed at package_hyprav-gui() with
+# "PyGObject + GTK4 not found" until these were added here. Same class
+# of gap debian/control's own comment already documents and accounts
+# for (python3-gi/gir1.2-gtk-4.0 there) and packaging/fedora/hyprav.spec
+# (python3-gobject/gtk4) - this file just hadn't caught up.
+makedepends=('git' 'linux-headers' 'libnl' 'yara' 'ssdeep' 'tlsh' 'pkgconf' 'python-gobject' 'gtk4')
+source=("hyprav::git+${HYPRAV_CI_SOURCE:-https://github.com/keanehatescoding/antivirus.git}")
 sha256sums=('SKIP')
 
 pkgver() {
@@ -49,8 +59,24 @@ build() {
   # inherit whatever the caller passed for CC/CXX/LLVM here. Cleaned
   # first for the same stale-object reason as userspace below, in
   # case an earlier retry used a different CC/LLVM combination.
-  make -C av clean
-  make -C av
+  #
+  # HYPRAV_SKIP_AV_KO_CHECK skips this specific check - CI runs this
+  # PKGBUILD from a plain archlinux container that shares the actual
+  # runner's host kernel (uname -r), but Arch's linux-headers package
+  # only provides headers for Arch's OWN linux kernel package, never
+  # for an arbitrary foreign host kernel, so
+  # /lib/modules/$(uname -r)/build can't resolve there no matter what's
+  # installed - not a real regression, just this one sanity check being
+  # inherently unable to run in a cross-distro container. av/ compiling
+  # correctly across real kernel versions is already covered far more
+  # rigorously by .github/workflows/build-matrix.yml (which downloads
+  # and builds actual matching kernel trees). Unset by default, so a
+  # real Arch machine (where headers DO match uname -r) still gets this
+  # check exactly as before.
+  if [ -z "$HYPRAV_SKIP_AV_KO_CHECK" ]; then
+    make -C av clean
+    make -C av
+  fi
 
   # `make clean` first, unconditionally: makepkg reuses $srcdir across
   # retries of a failed build rather than wiping it (that only happens
