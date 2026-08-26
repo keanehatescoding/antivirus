@@ -26,6 +26,7 @@
 #include "tlsh_shim.h"
 #include "tlsh_core.h"
 
+#include <errno.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -45,15 +46,23 @@ int av_tlsh_hash_fd(int fd, char *out, size_t outlen) {
 
   tlsh_init(&ctx);
 
-  while ((n = read(fd, buf, sizeof(buf))) > 0) {
+  for (;;) {
+    n = read(fd, buf, sizeof(buf));
+    if (n == 0)
+      break;
+    if (n < 0) {
+      /* avd installs signal handlers - a signal landing mid-read can
+       * return -1/EINTR with nothing actually wrong, and the syscall
+       * just needs retrying, not treating as a real I/O error. */
+      if (errno == EINTR)
+        continue;
+      /* tlsh_update() may have calloc'd ctx.a_bucket already - free it
+       * rather than leaking on this error path. */
+      tlsh_free(&ctx);
+      return -1;
+    }
     tlsh_update(&ctx, buf, (unsigned int)n);
     any_data = 1;
-  }
-  if (n < 0) {
-    /* tlsh_update() may have calloc'd ctx.a_bucket already - free it
-     * rather than leaking on this error path. */
-    tlsh_free(&ctx);
-    return -1;
   }
   if (!any_data) {
     /* ctx.a_bucket is still NULL here (tlsh_update() was never

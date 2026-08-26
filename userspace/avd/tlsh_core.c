@@ -109,6 +109,18 @@ static unsigned char l_capturing(unsigned int len)
     int top = 170;
     int idx = 85;
 
+    /* Without this, len > topval[169] (~3.9GB+) makes the bisection
+     * below converge on idx==170 - one past the last valid index of a
+     * 170-entry (0..169) table, an out-of-bounds read. Traced by hand:
+     * every iteration takes the "bottom = idx + 1" branch since len
+     * never satisfies len < topval[idx], which walks bottom up to 170
+     * with top pinned at its initial value the whole time. Saturating
+     * at the top bucket for anything beyond the table's range is the
+     * only sane behavior anyway - there's no finer length distinction
+     * left to make. */
+    if (len > topval[169])
+        return 169;
+
     for (;;) {
         if (idx == 0)
             return (unsigned char)idx;
@@ -188,6 +200,13 @@ void tlsh_update(tlsh_ctx *ctx, const unsigned char *data, unsigned int len)
          * top comment. Under-allocating to 128 would be an
          * out-of-bounds write on every other bucket hit. */
         ctx->a_bucket = calloc(BUCKET_COUNT, sizeof(unsigned int));
+        if (ctx->a_bucket == NULL)
+            /* OOM: bail before the unconditional a_bucket[r]++ writes
+             * below would dereference NULL. tlsh_final()'s own
+             * a_bucket==NULL check already treats this ctx as
+             * "never became valid" (same outcome as too-short input),
+             * so there's nothing else to signal here. */
+            return;
     }
 
     j = (int)(ctx->data_len % SLIDING_WND_SIZE);
