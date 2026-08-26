@@ -1401,9 +1401,9 @@ matrix legs total) — see the `toolchain` matrix dimension in
 
 ## CI
 
-Two tiers, both on every push, both across the same three kernel
-versions (currently 6.12.96 LTS, 6.18.21 LTS, 7.1.4 stable — bump
-these as kernel.org publishes new point releases):
+Three tiers on every push. The first two both run across the same
+three kernel versions (currently 6.12.96 LTS, 6.18.21 LTS, 7.1.4
+stable — bump these as kernel.org publishes new point releases):
 
 **Tier 1 - `.github/workflows/build-matrix.yml`**: compile-tests
 `av/` against gcc and clang. Catches
@@ -1438,3 +1438,26 @@ failing closed on `-EFAULT`, and switching to an LSM hook) - documented
 as a known, tracked limitation (same risk-reduction-not-elimination
 category as this file's other TOCTOU notes), not fixed as part of
 adding this test.
+
+**Tier 3 - `.github/workflows/build-packages.yml`**: actually builds
+the `.deb` (Debian), `.pkg.tar.zst` (Arch), and `.rpm` (Fedora)
+packages under `packaging/`, on `debian:trixie`, `archlinux:base-devel`,
+and `fedora:latest` containers respectively - catches a packaging
+regression (missing build-dep, broken Makefile override, stale pinned
+source) the same way Tier 1 catches a kernel-compat regression. It
+doesn't touch `av.ko` itself either way: `hyprav-dkms` ships it as DKMS
+*source* in all three formats, compiled later on the end user's own
+machine, not at package-build time.
+
+The Arch and Fedora jobs both build from git-source/tarball-fetch
+mechanisms designed for a real release, not a local CI checkout
+(`PKGBUILD`'s `source=`, the spec's `Source0`) - see
+`HYPRAV_CI_SOURCE`/`HYPRAV_SKIP_AV_KO_CHECK` in `packaging/arch/PKGBUILD`
+and the RPM job's "Build a source tarball from THIS checkout" step for
+how each is pointed at the actual commit under test instead. The
+Fedora job runs with `continue-on-error: true`: `BuildRequires:
+tlsh-devel` doesn't resolve on any currently shipping Fedora release
+(confirmed, not assumed - see `packaging/fedora/hyprav.spec`'s own
+header comment for what was already checked and what fixing it would
+take), a known pre-existing gap this CI addition doesn't attempt to
+fix, so the job is expected to fail until that's separately resolved.
