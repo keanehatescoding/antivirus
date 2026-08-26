@@ -62,6 +62,18 @@ jobs:
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:
+      # git must exist BEFORE actions/checkout runs, not after - a
+      # real CI run showed that without it, checkout silently falls
+      # back to downloading a plain tarball via the GitHub REST API
+      # ("To create a local Git repository instead, add Git 2.18 or
+      # higher to the PATH"), which never creates a .git directory at
+      # all. Every later git command (PKGBUILD's pkgver(), makepkg's
+      # own git source clone) then fails with what looks like an
+      # ownership/permission error but is really just "there is no
+      # .git here" - archlinux:base-devel doesn't ship git installed.
+      - name: Install git (before checkout needs it)
+        run: pacman -Syu --noconfirm --quiet && pacman -S --noconfirm --needed --quiet git
+
       - uses: actions/checkout@v7
         with:
           # PKGBUILD's pkgver() runs `git describe --long --tags`,
@@ -76,9 +88,7 @@ jobs:
         # python-gobject/gtk4/...) straight from PKGBUILD itself, so
         # duplicating that list here would just be a second place it
         # could silently drift out of sync.
-        run: |
-          pacman -Syu --noconfirm --quiet
-          pacman -S --noconfirm --needed --quiet git sudo
+        run: pacman -S --noconfirm --needed --quiet sudo
 
       - name: makepkg (as a non-root builder user)
         run: |
@@ -92,13 +102,10 @@ jobs:
           echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
 
           # Copy the checkout to a location builder owns outright,
-          # rather than pointing HYPRAV_CI_SOURCE at $GITHUB_WORKSPACE
-          # in place (chown -R to builder there instead) - a real CI
-          # run showed the latter breaks makepkg's own internal bare
-          # git clone of it ("does not appear to be a git repository",
-          # almost certainly the actions/checkout-in-a-container
-          # ownership quirk). This sidesteps it entirely and matches
-          # what was actually build-tested locally before this
+          # rather than chown -R'ing $GITHUB_WORKSPACE itself and
+          # pointing HYPRAV_CI_SOURCE there in place - keeps the real
+          # checkout's ownership untouched for every other step, and
+          # matches what was actually build-tested locally before this
           # workflow was written.
           cp -r "$GITHUB_WORKSPACE" /home/builder/hyprav-ci-src
           chown -R builder:builder /home/builder/hyprav-ci-src
@@ -157,19 +164,23 @@ jobs:
     # Drop this once that's resolved.
     continue-on-error: true
     steps:
+      # git must exist BEFORE actions/checkout runs, not after - a
+      # real CI run showed that without it, checkout silently falls
+      # back to downloading a plain tarball via the GitHub REST API
+      # ("To create a local Git repository instead, add Git 2.18 or
+      # higher to the PATH"), which never creates a .git directory at
+      # all. The later `git rev-parse`/`git archive` calls below then
+      # fail with "not a git repository" - not an ownership issue,
+      # fedora:latest just doesn't ship git installed.
+      - name: Install git (before checkout needs it)
+        run: dnf install -y -q git
+
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Install rpmbuild tooling
-        run: |
-          dnf install -y -q rpm-build rpmdevtools dnf-plugins-core git
-          # actions/checkout in a container job leaves this checkout
-          # owned in a way plain `git` here treats as untrusted ("not
-          # a git repository" from a real CI run, not the more usual
-          # "detected dubious ownership" wording, but same root cause)
-          # - mark it trusted for every later git command in this job.
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        run: dnf install -y -q rpm-build rpmdevtools dnf-plugins-core
 
       - name: Build a source tarball from THIS checkout
         # hyprav.spec's Source0 names a specific historical commit's
