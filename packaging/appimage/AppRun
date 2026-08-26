@@ -1,0 +1,7 @@
+#!/bin/sh
+# AppImage entry point. Kept as a thin wrapper around usr/bin/av-gui
+# (the real launcher logic) rather than duplicating it here, so
+# there's exactly one place that resolves LIBDIR/checks deps - see
+# usr/bin/av-gui's own comment for why.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+exec "$HERE/usr/bin/av-gui" "$@"

@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Shared AppStream metadata for BOTH sandboxed builds of the GUI
+  console (packaging/flatpak/org.hyprav.avgui.yml and
+  packaging/appimage/build-appimage.sh) - kept at the packaging/ top
+  level, not under flatpak/ or appimage/, so neither build "owns" it
+  and it can't drift out of sync between the two. Native
+  Arch/Debian/Fedora packages ship userspace/av-gui/data/av-gui.desktop
+  directly and don't need AppStream metadata.
+
+  This describes av-gui ONLY, not the whole HyprAV stack: the kernel
+  module (hyprav-dkms) and the avd system daemon are not, and cannot
+  be, part of either sandboxed build - see the note under
+  <description> and packaging/flatpak/README.md /
+  packaging/appimage/README.md for why.
+-->
+<component type="desktop-application">
+  <id>org.hyprav.avgui</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+  <name>HyprAV</name>
+  <summary>Management console for the HyprAV kernel-level antivirus</summary>
+  <description>
+    <p>
+      HyprAV is a kprobe-based kernel antivirus (av.ko) paired with a
+      privileged userspace daemon (avd) that does YARA matching, ELF
+      structural analysis, entropy scoring, and ssdeep/TLSH fuzzy
+      hashing, plus a CLI (avctl) for managing it.
+    </p>
+    <p>
+      This package is the GTK4 management console only: dashboard,
+      detection history, quarantine list/restore/delete, on-demand
+      scans, and signature/trust-list/protected-path/policy
+      management. It is a thin client - it talks to a HyprAV
+      installation (avd + avctl) that must already be installed and
+      running on the host system via your distro's native package
+      (Arch PKGBUILD, Debian, or Fedora RPM under packaging/). The
+      kernel module and the privileged system daemon cannot be
+      shipped as a Flatpak or AppImage themselves - both formats
+      sandbox or bundle a userspace app, not a DKMS kernel module and
+      a root systemd service that talks to it over netlink.
+    </p>
+  </description>
+  <launchable type="desktop-id">org.hyprav.avgui.desktop</launchable>
+  <url type="homepage">https://github.com/keanehatescoding/antivirus</url>
+  <url type="bugtracker">https://github.com/keanehatescoding/antivirus/issues</url>
+  <icon type="stock">org.hyprav.avgui</icon>
+  <categories>
+    <category>System</category>
+    <category>Security</category>
+  </categories>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.9.0" date="2026-08-26">
+      <description>
+        <p>First Flatpak/AppImage packaging of the GUI console.</p>
+      </description>
+    </release>
+  </releases>
+</component>
