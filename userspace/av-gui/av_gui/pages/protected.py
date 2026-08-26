@@ -38,6 +38,7 @@ class Page:
         self.refresh()
 
     def refresh(self):
+        """Reads and displays the list of protected paths from the kernel module."""
         self._error_label.set_label("")
         clear_box(self._rows_box)
         try:
@@ -70,6 +71,7 @@ class Page:
             return
 
         def done(ok, stdout, stderr):
+            """Callback invoked after the protect add command completes."""
             if ok:
                 self._toast("Protected")
                 self._path_entry.set_text("")
@@ -80,6 +82,7 @@ class Page:
 
     def _on_remove(self, _button, path):
         def done(ok, stdout, stderr):
+            """Callback invoked after the protect del command completes."""
             if ok:
                 self._toast("Unprotected")
                 self.refresh()

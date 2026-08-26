@@ -27,6 +27,7 @@ class Page:
         self.refresh()
 
     def refresh(self):
+        """Fetches and displays the list of quarantined files from avd."""
         self._error_label.set_label("")
         clear_box(self._rows_box)
         try:
@@ -62,6 +63,7 @@ class Page:
 
     def _on_restore(self, _button, qid):
         def done(ok, stdout, stderr):
+            """Callback invoked after the quarantine restore command completes."""
             if ok:
                 self._toast(f"Restored {qid}")
                 self.refresh()
@@ -71,6 +73,7 @@ class Page:
 
     def _on_delete(self, _button, qid):
         def done(ok, stdout, stderr):
+            """Callback invoked after the quarantine delete command completes."""
             if ok:
                 self._toast(f"Deleted {qid}")
                 self.refresh()

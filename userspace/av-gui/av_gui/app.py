@@ -29,6 +29,7 @@ _CSS = b"""
 
 
 def _load_css():
+    """Loads custom CSS styles for the application."""
     provider = Gtk.CssProvider()
     provider.load_from_data(_CSS)
     display = Gdk.Display.get_default()
@@ -105,6 +106,7 @@ class AvGuiWindow(Gtk.ApplicationWindow):
         self._stack.add_titled(page.widget, name, title)
 
     def show_toast(self, message):
+        """Shows a temporary notification message at the bottom of the window."""
         self._toast_label.set_label(message)
         self._toast_revealer.set_reveal_child(True)
         GLib.timeout_add_seconds(4, self._hide_toast)
@@ -140,6 +142,7 @@ class AvGuiApp(Gtk.Application):
         self._window = None
 
     def do_activate(self):
+        """Activates the application and presents the main window."""
         _load_css()
         if not self._window:
             self._window = AvGuiWindow(self)
@@ -147,6 +150,7 @@ class AvGuiApp(Gtk.Application):
 
 
 def main():
+    """Entry point for the av-gui application."""
     app = AvGuiApp()
     return app.run(sys.argv)
 

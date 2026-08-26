@@ -44,6 +44,7 @@ class Page:
         self._value_labels[key].set_label(str(value))
 
     def refresh(self):
+        """Updates the dashboard with current status from avd and the kernel module."""
         errors = []
 
         try:
