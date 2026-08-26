@@ -15,7 +15,27 @@
 # algorithm (rather than waiting on a Fedora package that was never
 # going to appear) is what actually fixed this.
 
+# Guarded %if, not a bare %global: a bare %global unconditionally
+# (re)defines the macro when the spec is parsed, which would silently
+# discard a caller's `rpmbuild --define "gitcommit $SHA" ...` (exactly
+# how .github/workflows/build-packages.yml pins this to the commit
+# actually under test) - confirmed the hard way, a real CI run kept
+# building "32d9af8" regardless of --define, because the tarball
+# `git archive` produced was named after the real commit while %prep's
+# Source0 lookup used this hardcoded fallback instead. `%if
+# 0%{!?gitcommit:1}` is the standard "define a fallback only if not
+# already defined" idiom (0%{!?x:1} expands to "01"=1/true if x is
+# NOT defined, plain "0"=false if it is). An inline `%{!?gitcommit:
+# %global gitcommit ...}` form was tried first and rejected by a real
+# rpmspec parse ("Macro % has illegal name") - this %if/%endif form
+# replaced it, but wasn't itself confirmed against a real rpmspec/
+# rpmbuild run before pushing (sandbox networking made that
+# unreliable); watch the next CI run to confirm it actually fixes
+# --define precedence, not just that it parses (this job is
+# continue-on-error, so a miss here doesn't block builds either way).
+%if 0%{!?gitcommit:1}
 %global gitcommit 32d9af8
+%endif
 
 Name:           hyprav
 Version:        0.9.0.129.g%{gitcommit}
