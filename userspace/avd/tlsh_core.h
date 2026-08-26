@@ -61,6 +61,15 @@ typedef struct {
     unsigned char slide_window[5];   /* SLIDING_WND_SIZE=5 */
     unsigned int data_len;
     unsigned char checksum;
+    /* Sticky, not just "a_bucket is NULL": a calloc() failure in one
+     * tlsh_update() call must permanently invalidate this ctx, even if
+     * a LATER call's calloc happens to succeed (transient OOM clearing
+     * up) - otherwise that later call would silently start a fresh
+     * bucket array and hash only the chunks fed in after the failure,
+     * and tlsh_final() would hand back a normal-looking digest for
+     * what's actually incomplete input. Checked before a_bucket's own
+     * NULL-ness in both tlsh_update() and tlsh_final(). */
+    int alloc_failed;
 } tlsh_ctx;
 
 void tlsh_init(tlsh_ctx *ctx);

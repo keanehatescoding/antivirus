@@ -187,6 +187,15 @@ void tlsh_update(tlsh_ctx *ctx, const unsigned char *data, unsigned int len)
     unsigned int i;
     int j;
 
+    /* Sticky: once one call's calloc() has failed, every later call is
+     * a no-op, even if THIS call's calloc would succeed - see
+     * tlsh_core.h's comment on alloc_failed for why a later success
+     * must not be allowed to quietly resume hashing from a fresh
+     * bucket array, which would hash only the tail of the stream and
+     * still finalize into a normal-looking (but wrong) digest. */
+    if (ctx->alloc_failed)
+        return;
+
     /* Lazily allocated like upstream's a_bucket - a file that never
      * gets update()'d at all (empty input) never touches this, and
      * av_tlsh_hash_fd() already treats zero-byte reads as -2 before
@@ -200,13 +209,14 @@ void tlsh_update(tlsh_ctx *ctx, const unsigned char *data, unsigned int len)
          * top comment. Under-allocating to 128 would be an
          * out-of-bounds write on every other bucket hit. */
         ctx->a_bucket = calloc(BUCKET_COUNT, sizeof(unsigned int));
-        if (ctx->a_bucket == NULL)
+        if (ctx->a_bucket == NULL) {
             /* OOM: bail before the unconditional a_bucket[r]++ writes
-             * below would dereference NULL. tlsh_final()'s own
-             * a_bucket==NULL check already treats this ctx as
-             * "never became valid" (same outcome as too-short input),
-             * so there's nothing else to signal here. */
+             * below would dereference NULL, and latch alloc_failed so
+             * no later call can paper over this one's missing data by
+             * successfully allocating a fresh array instead. */
+            ctx->alloc_failed = 1;
             return;
+        }
     }
 
     j = (int)(ctx->data_len % SLIDING_WND_SIZE);
@@ -362,10 +372,16 @@ int tlsh_final(tlsh_ctx *ctx, tlsh_digest *out)
     int nonzero;
     unsigned int i, j;
 
-    /* MIN_DATA_LENGTH cutoff: same "too short to mean anything, not an
-     * error" rationale as the old shim's -2 return documented -
-     * preserved here as the same early "invalid" outcome. */
-    if (ctx->data_len < MIN_DATA_LENGTH || ctx->a_bucket == NULL) {
+    /* alloc_failed checked separately from (and before) a_bucket==NULL:
+     * a failed call latches alloc_failed but a LATER call could still
+     * have gone on to allocate successfully (see tlsh_update()), which
+     * would make a_bucket non-NULL again despite the gap in what
+     * actually got hashed - alloc_failed is the one thing that stays
+     * true regardless. MIN_DATA_LENGTH cutoff below is the unrelated
+     * "too short to mean anything, not an error" case - same rationale
+     * as the old shim's -2 return documented - preserved here as the
+     * same early "invalid" outcome. */
+    if (ctx->alloc_failed || ctx->data_len < MIN_DATA_LENGTH || ctx->a_bucket == NULL) {
         tlsh_free(ctx);
         return -1;
     }
