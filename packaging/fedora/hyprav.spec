@@ -15,23 +15,28 @@
 # algorithm (rather than waiting on a Fedora package that was never
 # going to appear) is what actually fixed this.
 
-# Guarded %if, not a bare %global: a bare %global unconditionally
+# Guarded %%if, not a bare %%global: a bare %%global unconditionally
 # (re)defines the macro when the spec is parsed, which would silently
 # discard a caller's `rpmbuild --define "gitcommit $SHA" ...` (exactly
 # how .github/workflows/build-packages.yml pins this to the commit
 # actually under test) - confirmed the hard way, a real CI run kept
 # building "32d9af8" regardless of --define, because the tarball
-# `git archive` produced was named after the real commit while %prep's
-# Source0 lookup used this hardcoded fallback instead. `%if
-# 0%{!?gitcommit:1}` is the standard "define a fallback only if not
-# already defined" idiom (0%{!?x:1} expands to "01"=1/true if x is
-# NOT defined, plain "0"=false if it is). An inline `%{!?gitcommit:
-# %global gitcommit ...}` form was tried first and rejected by a real
-# rpmspec parse ("Macro % has illegal name") - this %if/%endif form
-# replaced it, but wasn't itself confirmed against a real rpmspec/
-# rpmbuild run before pushing (sandbox networking made that
-# unreliable); watch the next CI run to confirm it actually fixes
-# --define precedence, not just that it parses (this job is
+# `git archive` produced was named after the real commit while %%prep's
+# Source0 lookup used this hardcoded fallback instead. The pattern
+# below is the standard "define a fallback only if not already
+# defined" idiom - it expands to true (fallback applies) only when
+# gitcommit is NOT already defined, false (fallback skipped, the
+# --define value stands) when it is. NOTE: a literal %% is required
+# throughout this comment, not just in the directives below it -
+# confirmed the hard way, a real CI parse failure ("Macro %% has
+# illegal name") once an earlier draft of this same comment quoted the
+# unescaped macro syntax directly; RPM's spec parser expands %%-macros
+# even inside # comments, unescaped %% is never actually inert here.
+# An inline single-line form of the guard was also tried first and
+# separately rejected by a real rpmspec parse before this %%if/%%endif
+# block form replaced it - that form's parse failure was confirmed;
+# whether this block form actually fixes the --define precedence
+# itself (not just parses) is left for CI to confirm (this job is
 # continue-on-error, so a miss here doesn't block builds either way).
 %if 0%{!?gitcommit:1}
 %global gitcommit 32d9af8
