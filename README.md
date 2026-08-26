@@ -1384,7 +1384,6 @@ measure different things:
 ## Toolchain support (GCC / Clang)
 
 
-
 A kernel module generally must be built with the same compiler family as
 the target kernel — this matters if you're testing against a Clang-built
 kernel (e.g. CachyOS's `-clang` variant), especially under LTO/CFI
@@ -1450,16 +1449,3 @@ source) the same way Tier 1 catches a kernel-compat regression. It
 doesn't touch `av.ko` itself either way: `hyprav-dkms` ships it as DKMS
 *source* in all three formats, compiled later on the end user's own
 machine, not at package-build time.
-
-The Arch and Fedora jobs both build from git-source/tarball-fetch
-mechanisms designed for a real release, not a local CI checkout
-(`PKGBUILD`'s `source=`, the spec's `Source0`) - see
-`HYPRAV_CI_SOURCE`/`HYPRAV_SKIP_AV_KO_CHECK` in `packaging/arch/PKGBUILD`
-and the RPM job's "Build a source tarball from THIS checkout" step for
-how each is pointed at the actual commit under test instead. The
-Fedora job runs with `continue-on-error: true`: `BuildRequires:
-tlsh-devel` doesn't resolve on any currently shipping Fedora release
-(confirmed, not assumed - see `packaging/fedora/hyprav.spec`'s own
-header comment for what was already checked and what fixing it would
-take), a known pre-existing gap this CI addition doesn't attempt to
-fix, so the job is expected to fail until that's separately resolved.
