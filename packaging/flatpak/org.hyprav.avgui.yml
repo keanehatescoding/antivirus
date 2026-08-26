@@ -1,0 +1,71 @@
+# Flatpak manifest for the GTK4 management console (userspace/av-gui)
+# ONLY - not the kernel module (av.ko) or the avd system daemon, which
+# cannot be sandboxed this way (root systemd service that talks to a
+# DKMS-built kernel module over netlink; see packaging/README.md and
+# the top-level README's "GUI: av-gui" section). Install hyprav +
+# hyprav-dkms natively (Arch/Debian/Fedora under packaging/) first -
+# this Flatpak is a thin client over that installation, not a
+# replacement for it.
+#
+# Build (from repo root, needs flatpak-builder + the GNOME runtime -
+# runtime version below should be bumped to whatever
+# `flatpak remote-ls flathub | grep org.gnome.Platform//` currently
+# shows as latest before building, once this one ages off Flathub):
+#
+#   flatpak install flathub org.gnome.Platform//49 org.gnome.Sdk//49
+#   flatpak-builder --user --install --force-clean \
+#       build-dir packaging/flatpak/org.hyprav.avgui.yml
+#   flatpak run org.hyprav.avgui
+#
+# See packaging/flatpak/README.md for the sandbox-escape design
+# (flatpak-spawn --host) that lets this reach avctl/avd on the host.
+app-id: org.hyprav.avgui
+runtime: org.gnome.Platform
+runtime-version: '49'
+sdk: org.gnome.Sdk
+command: av-gui
+
+finish-args:
+  # GTK4 display - Wayland first, X11 fallback for non-Wayland
+  # sessions/window managers.
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+  # Lets host_exec.py's `flatpak-spawn --host` reach avctl/pkexec on
+  # the host (see userspace/av-gui/av_gui/host_exec.py) - the whole
+  # point of this app is driving a HOST-installed, privileged avd/
+  # avctl, which cannot themselves live inside the sandbox.
+  - --talk-name=org.freedesktop.Flatpak
+  # av_gui/avd_client.py connects directly to avd's control socket
+  # (default /run/avd/control.sock, see docs/avd-socket-protocol.md)
+  # for unprivileged reads (status/detections/quarantine list) - needs
+  # host filesystem access to that one runtime directory, read-only
+  # since the GUI never writes to it itself (writes go through
+  # pkexec avctl via flatpak-spawn instead, see above).
+  - --filesystem=/run/avd:ro
+
+modules:
+  - name: hyprav-gui
+    buildsystem: simple
+    build-commands:
+      # Installs userspace/av-gui's Python package, launcher shim, and
+      # its OWN desktop file (data/av-gui.desktop, Icon=security-high-
+      # symbolic) under $PREFIX=/app first, same install target every
+      # other packaging format uses...
+      - make -C userspace/av-gui install PREFIX=/app
+      # ...then overwrite just the desktop entry, icon, and AppStream
+      # metadata with the Flatpak-specific ones (app-id-matched
+      # filename, bundled icon instead of a theme lookup that may not
+      # resolve inside the sandbox) - the installed av_gui/ package
+      # and bin/av-gui launcher from the step above are unchanged and
+      # still exactly what this app-id's `command: av-gui` runs.
+      - install -Dm644 packaging/org.hyprav.avgui.desktop
+        /app/share/applications/org.hyprav.avgui.desktop
+      - install -Dm644 packaging/org.hyprav.avgui.metainfo.xml
+        /app/share/metainfo/org.hyprav.avgui.metainfo.xml
+      - install -Dm644 packaging/icons/org.hyprav.avgui.svg
+        /app/share/icons/hicolor/scalable/apps/org.hyprav.avgui.svg
+    sources:
+      - type: dir
+        path: ../..

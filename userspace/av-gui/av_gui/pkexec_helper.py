@@ -17,6 +17,8 @@ import gi
 gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib
 
+from . import host_exec
+
 # pkexec only authorizes against avctl's INSTALLED path (see
 # org.freedesktop.policykit.exec.path in packaging/org.hyprav.avctl.policy,
 # and userspace/avctl/Makefile install target's own comment on why) -
@@ -35,7 +37,7 @@ def run_privileged(args, on_done):
     other error", both show up the same way (an error message from
     stderr/stdout).
     """
-    argv = ["pkexec", AVCTL_PATH] + list(args)
+    argv = host_exec.host_argv(["pkexec", AVCTL_PATH] + list(args))
     try:
         proc = Gio.Subprocess.new(
             argv,

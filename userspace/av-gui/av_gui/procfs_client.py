@@ -9,6 +9,8 @@ reuses this format instead of adding a second read protocol.
 import os
 import subprocess
 
+from . import host_exec
+
 AVCTL_PATH = os.environ.get("AVCTL_PATH", "/usr/local/bin/avctl")
 
 
@@ -25,7 +27,7 @@ def read_state():
     (str, "fail-open"/"fail-closed", or None if unavailable)."""
     try:
         result = subprocess.run(
-            [AVCTL_PATH, "save", "-"],
+            host_exec.host_argv([AVCTL_PATH, "save", "-"]),
             capture_output=True, text=True, timeout=10, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:

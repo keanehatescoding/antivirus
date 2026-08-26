@@ -42,6 +42,9 @@ packaging/
   org.hyprav.avctl.policy - polkit action backing every privileged avctl
                         command (scan, quarantine restore/delete, and
                         anything the GUI does) - see "GUI: av-gui" below
+  flatpak/, appimage/  - sandboxed/portable builds of the GUI console
+                        ONLY (not the kernel module or avd) - see "GUI:
+                        av-gui" below
 av/                  - the actual antivirus module (single, evolving)
   main.c              - kprobe hooks (execve, openat, unlink, unlinkat,
                         rename, renameat, renameat2), workqueue,
@@ -360,6 +363,26 @@ Override `AVD_SOCK_PATH` (both `avd` and `avctl`/the GUI read it) and
 `AVCTL_PATH` (the GUI only) for a non-default install or for testing
 against a throwaway instance, same overrides `tests/test_avd_socket.sh`
 uses.
+
+### Flatpak / AppImage builds of the GUI
+
+`packaging/flatpak/` and `packaging/appimage/` package **av-gui
+only** - not `av.ko` or `avd`. Neither a Flatpak sandbox nor an
+AppImage can contain a DKMS kernel module or a root `systemd` daemon
+that talks to it over netlink, so `hyprav` + `hyprav-dkms` still need
+a native install (Arch/Debian/Fedora, above) regardless; both of these
+are thin GUI clients on top of that installation, not an alternative
+to it.
+
+The Flatpak build is sandboxed, so it can't reach `/run/avd/control.sock`
+or exec `avctl`/`pkexec` directly - `av_gui/host_exec.py` routes both
+through `flatpak-spawn --host` when it detects it's running inside one
+(`/.flatpak-info` present), a no-op everywhere else. See
+`packaging/flatpak/README.md` and `packaging/appimage/README.md` for
+build instructions and the full reasoning, including why the AppImage
+deliberately doesn't bundle GTK4/PyGObject itself. Neither has been
+build-tested in an environment with `flatpak-builder`/`appimagetool`
+available - review the manifests before relying on them.
 
 ## A note on kernel version / architecture
 

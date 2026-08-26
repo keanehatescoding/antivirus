@@ -1,0 +1,26 @@
+#!/bin/sh
+# Real launcher for the AppImage build, installed by build-appimage.sh
+# to AppDir/usr/bin/av-gui (matching Exec=av-gui in
+# packaging/org.hyprav.avgui.desktop, shared with the Flatpak build).
+#
+# Deliberately does NOT bundle GTK4/PyGObject/Python - see
+# build-appimage.sh's comment on why. This just runs av_gui.app
+# against whatever python3 (with GTK4 bindings) the HOST already has,
+# same runtime dependency the native Arch/Debian/Fedora packages
+# already declare (python-gobject/gtk4, python3-gi+gir1.2-gtk-4.0,
+# python3-gobject+gtk4 respectively) - this AppImage's value is "no
+# `make install` needed for the GUI itself", not "zero system
+# dependencies". host_exec.py's flatpak-spawn detection is a no-op
+# here (no /.flatpak-info inside an AppImage mount), so avctl/pkexec
+# get invoked directly, same as a native install.
+HERE="$(cd "$(dirname "$0")/../.." && pwd)"
+
+if ! python3 -c "import gi; gi.require_version('Gtk', '4.0'); from gi.repository import Gtk" 2>/dev/null; then
+    echo "ERROR: PyGObject + GTK4 not found on this system." >&2
+    echo "  Arch/CachyOS: sudo pacman -S python-gobject gtk4" >&2
+    echo "  Debian/Ubuntu: sudo apt install python3-gi gir1.2-gtk-4.0" >&2
+    echo "  Fedora: sudo dnf install python3-gobject gtk4" >&2
+    exit 1
+fi
+
+PYTHONPATH="$HERE/usr/lib/hyprav/av-gui${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m av_gui.app "$@"

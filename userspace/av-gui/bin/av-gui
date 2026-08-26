@@ -15,9 +15,18 @@
 # to resolving av_gui/ relative to this script's own location, same as
 # every other component in this repo being buildable/runnable in place
 # without `make install` first (see the top-level README).
+#
+# The unsubstituted-check below is deliberately NOT
+# `[ "$LIBDIR" = "@LIBDIR@" ]` - the Makefile's install target runs
+# `sed 's|@LIBDIR@|...|g'` over this whole file, which would rewrite
+# BOTH the assignment below AND that literal comparison string,
+# making it compare a real path against itself and always take the
+# fallback branch even when installed. The `@*@` glob matches the
+# literal unsubstituted token without spelling out `@LIBDIR@` again,
+# so sed has nothing else to rewrite.
 LIBDIR="@LIBDIR@"
-if [ "$LIBDIR" = "@LIBDIR@" ]; then
-    LIBDIR="$(cd "$(dirname "$0")/.." && pwd)"
-fi
+case "$LIBDIR" in
+    @*@) LIBDIR="$(cd "$(dirname "$0")/.." && pwd)" ;;
+esac
 
 PYTHONPATH="$LIBDIR${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m av_gui.app "$@"
