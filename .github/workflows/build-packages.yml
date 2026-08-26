@@ -180,7 +180,17 @@ jobs:
           fetch-depth: 0
 
       - name: Install rpmbuild tooling
-        run: dnf install -y -q rpm-build rpmdevtools dnf-plugins-core
+        run: |
+          dnf install -y -q rpm-build rpmdevtools dnf-plugins-core
+          # actions/checkout's own dubious-ownership fix (its "Post Run"
+          # step logs "Adding repository directory to the temporary git
+          # global config as a safe directory") is scoped to a
+          # temporary HOME override for its OWN internal git calls only
+          # - it doesn't persist for any later step's git commands.
+          # Confirmed by a real CI run: `git rev-parse` here failed
+          # with "detected dubious ownership in repository at
+          # '$GITHUB_WORKSPACE'" even though checkout itself succeeded.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Build a source tarball from THIS checkout
         # hyprav.spec's Source0 names a specific historical commit's
