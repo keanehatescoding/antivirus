@@ -183,10 +183,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Install libnl-genl, libyara, libfuzzy, and libtlsh
+      - name: Install libnl-genl, libyara, and libfuzzy
         run: |
           sudo apt-get update
-          sudo apt-get install -y libnl-genl-3-dev libyara-dev libfuzzy-dev libtlsh-dev pkg-config
+          sudo apt-get install -y libnl-genl-3-dev libyara-dev libfuzzy-dev pkg-config
       - name: Build avd
         run: make -C userspace/avd
 
@@ -274,21 +274,23 @@ jobs:
           # it never calls av_tlsh_hash_fd()/av_tlsh_diff() (the real
           # shim avd.c actually links against) or parses
           # corpus/tlsh_hashes.txt, so it could stay green even if the
-          # C/C++ shim boundary or the corpus file format were broken.
-          # This closes that gap without the much heavier lift of a
-          # full kernel+netlink+daemon round trip (avd.c's own header
-          # comment already documents that as a separate, pre-existing,
-          # not-yet-covered gap for the whole daemon, not something
-          # specific to TLSH) - it links against the real
-          # tlsh_shim.o built by the "Build avd" step above, and reads
-          # the real corpus/tlsh_hashes.txt with load_tlsh_corpus()'s
-          # exact line format (hash,name - avd.c's own loader is
-          # static/not exported, so this reimplements just enough of
-          # its parsing to exercise the same file, not a mock of it).
-          cat > /tmp/tlsh_shim_smoke.cpp << 'EOF'
+          # tlsh_core/tlsh_shim boundary or the corpus file format were
+          # broken. This closes that gap without the much heavier lift
+          # of a full kernel+netlink+daemon round trip (avd.c's own
+          # header comment already documents that as a separate,
+          # pre-existing, not-yet-covered gap for the whole daemon, not
+          # something specific to TLSH) - it links against the real
+          # tlsh_core.o/tlsh_shim.o built by the "Build avd" step above
+          # (plain C now - no C++, no libtlsh, see tlsh_core.h), and
+          # reads the real corpus/tlsh_hashes.txt with
+          # load_tlsh_corpus()'s exact line format (hash,name - avd.c's
+          # own loader is static/not exported, so this reimplements
+          # just enough of its parsing to exercise the same file, not a
+          # mock of it).
+          cat > /tmp/tlsh_shim_smoke.c << 'EOF'
           #include "tlsh_shim.h"
-          #include <cstdio>
-          #include <cstring>
+          #include <stdio.h>
+          #include <string.h>
           #include <fcntl.h>
           #include <unistd.h>
 
@@ -350,10 +352,10 @@ jobs:
             return 0;
           }
           EOF
-          g++ -Wall -Wextra -O2 -Iuserspace/avd -I/usr/include/tlsh \
-              -c /tmp/tlsh_shim_smoke.cpp -o /tmp/tlsh_shim_smoke.o
-          g++ -o /tmp/tlsh_shim_smoke /tmp/tlsh_shim_smoke.o \
-              userspace/avd/tlsh_shim.o -ltlsh
+          gcc -Wall -Wextra -O2 -Iuserspace/avd \
+              -c /tmp/tlsh_shim_smoke.c -o /tmp/tlsh_shim_smoke.o
+          gcc -o /tmp/tlsh_shim_smoke /tmp/tlsh_shim_smoke.o \
+              userspace/avd/tlsh_core.o userspace/avd/tlsh_shim.o
           /tmp/tlsh_shim_smoke
 
       - uses: actions/upload-artifact@v7

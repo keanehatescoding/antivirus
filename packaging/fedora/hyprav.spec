@@ -5,19 +5,15 @@
 # being compiled here at rpmbuild time. avd/avctl (hyprav) and the
 # GTK4 console (hyprav-gui) are plain userspace and get built normally.
 #
-# CONFIRMED BROKEN, NOT YET FIXED: Fedora's own tlsh.spec (checked
-# f41 through f44 and rawhide at src.fedoraproject.org/rpms/tlsh) only
-# builds tlsh-doc and python3-tlsh - the Python bindings. There is no
-# tlsh-devel, no libtlsh.so, no /usr/include/tlsh.h anywhere in
-# current Fedora; the C library package this project's Makefiles
-# assume (`tlsh` on Arch, `libtlsh-dev` on Debian) simply does not
-# exist here, and hasn't for a long time (python3-tlsh's spec still
-# carries `Obsoletes: tlsh-devel < 3.17.0` from whenever it was
-# dropped). No COPR providing a current tlsh-devel-equivalent was
-# found either. `BuildRequires: tlsh-devel` below WILL fail to
-# resolve - this spec cannot build as written until that's addressed
-# (e.g. vendoring upstream TLSH's C++ source into %build, or dropping
-# TLSH support for the Fedora build specifically).
+# TLSH fuzzy hashing needs no BuildRequires at all: it's vendored,
+# pure C (userspace/avd/tlsh_core.c/.h), not linked against a system
+# libtlsh. This used to be a real, confirmed-broken blocker here -
+# Fedora's own tlsh.spec (checked f41 through f44 and rawhide at
+# src.fedoraproject.org/rpms/tlsh) only ever built tlsh-doc and
+# python3-tlsh, never a tlsh-devel/libtlsh.so/tlsh.h - so `BuildRequires:
+# tlsh-devel` could never have resolved on Fedora. Vendoring the
+# algorithm (rather than waiting on a Fedora package that was never
+# going to appear) is what actually fixed this.
 
 %global gitcommit 32d9af8
 
@@ -34,13 +30,11 @@ URL:            https://github.com/keanehatescoding/antivirus
 Source0:        %{url}/archive/%{gitcommit}/antivirus-%{gitcommit}.tar.gz
 
 BuildRequires:  gcc
-BuildRequires:  gcc-c++
 BuildRequires:  make
 BuildRequires:  pkgconfig
 BuildRequires:  pkgconfig(libnl-genl-3.0)
 BuildRequires:  yara-devel
 BuildRequires:  ssdeep-devel
-BuildRequires:  tlsh-devel
 BuildRequires:  systemd-rpm-macros
 # userspace/av-gui/Makefile's `install` target (invoked in %install
 # below) depends on `checkdeps`, which imports gi and loads GTK4
