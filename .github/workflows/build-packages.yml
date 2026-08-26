@@ -41,13 +41,21 @@ jobs:
         # aren't meant to be published as-is.
         run: dpkg-buildpackage -us -uc -b
 
+      - name: Move built packages into the workspace
+        # dpkg-buildpackage places output one directory ABOVE the
+        # source tree it was invoked in, not inside it -
+        # actions/upload-artifact rejects any path containing `..`
+        # outright ("Relative pathing '.' and '..' is not allowed"),
+        # so it can't just glob that parent directory directly.
+        run: |
+          mkdir -p dist
+          mv ../*.deb ../*.buildinfo ../*.changes dist/
+
       - name: Upload .deb packages
         uses: actions/upload-artifact@v7
         with:
           name: deb-packages
-          # dpkg-buildpackage places output one directory ABOVE the
-          # source tree it was invoked in, not inside it.
-          path: ${{ github.workspace }}/../*.deb
+          path: dist/*.deb
           if-no-files-found: error
 
   build-arch:
@@ -82,27 +90,49 @@ jobs:
           # makedepends.
           useradd -m builder
           echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
-          chown -R builder:builder "$GITHUB_WORKSPACE"
-          su builder -c "
-            set -euxo pipefail
-            cd '$GITHUB_WORKSPACE/packaging/arch'
-            # HYPRAV_CI_SOURCE: PKGBUILD's git source otherwise always
-            # fetches from GitHub regardless of what's checked out
-            # locally, which would build whatever's currently on the
-            # default branch instead of the commit/PR this job is
-            # actually testing - point it at this checkout instead
-            # (see PKGBUILD's own comment on this variable).
-            export HYPRAV_CI_SOURCE='file://$GITHUB_WORKSPACE'
-            # HYPRAV_SKIP_AV_KO_CHECK: this container shares the CI
-            # runner's real host kernel, but Arch's linux-headers
-            # package only provides headers for Arch's OWN kernel
-            # package, never for an arbitrary foreign host kernel - see
-            # PKGBUILD's own comment on this variable for why that's
-            # fine to skip here (build-matrix.yml already covers av/
-            # compiling correctly, far more rigorously, elsewhere).
-            export HYPRAV_SKIP_AV_KO_CHECK=1
-            makepkg -s --noconfirm
-          "
+
+          # Copy the checkout to a location builder owns outright,
+          # rather than pointing HYPRAV_CI_SOURCE at $GITHUB_WORKSPACE
+          # in place (chown -R to builder there instead) - a real CI
+          # run showed the latter breaks makepkg's own internal bare
+          # git clone of it ("does not appear to be a git repository",
+          # almost certainly the actions/checkout-in-a-container
+          # ownership quirk). This sidesteps it entirely and matches
+          # what was actually build-tested locally before this
+          # workflow was written.
+          cp -r "$GITHUB_WORKSPACE" /home/builder/hyprav-ci-src
+          chown -R builder:builder /home/builder/hyprav-ci-src
+
+          # A real script file, not an inline su -c string - avoids a
+          # quoting mess between this outer shell and the inner one,
+          # and is what actually runs makepkg as the builder user.
+          cat > /tmp/build-arch-pkg.sh <<'SCRIPT'
+          set -euxo pipefail
+          cd /home/builder/hyprav-ci-src/packaging/arch
+          # HYPRAV_CI_SOURCE overrides PKGBUILD's git source, which
+          # otherwise always fetches from GitHub regardless of the
+          # local checkout, so this builds the exact commit under
+          # test instead of whatever is currently on the default
+          # branch (see PKGBUILD's own comment on this variable).
+          export HYPRAV_CI_SOURCE=file:///home/builder/hyprav-ci-src
+          # HYPRAV_SKIP_AV_KO_CHECK skips the av.ko compile-sanity
+          # check: this container shares the CI runner's real host
+          # kernel, but Arch's linux-headers package only matches
+          # Arch's OWN kernel package, so it can never resolve here -
+          # build-matrix.yml already covers av/ compiling correctly,
+          # far more rigorously, elsewhere (see PKGBUILD's own comment
+          # on this variable).
+          export HYPRAV_SKIP_AV_KO_CHECK=1
+          makepkg -s --noconfirm
+          SCRIPT
+          chmod +x /tmp/build-arch-pkg.sh
+          su builder -c /tmp/build-arch-pkg.sh
+
+          # Copy the built packages back into the real workspace (as
+          # root, which can always write there) so the upload step
+          # below finds them at the usual path.
+          cp /home/builder/hyprav-ci-src/packaging/arch/*.pkg.tar.zst \
+            packaging/arch/
 
       - name: Upload .pkg.tar.zst packages
         uses: actions/upload-artifact@v7
@@ -132,7 +162,14 @@ jobs:
           fetch-depth: 0
 
       - name: Install rpmbuild tooling
-        run: dnf install -y -q rpm-build rpmdevtools dnf-plugins-core git
+        run: |
+          dnf install -y -q rpm-build rpmdevtools dnf-plugins-core git
+          # actions/checkout in a container job leaves this checkout
+          # owned in a way plain `git` here treats as untrusted ("not
+          # a git repository" from a real CI run, not the more usual
+          # "detected dubious ownership" wording, but same root cause)
+          # - mark it trusted for every later git command in this job.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Build a source tarball from THIS checkout
         # hyprav.spec's Source0 names a specific historical commit's
