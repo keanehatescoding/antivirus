@@ -1,7 +1,5 @@
 CC ?= gcc
-CXX ?= g++
 CFLAGS ?= -Wall -Wextra -O2
-CXXFLAGS ?= -Wall -Wextra -O2
 PKG_CONFIG ?= pkg-config
 
 # install target only - PREFIX/SYSCONFDIR/UNITDIR follow the usual
@@ -19,22 +17,11 @@ YARA_CFLAGS  := $(shell $(PKG_CONFIG) --cflags yara 2>/dev/null)
 YARA_LIBS    := $(shell $(PKG_CONFIG) --libs yara 2>/dev/null)
 # libfuzzy (ssdeep) doesn't ship a pkg-config file - link manually.
 FUZZY_LIBS   := -lfuzzy
-# libtlsh doesn't ship a pkg-config file either (confirmed against the
-# actual distro package, not assumed) - same manual-link-test approach
-# as FUZZY_LIBS below. Unlike libfuzzy, libtlsh's only public API is a
-# C++ class (see tlsh_shim.h) - the link-test below is a C++ compile,
-# not C, since that's genuinely what's needed to use it at all.
-TLSH_LIBS    := -ltlsh
-# The header install PATH differs by distro too, confirmed the hard
-# way (a real CI failure, not assumed): Arch/CachyOS's `tlsh` package
-# puts tlsh.h under /usr/include/tlsh/, but Debian/Ubuntu's
-# libtlsh-dev installs it flat at /usr/include/tlsh.h. tlsh_shim.cpp
-# includes the flat name (<tlsh.h>) to match Ubuntu directly; this
-# extra -I is what makes that same flat include ALSO resolve on
-# Arch/CachyOS - harmless no-op there if this exact directory ever
-# stopped existing, since an -I for a nonexistent directory is
-# silently ignored by both gcc and clang, not an error.
-TLSH_CFLAGS  := -I/usr/include/tlsh
+# TLSH fuzzy hashing (tlsh_core.c/tlsh_shim.c) is vendored pure C -
+# no libtlsh/-ltlsh, no header search path, no C++ compiler. See
+# tlsh_core.h and the top-level README's "Testing TLSH fuzzy hashing"
+# section for why this used to be a system dependency (a C++-only
+# library with real distro/version skew) and isn't anymore.
 
 # `avd` must stay the default goal even though checkdeps (textually
 # the first target below) is not a real build product - make defaults
@@ -42,15 +29,15 @@ TLSH_CFLAGS  := -I/usr/include/tlsh
 # this Makefile as plain `make` with no explicit target.
 .DEFAULT_GOAL := avd
 
-# checkdeps runs before avd.o/tlsh_shim.o are ever compiled (see the
+# checkdeps runs before the objects are ever compiled (see the
 # order-only "| checkdeps" prerequisite below) - it used to live in the
-# `avd` recipe itself, but avd.o/tlsh_shim.o are prerequisites of
-# `avd`, so make built them (running straight into the plain compiler
-# rules further down) before that recipe's friendly "not found"
-# checks ever got a chance to run. A missing dependency then surfaced
-# as a raw compiler fatal error instead of the guided message below.
-# Putting the checks in their own target that the objects depend on
-# guarantees they run first.
+# `avd` recipe itself, but the objects are prerequisites of `avd`, so
+# make built them (running straight into the plain compiler rules
+# further down) before that recipe's friendly "not found" checks ever
+# got a chance to run. A missing dependency then surfaced as a raw
+# compiler fatal error instead of the guided message below. Putting the
+# checks in their own target that the objects depend on guarantees they
+# run first.
 checkdeps:
 	@if [ -z "$(LIBNL_LIBS)" ]; then \
 		echo "ERROR: libnl-genl-3.0 not found via pkg-config."; \
@@ -82,45 +69,38 @@ checkdeps:
 		echo "  Debian/Ubuntu: sudo apt install libfuzzy-dev"; \
 		exit 1; \
 	fi
-	@tmp=$$(mktemp "$${TMPDIR:-/tmp}/.avd_tlsh_check.XXXXXX") || exit 1; \
-	trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
-	if ! echo 'int main(){return 0;}' | $(CXX) -x c++ - -o "$$tmp" $(TLSH_LIBS) 2>/dev/null; then \
-		echo "ERROR: libtlsh not found."; \
-		echo "  Arch/CachyOS: sudo pacman -S tlsh"; \
-		echo "  Debian/Ubuntu: sudo apt install libtlsh-dev"; \
-		exit 1; \
-	fi
 
-avd: avd.o sha256.o tlsh_shim.o
-	$(CXX) -o avd avd.o sha256.o tlsh_shim.o $(LIBNL_LIBS) $(YARA_LIBS) $(FUZZY_LIBS) $(TLSH_LIBS) -lpthread
+avd: avd.o sha256.o tlsh_core.o tlsh_shim.o
+	$(CC) -o avd avd.o sha256.o tlsh_core.o tlsh_shim.o $(LIBNL_LIBS) $(YARA_LIBS) $(FUZZY_LIBS) -lpthread
 
-# avd.c is plain C, built with $(CC) - only tlsh_shim.cpp needs a C++
-# compiler (see tlsh_shim.h for why). The final link above uses $(CXX)
-# rather than $(CC) because it's linking in a C++ object either way
-# (tlsh_shim.o) - g++ auto-links libstdc++, which plain gcc does not,
-# so linking mixed C/C++ objects with $(CC) would need an explicit
-# -lstdc++ instead; using $(CXX) for the link step is the more
-# conventional way to handle this rather than fighting gcc for it.
-#
-# "| checkdeps" is an order-only prerequisite: it forces checkdeps to
-# run first without making a checkdeps timestamp change trigger a
-# needless rebuild of these objects (checkdeps has no file output to
-# have a timestamp in the first place).
+# Every translation unit here is plain C, built and linked with
+# $(CC) - this project has no C++ code left (TLSH fuzzy hashing used
+# to need a small C++ shim over libtlsh; it's now vendored pure C, see
+# tlsh_core.h). "| checkdeps" is an order-only prerequisite: it forces
+# checkdeps to run first without making a checkdeps timestamp change
+# trigger a needless rebuild of these objects (checkdeps has no file
+# output to have a timestamp in the first place).
 avd.o: avd.c ../../av/netlink_proto.h sha256.h tlsh_shim.h | checkdeps
 	$(CC) $(CFLAGS) $(LIBNL_CFLAGS) $(YARA_CFLAGS) -c avd.c -o avd.o
 
-# sha256.o needs none of avd's third-party deps (libnl/yara/fuzzy/tlsh)
+# sha256.o needs none of avd's third-party deps (libnl/yara/fuzzy)
 # - no "| checkdeps" prerequisite, so `make` in a tree missing those
 # still builds this object on its own (harmless; the final link still
 # needs them regardless).
 sha256.o: sha256.c sha256.h
 	$(CC) $(CFLAGS) -c sha256.c -o sha256.o
 
-tlsh_shim.o: tlsh_shim.cpp tlsh_shim.h | checkdeps
-	$(CXX) $(CXXFLAGS) $(TLSH_CFLAGS) -c tlsh_shim.cpp -o tlsh_shim.o
+# tlsh_core.o is the vendored TLSH algorithm itself - no third-party
+# deps either (tlsh_diff_table.h is a header, not a link dependency),
+# same no-checkdeps reasoning as sha256.o.
+tlsh_core.o: tlsh_core.c tlsh_core.h tlsh_diff_table.h
+	$(CC) $(CFLAGS) -c tlsh_core.c -o tlsh_core.o
+
+tlsh_shim.o: tlsh_shim.c tlsh_shim.h tlsh_core.h
+	$(CC) $(CFLAGS) -c tlsh_shim.c -o tlsh_shim.o
 
 clean:
-	rm -f avd avd.o sha256.o tlsh_shim.o
+	rm -f avd avd.o sha256.o tlsh_core.o tlsh_shim.o
 
 # Installs the binary, the systemd unit, and a default rules/corpus
 # location under SYSCONFDIR - NOT enabled or started automatically

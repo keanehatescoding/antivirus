@@ -36,6 +36,7 @@ class Page:
         self.widget = outer
 
     def refresh(self):
+        """No-op refresh - scan page is purely action-driven."""
         pass  # purely action-driven - nothing to poll
 
     def _on_browse(self, _button):
@@ -60,6 +61,7 @@ class Page:
         self._result_label.set_label("Scanning…")
 
         def done(ok, stdout, stderr):
+            """Callback invoked after the scan command completes."""
             if ok:
                 self._result_label.set_label(stdout.strip() or "(no output)")
                 self._toast("Scan complete")

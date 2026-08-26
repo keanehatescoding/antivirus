@@ -36,27 +36,31 @@
  *         AVD_TLSH_CORPUS_FILE). Complementary, not redundant: the two
  *         algorithms fingerprint files differently, so this is real
  *         defense in depth, not the same check twice - see
- *         check_tlsh_corpus()'s comment. Genuinely different
- *         integration shape than ssdeep's, though: libtlsh's only
- *         public API is a C++ class with no extern "C" surface at
- *         all (confirmed against the actual upstream header), so this
- *         goes through tlsh_shim.{h,cpp} - the one C++ translation
- *         unit in this otherwise-C project - rather than linking
- *         directly the way fuzzy.h does. See tlsh_shim.h and the
- *         Makefile for the full story.
+ *         check_tlsh_corpus()'s comment. TLSH itself is vendored, pure
+ *         C, in tlsh_core.{h,c} (a from-scratch port of upstream
+ *         trendmicro/tlsh's algorithm, not a system library binding -
+ *         upstream's only public API is a C++ class with no external
+ *         "C" surface, which is why this used to need a small C++
+ *         shim; that dependency is gone). tlsh_shim.{h,c} is now just
+ *         the small plain-C bridge from that core algorithm to this
+ *         file's fd-hashing/corpus-comparison usage. See tlsh_shim.h
+ *         and tlsh_core.h for the full story.
  *
- * Compile-verified against real libnl-genl-3.0, libyara, libfuzzy, and
- * libtlsh headers (clean build, -Wall -Wextra, no warnings). The YARA
- * rules and fuzzy-hash comparison logic (both ssdeep and TLSH) were
- * verified against real samples (see README testing sections) using
- * the exact scan/compare patterns used here. NOT yet runtime-tested
- * end-to-end against the actual kernel module together with this -
- * see docs/netlink-protocol.md and the top-level README's netlink
- * testing section.
+ * Compile-verified against real libnl-genl-3.0, libyara, and libfuzzy
+ * headers (clean build, -Wall -Wextra, no warnings; TLSH has no
+ * external header/library dependency at all anymore). The YARA rules
+ * and fuzzy-hash comparison logic (both ssdeep and TLSH) were verified
+ * against real samples (see README testing sections) using the exact
+ * scan/compare patterns used here. NOT yet runtime-tested end-to-end
+ * against the actual kernel module together with this - see
+ * docs/netlink-protocol.md and the top-level README's netlink testing
+ * section.
  *
- * Dependencies (Arch/CachyOS):  sudo pacman -S libnl yara ssdeep tlsh
+ * Dependencies (Arch/CachyOS):  sudo pacman -S libnl yara ssdeep
  * Dependencies (Debian/Ubuntu): sudo apt install libnl-genl-3-dev libyara-dev
- * libfuzzy-dev libtlsh-dev
+ * libfuzzy-dev
+ * (TLSH fuzzy hashing is vendored pure C - no libtlsh/libtlsh-dev
+ * package needed.)
  *
  * See docs/netlink-protocol.md for the full protocol design.
  *
@@ -202,15 +206,14 @@ struct fuzzy_corpus_entry {
 };
 
 /* Hash field NOT compile-time sized off av_tlsh_hash_maxlen() -
- * avd.c never includes <tlsh.h> itself (see tlsh_shim.h), so it has
- * no compile-time knowledge of libtlsh's actual hash string length.
- * AV_TLSH_HASH_BUFSZ below is a fixed, generously-sized upper bound
- * (see tlsh_shim.cpp's AV_TLSH_HASH_BUFLEN comment for the exact
- * worst-case reasoning - this MUST stay >= av_tlsh_hash_maxlen() + 1,
- * checked at runtime in load_tlsh_corpus() below rather than assumed
- * to match forever); measured hash length against the distro
- * packages actually used in development is 70 hex chars, well under
- * this. */
+ * avd.c never includes tlsh_core.h itself (see tlsh_shim.h), so it has
+ * no compile-time knowledge of the vendored TLSH implementation's
+ * exact digest length (TLSH_DIGEST_HEXLEN, tlsh_core.h - currently a
+ * fixed 70 hex chars for the BUCKETS_128/CHECKSUM_1B config this
+ * project implements, see tlsh_core.h). AV_TLSH_HASH_BUFSZ below is a
+ * fixed, generously-sized upper bound - this MUST stay >=
+ * av_tlsh_hash_maxlen() + 1, checked at runtime in load_tlsh_corpus()
+ * below rather than assumed to match forever. */
 #define AV_TLSH_HASH_BUFSZ 200
 
 struct tlsh_corpus_entry {

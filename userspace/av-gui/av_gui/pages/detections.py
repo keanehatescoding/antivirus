@@ -29,6 +29,7 @@ class Page:
         self.refresh()
 
     def refresh(self):
+        """Fetches and displays recent scan verdicts from avd."""
         self._error_label.set_label("")
         clear_box(self._rows_box)
         try:

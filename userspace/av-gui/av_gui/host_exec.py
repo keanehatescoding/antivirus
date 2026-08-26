@@ -17,6 +17,7 @@ _FLATPAK_INFO = "/.flatpak-info"
 
 
 def in_flatpak_sandbox():
+    """Returns True if running inside a Flatpak sandbox."""
     return os.path.exists(_FLATPAK_INFO)
 
 

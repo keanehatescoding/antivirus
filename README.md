@@ -141,13 +141,23 @@ userspace/
                         not linking libcrypto for one hash. Verified
                         against FIPS 180-4 known-answer vectors -
                         see tests/test_sha256.sh
-    tlsh_shim.h/.cpp     - libtlsh's only public API is a C++ class
-                        with no extern "C" surface at all (confirmed
-                        against the real upstream header, not
-                        assumed) - this is the one C++ translation
-                        unit in this otherwise-C project, bridging
-                        avd.c to it. See the Makefile for how the
-                        mixed C/C++ build works.
+    tlsh_core.h/.c       - from-scratch, pure-C port of upstream
+                        trendmicro/tlsh's algorithm (BUCKETS_128/
+                        CHECKSUM_1B, no version prefix - the default
+                        config upstream ships) - vendored rather than
+                        linked, since upstream's only public API is a
+                        C++ class with no extern "C" surface at all.
+                        Validated byte-for-byte against the system's
+                        real libtlsh before replacing it - see
+                        "Testing TLSH fuzzy hashing" below.
+    tlsh_diff_table.h    - the h_distance() lookup table, extracted
+                        verbatim (by script, not retyped) from
+                        upstream's generated source - see its own
+                        header comment.
+    tlsh_shim.h/.c       - small plain-C bridge from tlsh_core's
+                        update()/final() API to avd.c's fd-hashing
+                        usage. No longer a C++ translation unit -
+                        this project has no C++ code left.
     Makefile
   av-gui/             - GTK4/Python management console: dashboard,
                         detections, quarantine, on-demand scan,
@@ -899,42 +909,34 @@ measured diff=10; an unrelated binary measured diff=43 - 30 sits with
 real margin on both sides), not against an actual malware corpus with
 known variant families.
 
-**Why a C++ shim instead of linking libtlsh directly, like ssdeep:**
-libtlsh's only public API is a C++ class (`Tlsh`) with no
-`extern "C"` interface at all — confirmed by reading the actual
-upstream header, not assumed from the library's reputation. Where
-that header actually lives differs by distro, confirmed the hard way
-via a real CI failure: Arch/CachyOS's `tlsh` package installs it under
-a subdirectory (`/usr/include/tlsh/tlsh.h`), Debian/Ubuntu's
-`libtlsh-dev` installs it flat (`/usr/include/tlsh.h`, no
-subdirectory). `tlsh_shim.cpp` includes the flat name (`<tlsh.h>`) to
-match Ubuntu directly, with `-I/usr/include/tlsh` added in the
-Makefile (a harmless no-op there on Debian/Ubuntu, where that
-directory doesn't exist) to make the same include resolve on
-Arch/CachyOS too — see the Makefile's `TLSH_CFLAGS` comment.
-`avd.c` is plain C, so it can't call that API directly the way it
-calls `fuzzy_hash_file()`/`fuzzy_compare()` from `fuzzy.h`. Two real
-alternatives were considered and not taken:
+**Why TLSH is vendored pure C instead of linked against libtlsh:**
+upstream trendmicro/tlsh's only public API is a C++ class (`Tlsh`)
+with no `extern "C"` interface at all — confirmed by reading the
+actual upstream header, not assumed from the library's reputation.
+`avd.c` is plain C, so an earlier version of this project carried a
+small C++ shim (`tlsh_shim.cpp`) — the one C++ translation unit in an
+otherwise-C project, compiled with `$(CXX)` and linked with `$(CXX)`
+so g++ could auto-link `libstdc++` — purely to bridge to it. That
+shim also had to work around real distro drift: Arch/CachyOS's `tlsh`
+package installs its header under a subdirectory
+(`/usr/include/tlsh/tlsh.h`), Debian/Ubuntu's `libtlsh-dev` installs
+it flat (`/usr/include/tlsh.h`); and a decade of API/behavior skew
+between the two distros' shipped versions (3.4.4 vs 4.12.0).
 
-- **Shell out to the `tlsh` CLI per scan.** Keeps `avd.c` pure C, no
-  build-system change at all — but adds a fork/exec per file scanned
-  (real overhead under `AVD_SCAN_THREADS`-way concurrent load) and
-  CLI-output-parsing fragility, a different integration shape than
-  every other detection layer here.
-- **Do nothing, document the constraint.** Legitimate if the C++
-  toolchain dependency were unacceptable, but it isn't here — `avd`
-  is already the one place in this project explicitly designed to
-  carry heavy/complex dependencies (see "Architecture" above), and a
-  C++ shim confined to one small, clearly-marked translation unit is
-  a modest, contained addition to that, not a departure from it.
-
-`tlsh_shim.cpp` is the one C++ file in this project — the *only*
-translation unit that includes `<tlsh.h>` — exposing a small,
-plain-C-callable interface (`tlsh_shim.h`) that `avd.c` calls exactly
-like any other function. `userspace/avd/Makefile` compiles it with
-`$(CXX)` and links the final binary with `$(CXX)` too (g++ auto-links
-`libstdc++`, which plain `gcc` doesn't - see the Makefile's own
-comment on why the link step specifically needs this).
+Rather than keep carrying that C++-only system dependency (and its
+version-skew workarounds) indefinitely, TLSH's algorithm itself is now
+ported from upstream source into `tlsh_core.h`/`tlsh_core.c` — plain
+C99, no external library, validated byte-for-byte against the system's
+real libtlsh across a range of file sizes before it replaced the
+shim (see "Testing TLSH fuzzy hashing" above). This implements only
+upstream's default/compact digest format (128 buckets, 1-byte
+checksum, no version prefix) — the one every distro package this
+project has tested against actually produces; upstream's
+BUCKETS_256/CHECKSUM_3B/version-prefixed variants are out of scope.
+`tlsh_shim.h`/`tlsh_shim.c` remain as the small bridge between that
+core algorithm and `avd.c`'s fd-hashing/corpus-comparison usage, but
+it's plain C now — this project has no C++ code left, and
+`userspace/avd/Makefile` builds entirely with `$(CC)`.
 
 ## Testing behavioral heuristics (v0.8.0)
 

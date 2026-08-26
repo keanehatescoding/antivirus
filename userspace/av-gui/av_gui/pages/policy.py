@@ -48,6 +48,7 @@ class Page:
         self.refresh()
 
     def refresh(self):
+        """Reads the current daemon-unavailable policy and updates the radio buttons."""
         if self._pending:
             return  # a change is already in flight - see _pending's comment
         self._error_label.set_label("")
@@ -92,6 +93,7 @@ class Page:
         self._set_controls_sensitive(False)
 
         def done(ok, stdout, stderr):
+            """Callback invoked after the policy change command completes."""
             self._pending = False
             if ok:
                 self._toast(f"Policy set to {value}")

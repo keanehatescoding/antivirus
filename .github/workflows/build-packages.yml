@@ -175,17 +175,22 @@ jobs:
   build-rpm:
     runs-on: ubuntu-latest
     container: fedora:latest
-    # See packaging/fedora/hyprav.spec's own header comment:
-    # BuildRequires: tlsh-devel does not resolve on any currently
-    # shipping Fedora release - confirmed against a real `dnf install
-    # tlsh-devel` (f41 through rawhide), not assumed; no COPR
-    # providing an equivalent was found either. continue-on-error
-    # keeps this job from permanently blocking CI/PRs over a known,
-    # tracked, pre-existing upstream gap (see the spec's comment for
-    # what fixing it would actually take - vendoring TLSH's C++ source,
-    # or dropping TLSH support for the Fedora build specifically)
-    # rather than either hiding the job or leaving CI permanently red.
-    # Drop this once that's resolved.
+    # Originally added because BuildRequires: tlsh-devel never resolved
+    # on any shipping Fedora release (see packaging/fedora/hyprav.spec's
+    # history) - that's fixed now that TLSH is vendored pure C, no
+    # external package needed. Left in place because a second, separate,
+    # pre-existing bug in this job was masked behind that one and is now
+    # the thing actually failing it: packaging/fedora/hyprav.spec hardcodes
+    # `%global gitcommit 32d9af8`, which wins over this job's own
+    # `--define "gitcommit $GITCOMMIT"` when the spec is parsed (RPM's
+    # %global unconditionally redefines, it doesn't just provide a
+    # default), so the tarball %prep looks for under _sourcedir never
+    # matches the one `git archive` actually produced below. Not a TLSH
+    # issue - the spec's gitcommit needs to come from something that
+    # isn't clobbered by %global (e.g. this job sed-patching the spec's
+    # %global line to the real $GITCOMMIT before rpmbuild runs, rather
+    # than relying on --define alone). continue-on-error still keeps
+    # this from blocking CI/PRs over it. Drop this once THAT's fixed.
     continue-on-error: true
     steps:
       # git must exist BEFORE actions/checkout runs, not after - a

@@ -5,21 +5,42 @@
 # being compiled here at rpmbuild time. avd/avctl (hyprav) and the
 # GTK4 console (hyprav-gui) are plain userspace and get built normally.
 #
-# CONFIRMED BROKEN, NOT YET FIXED: Fedora's own tlsh.spec (checked
-# f41 through f44 and rawhide at src.fedoraproject.org/rpms/tlsh) only
-# builds tlsh-doc and python3-tlsh - the Python bindings. There is no
-# tlsh-devel, no libtlsh.so, no /usr/include/tlsh.h anywhere in
-# current Fedora; the C library package this project's Makefiles
-# assume (`tlsh` on Arch, `libtlsh-dev` on Debian) simply does not
-# exist here, and hasn't for a long time (python3-tlsh's spec still
-# carries `Obsoletes: tlsh-devel < 3.17.0` from whenever it was
-# dropped). No COPR providing a current tlsh-devel-equivalent was
-# found either. `BuildRequires: tlsh-devel` below WILL fail to
-# resolve - this spec cannot build as written until that's addressed
-# (e.g. vendoring upstream TLSH's C++ source into %build, or dropping
-# TLSH support for the Fedora build specifically).
+# TLSH fuzzy hashing needs no BuildRequires at all: it's vendored,
+# pure C (userspace/avd/tlsh_core.c/.h), not linked against a system
+# libtlsh. This used to be a real, confirmed-broken blocker here -
+# Fedora's own tlsh.spec (checked f41 through f44 and rawhide at
+# src.fedoraproject.org/rpms/tlsh) only ever built tlsh-doc and
+# python3-tlsh, never a tlsh-devel/libtlsh.so/tlsh.h - so `BuildRequires:
+# tlsh-devel` could never have resolved on Fedora. Vendoring the
+# algorithm (rather than waiting on a Fedora package that was never
+# going to appear) is what actually fixed this.
 
+# Guarded %%if, not a bare %%global: a bare %%global unconditionally
+# (re)defines the macro when the spec is parsed, which would silently
+# discard a caller's `rpmbuild --define "gitcommit $SHA" ...` (exactly
+# how .github/workflows/build-packages.yml pins this to the commit
+# actually under test) - confirmed the hard way, a real CI run kept
+# building "32d9af8" regardless of --define, because the tarball
+# `git archive` produced was named after the real commit while %%prep's
+# Source0 lookup used this hardcoded fallback instead. The pattern
+# below is the standard "define a fallback only if not already
+# defined" idiom - it expands to true (fallback applies) only when
+# gitcommit is NOT already defined, false (fallback skipped, the
+# --define value stands) when it is. NOTE: a literal %% is required
+# throughout this comment, not just in the directives below it -
+# confirmed the hard way, a real CI parse failure ("Macro %% has
+# illegal name") once an earlier draft of this same comment quoted the
+# unescaped macro syntax directly; RPM's spec parser expands %%-macros
+# even inside # comments, unescaped %% is never actually inert here.
+# An inline single-line form of the guard was also tried first and
+# separately rejected by a real rpmspec parse before this %%if/%%endif
+# block form replaced it - that form's parse failure was confirmed;
+# whether this block form actually fixes the --define precedence
+# itself (not just parses) is left for CI to confirm (this job is
+# continue-on-error, so a miss here doesn't block builds either way).
+%if 0%{!?gitcommit:1}
 %global gitcommit 32d9af8
+%endif
 
 Name:           hyprav
 Version:        0.9.0.129.g%{gitcommit}
@@ -34,13 +55,11 @@ URL:            https://github.com/keanehatescoding/antivirus
 Source0:        %{url}/archive/%{gitcommit}/antivirus-%{gitcommit}.tar.gz
 
 BuildRequires:  gcc
-BuildRequires:  gcc-c++
 BuildRequires:  make
 BuildRequires:  pkgconfig
 BuildRequires:  pkgconfig(libnl-genl-3.0)
 BuildRequires:  yara-devel
 BuildRequires:  ssdeep-devel
-BuildRequires:  tlsh-devel
 BuildRequires:  systemd-rpm-macros
 # userspace/av-gui/Makefile's `install` target (invoked in %install
 # below) depends on `checkdeps`, which imports gi and loads GTK4

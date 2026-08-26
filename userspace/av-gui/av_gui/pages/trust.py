@@ -41,6 +41,7 @@ class Page:
         self.refresh()
 
     def refresh(self):
+        """Reads and displays the list of trusted binary hashes from the kernel module."""
         self._error_label.set_label("")
         clear_box(self._rows_box)
         try:
@@ -75,6 +76,7 @@ class Page:
             return
 
         def done(ok, stdout, stderr):
+            """Callback invoked after the trust add command completes."""
             if ok:
                 self._toast("Trusted")
                 self._hash_entry.set_text("")
@@ -86,6 +88,7 @@ class Page:
 
     def _on_remove(self, _button, h):
         def done(ok, stdout, stderr):
+            """Callback invoked after the trust del command completes."""
             if ok:
                 self._toast("Untrusted")
                 self.refresh()
