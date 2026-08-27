@@ -465,7 +465,7 @@ static int do_trust(int argc, char **argv)
         char cmd[256];
         char name[192];
         size_t off = 0;
-        int i;
+        int i, n;
 
         if (argc < 5) {
             usage(argv[0]);
@@ -483,14 +483,23 @@ static int do_trust(int argc, char **argv)
          * kernel. */
         name[0] = '\0';
         for (i = 4; i < argc && off < sizeof(name) - 1; i++) {
-            int n = snprintf(name + off, sizeof(name) - off, "%s%s",
+            int m = snprintf(name + off, sizeof(name) - off, "%s%s",
                               i > 4 ? " " : "", argv[i]);
-            if (n < 0)
+            if (m < 0)
                 break;
-            off += (size_t)n;
+            off += (size_t)m;
         }
 
-        snprintf(cmd, sizeof(cmd), "add %s %s", argv[3], name);
+        /* Reject rather than let snprintf() below silently truncate -
+         * a truncated write would ask the kernel to trust a DIFFERENT
+         * (shorter) hash than the one printed back to the caller, with
+         * no error either side. Same reasoning as do_protect()'s
+         * add/del length checks. */
+        n = snprintf(cmd, sizeof(cmd), "add %s %s", argv[3], name);
+        if (n < 0 || (size_t)n >= sizeof(cmd)) {
+            fprintf(stderr, "avctl: hash/name too long to format\n");
+            return 1;
+        }
         if (write_command_to(TRUST_PROC_PATH, cmd))
             return 1;
         printf("trusted: %s (%s)\n", argv[3], name);
@@ -1005,23 +1014,38 @@ int main(int argc, char **argv)
         return do_quarantine(argc, argv);
     } else if (!strcmp(argv[1], "add")) {
         char cmd[256];
+        int n;
 
         if (argc < 5) {
             usage(argv[0]);
             return 1;
         }
-        snprintf(cmd, sizeof(cmd), "add %s %s %s", argv[2], argv[3], argv[4]);
+        /* Reject rather than let snprintf() below silently truncate -
+         * a truncated write would register a DIFFERENT (shorter) hash
+         * in the kernel than the one printed back to the caller, with
+         * no error either side. Same reasoning as do_protect()'s
+         * add/del length checks. */
+        n = snprintf(cmd, sizeof(cmd), "add %s %s %s", argv[2], argv[3], argv[4]);
+        if (n < 0 || (size_t)n >= sizeof(cmd)) {
+            fprintf(stderr, "avctl: signature type/hash/name too long to format\n");
+            return 1;
+        }
         if (write_command(cmd))
             return 1;
         printf("added %s signature: %s (%s)\n", argv[2], argv[3], argv[4]);
     } else if (!strcmp(argv[1], "del")) {
         char cmd[256];
+        int n;
 
         if (argc < 4) {
             usage(argv[0]);
             return 1;
         }
-        snprintf(cmd, sizeof(cmd), "del %s %s", argv[2], argv[3]);
+        n = snprintf(cmd, sizeof(cmd), "del %s %s", argv[2], argv[3]);
+        if (n < 0 || (size_t)n >= sizeof(cmd)) {
+            fprintf(stderr, "avctl: signature type/hash too long to format\n");
+            return 1;
+        }
         if (write_command(cmd))
             return 1;
         printf("removed %s signature: %s\n", argv[2], argv[3]);
