@@ -27,10 +27,10 @@ jobs:
   build-deb:
     runs-on: ubuntu-latest
     # Debian/Ubuntu, not a generic ubuntu-latest apt install: these
-    # exact build-dep package names (notably libtlsh-dev,
-    # gir1.2-gtk-4.0) were confirmed against a real Debian 13 (trixie)
-    # box (see debian/control's own comment) - Ubuntu's repos aren't
-    # guaranteed to carry the same names/versions.
+    # exact build-dep package names (notably gir1.2-gtk-4.0) were
+    # confirmed against a real Debian 13 (trixie) box (see
+    # debian/control's own comment) - Ubuntu's repos aren't guaranteed
+    # to carry the same names/versions.
     container: debian:trixie
     steps:
       - uses: actions/checkout@v7
@@ -42,7 +42,7 @@ jobs:
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends \
             build-essential dpkg-dev debhelper \
-            pkg-config libnl-genl-3-dev libyara-dev libfuzzy-dev libtlsh-dev \
+            pkg-config libnl-genl-3-dev libyara-dev libfuzzy-dev \
             python3-gi gir1.2-gtk-4.0
 
       - name: dpkg-buildpackage
