@@ -72,13 +72,24 @@
 #define AVCTL_HASH_HEX_MAXLEN 64
 #define AVCTL_NAME_MAXLEN 63
 
-/* Rejects (rather than lets the kernel's own %Ns sscanf() silently
- * truncate) a hash/name/etc. field that's longer than the kernel-side
- * parser will actually accept. */
+/* Rejects (rather than lets the kernel's own %Ns/%N[^\n] sscanf()
+ * silently truncate) a hash/name/etc. field that's longer than the
+ * kernel-side parser will actually accept, or that contains an
+ * embedded newline. The newline case is its own kind of truncation:
+ * the kernel's "%63[^\n]" name field stops at the first '\n' even when
+ * the whole field is well under the length limit, so e.g. a name of
+ * "first\nsecond" (under 63 bytes total) would sail through a
+ * length-only check, get stored as just "first" on the kernel side,
+ * yet still have avctl's own confirmation message echo back the full,
+ * un-truncated caller-supplied string. */
 static int check_field_len(const char *label, const char *s, size_t max)
 {
     size_t len = strlen(s);
 
+    if (strchr(s, '\n')) {
+        fprintf(stderr, "avctl: %s must not contain a newline\n", label);
+        return -1;
+    }
     if (len > max) {
         fprintf(stderr, "avctl: %s too long (%zu bytes, max %zu)\n", label,
                 len, max);
