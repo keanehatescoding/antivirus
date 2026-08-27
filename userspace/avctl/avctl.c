@@ -56,6 +56,36 @@
  * accepts, for tests/non-default installs. */
 #define CONTROL_SOCK_PATH_DEFAULT "/run/avd/control.sock"
 
+/* Must match the kernel side's own field-width limits: AV_HASH_HEX_MAXLEN
+ * (av/sigtable.h) / SHA256_HEX_LEN (av/behavior.c) for hashes, and
+ * AV_SIG_NAME_LEN-1 (av/sigtable.h) / TRUST_NAME_LEN-1 (av/behavior.c)
+ * for names - i.e. sig_proc_write()'s and trust_proc_write()'s
+ * "%64s %63[^\n]" sscanf() field widths. Not #include'd directly (those
+ * are kernel-only headers pulling in <linux/types.h>) - mirrored here
+ * as the userspace-side half of the same contract. Checking the total
+ * formatted `cmd` buffer against sizeof(cmd) (as every command below
+ * already does) catches an oversized WRITE, but not an oversized
+ * INDIVIDUAL FIELD that still fits in cmd[] - the kernel's sscanf()
+ * would silently truncate/misparse that field instead of avctl's own
+ * snprintf(), so it has to be rejected here first. */
+#define AVCTL_HASH_HEX_MAXLEN 64
+#define AVCTL_NAME_MAXLEN 63
+
+/* Rejects (rather than lets the kernel's own %Ns sscanf() silently
+ * truncate) a hash/name/etc. field that's longer than the kernel-side
+ * parser will actually accept. */
+static int check_field_len(const char *label, const char *s, size_t max)
+{
+    size_t len = strlen(s);
+
+    if (len > max) {
+        fprintf(stderr, "avctl: %s too long (%zu bytes, max %zu)\n", label,
+                len, max);
+        return -1;
+    }
+    return 0;
+}
+
 static void usage(const char *prog)
 {
     fprintf(stderr,
@@ -472,6 +502,9 @@ static int do_trust(int argc, char **argv)
             return 1;
         }
 
+        if (check_field_len("hash", argv[3], AVCTL_HASH_HEX_MAXLEN))
+            return 1;
+
         /* Join every remaining argv[] into one space-separated name
          * instead of using only argv[4] - the kernel side's
          * trust_proc_write() already parses the rest of the line as
@@ -485,10 +518,20 @@ static int do_trust(int argc, char **argv)
         for (i = 4; i < argc && off < sizeof(name) - 1; i++) {
             int m = snprintf(name + off, sizeof(name) - off, "%s%s",
                               i > 4 ? " " : "", argv[i]);
-            if (m < 0)
-                break;
+            /* m >= remaining means snprintf() would have truncated -
+             * reject rather than silently store a cut-off name (it
+             * would then also silently pass the AVCTL_NAME_MAXLEN
+             * check below despite the caller's real name being
+             * longer). */
+            if (m < 0 || (size_t)m >= sizeof(name) - off) {
+                fprintf(stderr, "avctl: name too long\n");
+                return 1;
+            }
             off += (size_t)m;
         }
+
+        if (check_field_len("name", name, AVCTL_NAME_MAXLEN))
+            return 1;
 
         /* Reject rather than let snprintf() below silently truncate -
          * a truncated write would ask the kernel to trust a DIFFERENT
@@ -505,12 +548,19 @@ static int do_trust(int argc, char **argv)
         printf("trusted: %s (%s)\n", argv[3], name);
     } else if (!strcmp(argv[2], "del")) {
         char cmd[256];
+        int n;
 
         if (argc < 4) {
             usage(argv[0]);
             return 1;
         }
-        snprintf(cmd, sizeof(cmd), "del %s", argv[3]);
+        if (check_field_len("hash", argv[3], AVCTL_HASH_HEX_MAXLEN))
+            return 1;
+        n = snprintf(cmd, sizeof(cmd), "del %s", argv[3]);
+        if (n < 0 || (size_t)n >= sizeof(cmd)) {
+            fprintf(stderr, "avctl: hash too long to format\n");
+            return 1;
+        }
         if (write_command_to(TRUST_PROC_PATH, cmd))
             return 1;
         printf("untrusted: %s\n", argv[3]);
@@ -1020,6 +1070,10 @@ int main(int argc, char **argv)
             usage(argv[0]);
             return 1;
         }
+        if (check_field_len("hash", argv[3], AVCTL_HASH_HEX_MAXLEN))
+            return 1;
+        if (check_field_len("name", argv[4], AVCTL_NAME_MAXLEN))
+            return 1;
         /* Reject rather than let snprintf() below silently truncate -
          * a truncated write would register a DIFFERENT (shorter) hash
          * in the kernel than the one printed back to the caller, with
@@ -1041,6 +1095,8 @@ int main(int argc, char **argv)
             usage(argv[0]);
             return 1;
         }
+        if (check_field_len("hash", argv[3], AVCTL_HASH_HEX_MAXLEN))
+            return 1;
         n = snprintf(cmd, sizeof(cmd), "del %s %s", argv[2], argv[3]);
         if (n < 0 || (size_t)n >= sizeof(cmd)) {
             fprintf(stderr, "avctl: signature type/hash too long to format\n");
