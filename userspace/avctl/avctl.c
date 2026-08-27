@@ -37,6 +37,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -81,6 +82,27 @@ static int check_field_len(const char *label, const char *s, size_t max)
     if (len > max) {
         fprintf(stderr, "avctl: %s too long (%zu bytes, max %zu)\n", label,
                 len, max);
+        return -1;
+    }
+    return 0;
+}
+
+/* Rejects anything that isn't exactly one of the three algorithm names
+ * parse_algo() (av/sigtable.c) accepts, case-insensitively - not just
+ * for the obvious "typo'd algorithm name" case, but because this is
+ * also what stops a crafted algo argument containing embedded
+ * whitespace (e.g. "sha256 <a second, attacker-chosen hash>") from
+ * shifting sig_proc_write()'s "%7s %7s %64s %63[^\n]" field boundaries
+ * and getting a different hash stored than the one avctl's own
+ * confirmation message prints. None of the three real algorithm names
+ * contain whitespace, so this check alone also closes that off. */
+static int check_algo(const char *algo)
+{
+    if (strcasecmp(algo, "md5") && strcasecmp(algo, "sha1") &&
+        strcasecmp(algo, "sha256")) {
+        fprintf(stderr,
+                "avctl: unknown algorithm \"%s\" (expected md5, sha1, or sha256)\n",
+                algo);
         return -1;
     }
     return 0;
@@ -418,6 +440,50 @@ static int do_save(const char *path)
     return 0;
 }
 
+/* do_load() forwards each "sig "/"trust " line's fields (`rest`, the
+ * text after that prefix) straight to write_command()/
+ * write_command_to() - unlike do_trust()/the top-level add/del
+ * commands, it never ran them through check_field_len()/check_algo()
+ * first. A load file (hand-edited, or round-tripped through something
+ * other than avctl's own `save`) with an oversized hash/name hits the
+ * exact same kernel-side "%64s %63[^\n]" silent-misparse risk those
+ * checks exist for. Parses just enough of `rest`'s own structure to
+ * apply the same checks before forwarding - protect/policy lines have
+ * no hash/name/algo fields in this shape, so this only covers "sig"/
+ * "trust". Field buffers here are sized well beyond
+ * AVCTL_HASH_HEX_MAXLEN/AVCTL_NAME_MAXLEN on purpose: reading (and
+ * then rejecting) the true full length of an oversized field, rather
+ * than quietly re-truncating it at the same width the kernel would
+ * have, is what makes the length check meaningful. */
+static int validate_sig_or_trust_fields(const char *kind, const char *rest)
+{
+    char op[8], field_a[512], field_b[512];
+    int n;
+
+    if (!strcmp(kind, "sig")) {
+        char algo[8];
+
+        n = sscanf(rest, "%7s %7s %511s %511[^\n]", op, algo, field_a, field_b);
+        if (n < 3)
+            return 0; /* let write_command() report the real parse error */
+        if (check_algo(algo))
+            return -1;
+        if (check_field_len("hash", field_a, AVCTL_HASH_HEX_MAXLEN))
+            return -1;
+        if (n == 4 && check_field_len("name", field_b, AVCTL_NAME_MAXLEN))
+            return -1;
+    } else {
+        n = sscanf(rest, "%7s %511s %511[^\n]", op, field_a, field_b);
+        if (n < 2)
+            return 0;
+        if (check_field_len("hash", field_a, AVCTL_HASH_HEX_MAXLEN))
+            return -1;
+        if (n == 3 && check_field_len("name", field_b, AVCTL_NAME_MAXLEN))
+            return -1;
+    }
+    return 0;
+}
+
 static int do_load(const char *path)
 {
     FILE *f = fopen(path, "r");
@@ -441,9 +507,17 @@ static int do_load(const char *path)
 
         if (!strncmp(line, "sig ", 4)) {
             rest = line + 4;
+            if (validate_sig_or_trust_fields("sig", rest)) {
+                errors++;
+                continue;
+            }
             ret = write_command(rest);
         } else if (!strncmp(line, "trust ", 6)) {
             rest = line + 6;
+            if (validate_sig_or_trust_fields("trust", rest)) {
+                errors++;
+                continue;
+            }
             ret = write_command_to(TRUST_PROC_PATH, rest);
         } else if (!strncmp(line, "protect ", 8)) {
             rest = line + 8;
@@ -1070,6 +1144,8 @@ int main(int argc, char **argv)
             usage(argv[0]);
             return 1;
         }
+        if (check_algo(argv[2]))
+            return 1;
         if (check_field_len("hash", argv[3], AVCTL_HASH_HEX_MAXLEN))
             return 1;
         if (check_field_len("name", argv[4], AVCTL_NAME_MAXLEN))
@@ -1095,6 +1171,8 @@ int main(int argc, char **argv)
             usage(argv[0]);
             return 1;
         }
+        if (check_algo(argv[2]))
+            return 1;
         if (check_field_len("hash", argv[3], AVCTL_HASH_HEX_MAXLEN))
             return 1;
         n = snprintf(cmd, sizeof(cmd), "del %s %s", argv[2], argv[3]);
