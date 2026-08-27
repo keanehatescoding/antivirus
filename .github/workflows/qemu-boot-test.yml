@@ -23,20 +23,36 @@ on:
   pull_request:
 
 jobs:
+  # Same job as build-matrix.yml's own load-kernel-matrix - reads
+  # .github/kernel-versions.json and hands its "versions" array to the
+  # qemu-boot job's matrix below via fromJSON(). Duplicated here rather
+  # than shared across workflow files (GitHub Actions has no
+  # cross-workflow job-dependency mechanism) so this job's kernel
+  # version list can never drift from build-matrix.yml's - it used to
+  # be its own hardcoded list that only got updated by hand, and
+  # nothing kept it in sync with the versions build-matrix.yml was
+  # actually testing. The KCONFIG steps below still diverge from that
+  # job's (this one needs a bootable kernel, not just a compilable
+  # one) - only the version numbers themselves are shared.
+  load-kernel-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.read.outputs.versions }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: read
+        run: echo "versions=$(jq -c '.versions' .github/kernel-versions.json)" >> "$GITHUB_OUTPUT"
+
   qemu-boot:
+    needs: load-kernel-matrix
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # Same versions as build-matrix.yml (see that file for the
-        # auto-update mechanism) - kept as a separate list here rather
-        # than a shared source since this config diverges from that
-        # job's (this one needs a bootable kernel, not just a
-        # compilable one - see the config step below).
-        kernel_version:
-          - "6.12.96"  # LTS
-          - "6.18.21"  # LTS
-          - "7.1.4"  # current stable
+        # See load-kernel-matrix above - hand-edit
+        # .github/kernel-versions.json if you need to add e.g. a one-off
+        # version; edits there won't survive the next scheduled run.
+        kernel_version: ${{ fromJSON(needs.load-kernel-matrix.outputs.versions) }}
     steps:
       - uses: actions/checkout@v7
 
