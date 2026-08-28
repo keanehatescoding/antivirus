@@ -162,9 +162,12 @@ static const char *const excluded_path_suffixes[] = {
 };
 #define NUM_EXCLUDED_SUFFIXES ARRAY_SIZE(excluded_path_suffixes)
 
-static bool path_is_excluded(const char *path) {
+/* Pseudo-filesystem/device paths (see excluded_path_prefixes above) are
+ * exempt from EVERY behavior check, sensitive-path included - /sys, /proc,
+ * and /dev aren't user data and were never meant to be reachable via the
+ * sensitive-path list either. */
+static bool path_is_pseudo_fs(const char *path) {
   size_t i;
-  size_t path_len = strlen(path);
 
   for (i = 0; i < NUM_EXCLUDED_PREFIXES; i++) {
     size_t len = strlen(excluded_path_prefixes[i]);
@@ -172,6 +175,23 @@ static bool path_is_excluded(const char *path) {
     if (!strncmp(path, excluded_path_prefixes[i], len))
       return true;
   }
+
+  return false;
+}
+
+/* Cache/journal/wal/shm paths (see excluded_path_cache_substrings and
+ * excluded_path_suffixes above) are noise ONLY for the volume-based
+ * rapid-write/rapid-rename counters - they must NOT exempt a path from
+ * path_is_sensitive(). A path like ~/.cache/staged is trivially attacker-
+ * controlled; folding this into the same check that also skips the
+ * sensitive-path test let a rename such as
+ * `mv ~/.cache/staged ~/.ssh/authorized_keys` bypass detection entirely
+ * via the old-path cache match. Callers must run path_is_sensitive()
+ * unconditionally and use this function only to gate the rapid-write
+ * heuristics. */
+static bool path_is_rapid_write_noise(const char *path) {
+  size_t i;
+  size_t path_len = strlen(path);
 
   for (i = 0; i < NUM_EXCLUDED_CACHE_SUBSTRINGS; i++) {
     if (strstr(path, excluded_path_cache_substrings[i]))
@@ -206,7 +226,7 @@ static const char *const sensitive_path_substrings[] = {
  * remotely the same thing as the actual /boot filesystem. Unlike
  * /etc/passwd, /etc/shadow, and /.ssh/ - specific enough that a
  * substring match rarely fires outside the real path - "boot" alone
- * needed the same anchored-prefix treatment path_is_excluded() above
+ * needed the same anchored-prefix treatment path_is_pseudo_fs() above
  * already uses for excluded_path_prefixes[]. */
 static const char *const sensitive_path_prefixes[] = {
     "/boot/",
@@ -1131,19 +1151,19 @@ void av_behavior_check_openat(pid_t pid, const char *path, int flags,
 
   /* Pseudo-filesystem/device paths never count toward either
    * heuristic - see the comment on excluded_path_prefixes for why. */
-  if (path_is_excluded(path))
+  if (path_is_pseudo_fs(path))
     return;
 
   sensitive = path_is_sensitive(path);
 
   mutex_lock(&behavior_lock);
   e = get_or_create_entry(pid);
-  if (e && !e->trusted) {
+  if (e && !e->trusted && !path_is_rapid_write_noise(path)) {
     /* Rapid-write counting is skipped ENTIRELY for a trusted
-     * process (see behavior.h) - not just given a higher
-     * threshold. The sensitive-path check above still applies
-     * regardless of trust; only the volume-based signal is
-     * exempted. */
+     * process (see behavior.h) or a cache/journal-shaped path -
+     * not just given a higher threshold. The sensitive-path check
+     * above still applies regardless; only the volume-based signal
+     * is exempted. */
     u32 path_hash = full_name_hash(NULL, path, strlen(path));
     unsigned int in_window = sliding_window_note(
         path_hash, jiffies, WRITE_OPEN_WINDOW_MS, e->recent_path_hashes,
@@ -1168,7 +1188,7 @@ void av_behavior_check_unlink(pid_t pid, const char *path,
   bool self_delete = false;
   bool sensitive;
 
-  if (path_is_excluded(path))
+  if (path_is_pseudo_fs(path))
     return;
 
   mutex_lock(&behavior_lock);
@@ -1192,30 +1212,35 @@ void av_behavior_check_rename(pid_t pid, const char *oldpath,
   bool sensitive;
   bool rapid = false;
 
-  /* Pseudo-filesystem/device paths never count toward either
-   * heuristic here either - same reasoning as av_behavior_check_openat.
-   * Checked on BOTH ends: a rename touching /proc, /sys, or /dev on
-   * either side isn't a meaningful signal for either heuristic. */
-  if (path_is_excluded(oldpath) || path_is_excluded(newpath))
-    return;
-
   /* Sensitive-path check applies to either end - renaming FROM a
    * sensitive path (e.g. relocating /etc/shadow out from under the
    * system) or TO one (e.g. clobbering /etc/passwd via rename) are
    * both worth flagging, and neither direction is really "safer"
-   * than the other. */
+   * than the other. Computed unconditionally, and NOT folded into the
+   * pseudo-fs skip below: an early return on "either end is pseudo-fs"
+   * would let a rename like `mv /dev/shm/x /etc/shadow` suppress
+   * detection of the genuinely sensitive newpath just because oldpath
+   * happened to match /dev/ - the two paths are independent, and a
+   * pseudo-fs match on one end says nothing about the other end. */
   sensitive = path_is_sensitive(oldpath) || path_is_sensitive(newpath);
 
+  /* Pseudo-filesystem/device paths never count toward the volume-based
+   * heuristic - same reasoning as av_behavior_check_openat. Checked on
+   * BOTH ends: a rename touching /proc, /sys, or /dev on either side
+   * isn't a meaningful signal for that heuristic. This only gates the
+   * rapid-rename counter below, never the sensitive-path check above. */
   if (is_extension_append_rename(oldpath, newpath)) {
     mutex_lock(&behavior_lock);
     e = get_or_create_entry(pid);
-    if (e && !e->trusted) {
+    if (e && !e->trusted && !path_is_pseudo_fs(oldpath) &&
+        !path_is_pseudo_fs(newpath) && !path_is_rapid_write_noise(oldpath) &&
+        !path_is_rapid_write_noise(newpath)) {
       /* Same true-sliding-window + distinct-source-file dedup pattern
        * as av_behavior_check_openat's write-open counter, just with
        * its own independent ring-buffer fields - see the struct
-       * comment. Trust exemption is identical too: skips ONLY this
-       * volume-based signal, the sensitive-path check above still
-       * applies regardless. */
+       * comment. Trust and cache/journal-shaped-path exemptions are
+       * identical too: they skip ONLY this volume-based signal, the
+       * sensitive-path check above still applies regardless. */
       u32 path_hash = full_name_hash(NULL, oldpath, strlen(oldpath));
       unsigned int in_window = sliding_window_note(
           path_hash, jiffies, RENAME_WINDOW_MS, e->recent_rename_hashes,
