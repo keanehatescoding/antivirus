@@ -44,10 +44,18 @@ if grep -q "clang version" /proc/version 2>/dev/null; then
 fi
 
 echo "=== Building benchmark harness ==="
-# Unquoted heredoc delimiter (not << 'EOF') so $WORKDIR below expands -
-# safe here since the harness source itself contains no '$' or
-# backticks for the shell to misinterpret.
-cat > "$WORKDIR/av_bench_harness.c" << EOF
+# Quoted heredoc delimiter ('EOF', not EOF) - the scratch path is
+# passed to the compiled harness as argv[2] (see the invocations
+# below), NOT interpolated into this C source. WORKDIR is normally
+# unpredictable and root-owned, but sudo doesn't always strip TMPDIR
+# (env_keep, --preserve-env, or running as root directly can all
+# preserve it) - an attacker-controlled TMPDIR containing a literal
+# '"' or '\' would otherwise land inside a C string literal here and
+# could break out of it into arbitrary code the root-owned gcc then
+# compiles. argv is passed through execve() untouched by the shell
+# that invokes it, so this can't happen regardless of what WORKDIR
+# contains.
+cat > "$WORKDIR/av_bench_harness.c" << 'EOF'
 /* Small timing harness: N iterations of fork+execve+wait (/bin/true),
  * and N iterations of open+close on a scratch file. Reports average
  * microseconds per operation. Not part of the shipped project - a
@@ -83,10 +91,10 @@ static void bench_execve(int n) {
            n, elapsed / n);
 }
 
-static void bench_openat(int n) {
+static void bench_openat(int n, const char *scratch_path) {
     double start = now_us();
     for (int i = 0; i < n; i++) {
-        int fd = open("$WORKDIR/av_bench_scratch.txt", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        int fd = open(scratch_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
         if (fd >= 0)
             close(fd);
     }
@@ -96,8 +104,9 @@ static void bench_openat(int n) {
 
 int main(int argc, char **argv) {
     int n = argc > 1 ? atoi(argv[1]) : 1000;
+    const char *scratch_path = argc > 2 ? argv[2] : "av_bench_scratch.txt";
     bench_execve(n);
-    bench_openat(n);
+    bench_openat(n, scratch_path);
     return 0;
 }
 EOF
@@ -106,7 +115,7 @@ gcc -O2 -o "$BENCH_BIN" "$WORKDIR/av_bench_harness.c"
 echo
 echo "=== Baseline: module NOT loaded ==="
 rmmod av 2>/dev/null || true
-"$BENCH_BIN" "$ITERATIONS" | tee "$WORKDIR/av_bench_baseline.txt"
+"$BENCH_BIN" "$ITERATIONS" "$WORKDIR/av_bench_scratch.txt" | tee "$WORKDIR/av_bench_baseline.txt"
 
 echo
 echo "=== Loading module ==="
@@ -116,7 +125,7 @@ sleep 1
 
 echo
 echo "=== With module loaded ==="
-"$BENCH_BIN" "$ITERATIONS" | tee "$WORKDIR/av_bench_loaded.txt"
+"$BENCH_BIN" "$ITERATIONS" "$WORKDIR/av_bench_scratch.txt" | tee "$WORKDIR/av_bench_loaded.txt"
 
 echo
 echo "=== Cleanup ==="
