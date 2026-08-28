@@ -598,16 +598,24 @@ static int load_fuzzy_corpus(const char *path) {
  * opened once at the top, instead of re-resolving a path string at
  * each step. Hashes via a dup()'d handle so this doesn't disturb
  * `fd`'s own read offset for whatever the caller does with it next;
- * fuzzy_hash_file() seeks its handle to the start itself and restores
- * position when done, so no manual lseek is needed here either way.
+ * that dup()'d handle is explicitly seeked to the start and read into
+ * a bounded buffer this function owns (see fuzzy_hash_buf() below),
+ * rather than handed to fuzzy_hash_file() - see MAX_FUZZY_TLSH_FILE_
+ * SIZE's comment for why.
  */
 /* Shared size gate for check_fuzzy_corpus()/check_tlsh_corpus() - see
  * MAX_FUZZY_TLSH_FILE_SIZE's comment for why this exists. Returns
  * true if `fd` is small enough to fuzzy/TLSH-hash; on fstat() failure
  * fails open (returns true) so a stat error alone doesn't disable
  * these checks for otherwise-normal files, matching this codebase's
- * general fail-open stance on inconclusive information. */
-static bool fuzzy_tlsh_size_ok(int fd, const char *label) {
+ * general fail-open stance on inconclusive information.
+ *
+ * `size_out`, if non-NULL, receives the size this check measured -
+ * check_fuzzy_corpus() uses it to size its read buffer exactly rather
+ * than always allocating the full cap. Left unset (caller should
+ * fall back to MAX_FUZZY_TLSH_FILE_SIZE) when fstat() failed, since
+ * there's no measured size to report in that case. */
+static bool fuzzy_tlsh_size_ok(int fd, const char *label, size_t *size_out) {
   struct stat st;
 
   if (fstat(fd, &st) != 0)
@@ -618,6 +626,8 @@ static bool fuzzy_tlsh_size_ok(int fd, const char *label) {
             label, (long long)st.st_size, MAX_FUZZY_TLSH_FILE_SIZE);
     return false;
   }
+  if (size_out)
+    *size_out = (size_t)st.st_size;
   return true;
 }
 
@@ -628,26 +638,58 @@ static int check_fuzzy_corpus(int fd, char *name_out, size_t name_out_len,
   size_t best_idx = 0;
   size_t i;
   int dup_fd;
-  FILE *fp;
+  /* Unset by fuzzy_tlsh_size_ok() means "fstat() failed" - fall back
+   * to the full cap rather than an unbounded/zero-size read in that
+   * case, same fail-open stance as the size check itself. */
+  size_t want = MAX_FUZZY_TLSH_FILE_SIZE;
+  unsigned char *buf;
+  size_t len = 0;
+  ssize_t n;
   int hash_ret;
 
   if (fuzzy_corpus_count == 0)
     return 0;
-  if (!fuzzy_tlsh_size_ok(fd, "fuzzy"))
+  if (!fuzzy_tlsh_size_ok(fd, "fuzzy", &want))
     return 0;
 
   dup_fd = dup(fd);
   if (dup_fd < 0)
     return -1;
-
-  fp = fdopen(dup_fd, "rb");
-  if (!fp) {
+  if (lseek(dup_fd, 0, SEEK_SET) < 0) {
     close(dup_fd);
     return -1;
   }
 
-  hash_ret = fuzzy_hash_file(fp, file_hash);
-  fclose(fp); /* also closes dup_fd */
+  /* Read at most `want` bytes ourselves and hash that fixed buffer via
+   * fuzzy_hash_buf(), instead of handing the fd to fuzzy_hash_file()
+   * (which reads to EOF with no cap of its own - see
+   * MAX_FUZZY_TLSH_FILE_SIZE's comment). This closes the gap the
+   * fstat()-based check above alone leaves open: even a file that
+   * keeps growing while this loop runs can't make it read more than
+   * `want` bytes, so a concurrent writer can no longer pin this
+   * worker past what was already measured. */
+  buf = malloc(want ? want : 1);
+  if (!buf) {
+    close(dup_fd);
+    return -1;
+  }
+  while (len < want) {
+    n = read(dup_fd, buf + len, want - len);
+    if (n == 0)
+      break;
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      free(buf);
+      close(dup_fd);
+      return -1;
+    }
+    len += (size_t)n;
+  }
+  close(dup_fd);
+
+  hash_ret = fuzzy_hash_buf(buf, (uint32_t)len, file_hash);
+  free(buf);
 
   if (hash_ret != 0)
     return -1;
@@ -793,14 +835,20 @@ static int check_tlsh_corpus(int fd, char *name_out, size_t name_out_len,
 
   if (tlsh_corpus_count == 0)
     return 0;
-  if (!fuzzy_tlsh_size_ok(fd, "TLSH"))
+  if (!fuzzy_tlsh_size_ok(fd, "TLSH", NULL))
     return 0;
 
   dup_fd = dup(fd);
   if (dup_fd < 0)
     return -1;
 
-  hash_ret = av_tlsh_hash_fd(dup_fd, file_hash, sizeof(file_hash));
+  /* max_len backstops fuzzy_tlsh_size_ok()'s earlier fstat()-based
+   * check against a file that keeps growing after that check ran -
+   * the read loop inside av_tlsh_hash_fd() itself now can never
+   * consume more than MAX_FUZZY_TLSH_FILE_SIZE bytes regardless of
+   * how much more data shows up concurrently. */
+  hash_ret = av_tlsh_hash_fd(dup_fd, file_hash, sizeof(file_hash),
+                             MAX_FUZZY_TLSH_FILE_SIZE);
   close(dup_fd);
 
   if (hash_ret == -2)

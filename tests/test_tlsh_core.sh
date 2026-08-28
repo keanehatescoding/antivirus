@@ -80,7 +80,7 @@ static void check_hash(const char *label, const char *path, int expect_ret,
         FAIL++;
         return;
     }
-    ret = av_tlsh_hash_fd(fd, hash, sizeof(hash));
+    ret = av_tlsh_hash_fd(fd, hash, sizeof(hash), (size_t)-1);
     close(fd);
 
     if (ret != expect_ret) {
