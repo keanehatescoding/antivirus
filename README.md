@@ -177,6 +177,11 @@ tests/
   test_sha256.sh       - FIPS 180-4 known-answer tests for
                         userspace/avd/sha256.c - no kernel module or
                         root needed, safe to run standalone
+  test_tlsh_core.sh     - known-answer tests for the hand-ported TLSH
+                        algorithm in userspace/avd/tlsh_core.c, digests
+                        generated against the real system libtlsh
+                        oracle - same no-kernel-module/root-needed
+                        standalone shape as test_sha256.sh
   test_sigtable.sh     - avctl/proc protocol tests (add/list/del/reject)
   test_detection.sh    - full build/load/detect/unload integration test
   test_avd_socket.sh   - avd control socket tests: STATUS/VERDICTS RECENT,
@@ -184,7 +189,7 @@ tests/
                         restore/delete - builds+loads the module AND
                         starts avd itself, against a throwaway
                         quarantine dir/socket path
-  run_all.sh           - runs all four of the above (used by the pre-push hook)
+  run_all.sh           - runs all five of the above (used by the pre-push hook)
   benchmark.sh          - v1.0.0: execve/openat hook overhead, module
                         loaded vs unloaded (needs root, real numbers only
                         from your VM - see the benchmarking section)
@@ -455,14 +460,26 @@ what the existing version-pinned CI matrix already covers.
 
 ## Automated tests
 
-`tests/` has four scripts. Three run *inside your VM*, not in CI (see
-the CI section below for why); `test_sha256.sh` is the exception —
-pure userspace, no kernel module or root needed, safe to run anywhere:
+`tests/` has five scripts. Three run *inside your VM*, not in CI (see
+the CI section below for why); `test_sha256.sh` and `test_tlsh_core.sh`
+are the exceptions — pure userspace, no kernel module or root needed,
+safe to run anywhere:
 
 - **`test_sha256.sh`** — FIPS 180-4 known-answer tests for the
   self-contained SHA-256 in `userspace/avd/sha256.c`:
   ```bash
   tests/test_sha256.sh
+  ```
+
+- **`test_tlsh_core.sh`** — known-answer tests for the hand-ported TLSH
+  algorithm in `userspace/avd/tlsh_core.c`. Unlike SHA-256, TLSH has no
+  published test-vector suite, so the expected digests were generated
+  once against the real system `tlsh` oracle (`tlsh -old -f <file>`)
+  and hardcoded — same "catch a silent transcription error" purpose as
+  `test_sha256.sh`, for the one algorithm in this project that's a
+  from-scratch port rather than a from-spec implementation:
+  ```bash
+  tests/test_tlsh_core.sh
   ```
 
 - **`test_sigtable.sh`** — exercises the `avctl`/`/proc` protocol: add,
@@ -496,7 +513,7 @@ pure userspace, no kernel module or root needed, safe to run anywhere:
 
 Run `test_detection.sh` from a fresh snapshot when testing anything that
 touches `handler_pre`/`av_work_fn` — same caution as manual testing.
-All four scripts print a pass/fail count and exit non-zero on any
+All five scripts print a pass/fail count and exit non-zero on any
 failure, so they're suitable for a pre-commit or pre-tag check even
 without CI runtime support.
 

@@ -24,6 +24,11 @@ echo "### test_sha256.sh (known-answer tests for userspace/avd/sha256.c) ###"
 "$REPO_ROOT/tests/test_sha256.sh" || FAIL=1
 
 echo
+echo "### test_tlsh_core.sh (known-answer tests for userspace/avd/tlsh_core.c) ###"
+# Same no-root-needed reasoning as test_sha256.sh above.
+"$REPO_ROOT/tests/test_tlsh_core.sh" || FAIL=1
+
+echo
 echo "### test_detection.sh (build av/, load, exercise clean+EICAR, unload) ###"
 "$REPO_ROOT/tests/test_detection.sh" || FAIL=1
 
