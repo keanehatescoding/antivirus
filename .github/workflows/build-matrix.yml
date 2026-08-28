@@ -300,11 +300,11 @@ jobs:
             if (fd1 < 0 || fd2 < 0) { perror("open"); return 1; }
 
             char h1[256], h2[256];
-            if (av_tlsh_hash_fd(fd1, h1, sizeof(h1)) != 0) {
+            if (av_tlsh_hash_fd(fd1, h1, sizeof(h1), (size_t)-1) != 0) {
               fprintf(stderr, "FAIL: av_tlsh_hash_fd(original) failed\n");
               return 1;
             }
-            if (av_tlsh_hash_fd(fd2, h2, sizeof(h2)) != 0) {
+            if (av_tlsh_hash_fd(fd2, h2, sizeof(h2), (size_t)-1) != 0) {
               fprintf(stderr, "FAIL: av_tlsh_hash_fd(variant) failed\n");
               return 1;
             }
