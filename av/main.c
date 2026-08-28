@@ -371,8 +371,26 @@ static void resolve_absolute_path(const char *path, const struct path *base,
   if (IS_ERR(dirpath))
     strscpy(out, path, out_len);
   else {
-    snprintf(out, out_len, "%s/%s", dirpath, path);
-    normalize_abs_path(out, out_len);
+    /* snprintf()'s return value is how many bytes WOULD have been
+     * written absent truncation - checking it against out_len catches
+     * silent truncation the assignment-and-move-on version above
+     * couldn't. Two distinct, deeply-nested files whose combined
+     * dirpath+path exceeds out_len would otherwise truncate to the
+     * identical string, which self-delete correlation and
+     * sensitive-path matching (both plain strcmp()/prefix checks on
+     * this output) would then treat as the same file - same
+     * lossy-result-is-dangerous reasoning as normalize_abs_path()'s
+     * own >128-component bail-out above. Falling back to the
+     * unresolved relative path (not absolute, but not truncated
+     * either) keeps this case from colliding with anything, matching
+     * this function's existing degraded-not-dropped fallback stance
+     * for the d_path() failure case just above. */
+    int need = snprintf(out, out_len, "%s/%s", dirpath, path);
+
+    if (need < 0 || (size_t)need >= out_len)
+      strscpy(out, path, out_len);
+    else
+      normalize_abs_path(out, out_len);
   }
 
   kfree(tmp);
