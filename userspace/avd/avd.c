@@ -155,6 +155,19 @@
  * was added as its own deliberate feature (see avctl's save/load). */
 #define AVD_VERDICT_HISTORY_MAX 500
 #define SCAN_TIMEOUT_SECS 10
+
+/* Cap on what check_fuzzy_corpus()/check_tlsh_corpus() will read.
+ * yr_rules_scan_fd() (the YARA path, see SCAN_TIMEOUT_SECS above) is
+ * bounded by a timeout; libfuzzy's fuzzy_hash_file() and
+ * av_tlsh_hash_fd() have no equivalent of their own and read to EOF
+ * with nothing else stopping them. Only AVD_SCAN_THREADS (8) workers
+ * exist, so a handful of very large files - kernel-triggered or a
+ * control-socket SCAN - can tie up the whole pool for as long as the
+ * read takes; kernel-side scans then queue past AVD_SCAN_QUEUE_MAX and
+ * fail open. Same 256MB value as the kernel side's MAX_HASH_FILE_SIZE
+ * (av/main.c) for consistency, though the two caps guard unrelated
+ * code paths. */
+#define MAX_FUZZY_TLSH_FILE_SIZE (256 * 1024 * 1024)
 #define MALICIOUS_SCORE_THRESHOLD 100
 /* handle_scan_request() (YARA scan, up to SCAN_TIMEOUT_SECS, plus the
  * fuzzy-hash pass) used to run synchronously inside msg_handler(),
@@ -584,6 +597,26 @@ static int load_fuzzy_corpus(const char *path) {
  * fuzzy_hash_file() seeks its handle to the start itself and restores
  * position when done, so no manual lseek is needed here either way.
  */
+/* Shared size gate for check_fuzzy_corpus()/check_tlsh_corpus() - see
+ * MAX_FUZZY_TLSH_FILE_SIZE's comment for why this exists. Returns
+ * true if `fd` is small enough to fuzzy/TLSH-hash; on fstat() failure
+ * fails open (returns true) so a stat error alone doesn't disable
+ * these checks for otherwise-normal files, matching this codebase's
+ * general fail-open stance on inconclusive information. */
+static bool fuzzy_tlsh_size_ok(int fd, const char *label) {
+  struct stat st;
+
+  if (fstat(fd, &st) != 0)
+    return true;
+  if (st.st_size > (off_t)MAX_FUZZY_TLSH_FILE_SIZE) {
+    fprintf(stderr,
+            "avd: skipping %s hash - file is %lld bytes, over the %d cap\n",
+            label, (long long)st.st_size, MAX_FUZZY_TLSH_FILE_SIZE);
+    return false;
+  }
+  return true;
+}
+
 static int check_fuzzy_corpus(int fd, char *name_out, size_t name_out_len,
                               int *score_out) {
   char file_hash[FUZZY_MAX_RESULT];
@@ -595,6 +628,8 @@ static int check_fuzzy_corpus(int fd, char *name_out, size_t name_out_len,
   int hash_ret;
 
   if (fuzzy_corpus_count == 0)
+    return 0;
+  if (!fuzzy_tlsh_size_ok(fd, "fuzzy"))
     return 0;
 
   dup_fd = dup(fd);
@@ -753,6 +788,8 @@ static int check_tlsh_corpus(int fd, char *name_out, size_t name_out_len,
   int hash_ret;
 
   if (tlsh_corpus_count == 0)
+    return 0;
+  if (!fuzzy_tlsh_size_ok(fd, "TLSH"))
     return 0;
 
   dup_fd = dup(fd);
