@@ -56,6 +56,16 @@
 #include "behavior.h"
 
 #define BEHAVIOR_BITS 10          /* 1024 buckets */
+/* Hard cap on live behavior_table entries. Each entry is a
+ * kzalloc(sizeof(struct av_behavior_entry)) slab (~5-8KB, dominated by
+ * the PATH_MAX exec_path buffer) reachable by any unprivileged process
+ * that can execve() - see get_or_create_entry() below. Without a cap,
+ * `while true; do /bin/true; done` from any local shell allocates
+ * unreclaimable kernel memory as fast as GC_INTERVAL_MS lets exited
+ * entries fall behind. 8192 entries is ~48MB worst case, comfortably
+ * above any realistic concurrent-process count while still bounding
+ * the DoS. */
+#define MAX_BEHAVIOR_ENTRIES 8192
 #define WRITE_OPEN_WINDOW_MS 2000 /* sliding window size */
 #define WRITE_OPEN_THRESHOLD                                                   \
   50 /* DISTINCT write-intent opens within                                     \
@@ -339,6 +349,9 @@ static unsigned int sliding_window_note(u32 hash, unsigned long now,
 
 static DEFINE_HASHTABLE(behavior_table, BEHAVIOR_BITS);
 static DEFINE_MUTEX(behavior_lock);
+/* Live entry count, always read/written under behavior_lock - see
+ * MAX_BEHAVIOR_ENTRIES and get_or_create_entry(). */
+static unsigned int behavior_table_count;
 
 static struct workqueue_struct *behavior_gc_wq;
 static struct delayed_work behavior_gc_work;
@@ -928,12 +941,26 @@ static struct av_behavior_entry *get_or_create_entry(pid_t pid) {
       return e;
   }
 
+  if (behavior_table_count >= MAX_BEHAVIOR_ENTRIES) {
+    /* At capacity - kick GC to run as soon as possible (instead of
+     * waiting up to GC_INTERVAL_MS) so a burst of short-lived
+     * processes recovers headroom quickly, then decline to track
+     * this pid for now. Every caller already treats a NULL entry as
+     * "skip behavior tracking for this op" - the sensitive-path
+     * checks that don't depend on `e` still run regardless, so this
+     * only degrades the volume-based heuristics, never the kill
+     * path. */
+    mod_delayed_work(behavior_gc_wq, &behavior_gc_work, 0);
+    return NULL;
+  }
+
   e = kzalloc(sizeof(*e), GFP_KERNEL);
   if (!e)
     return NULL;
 
   e->pid = pid;
   hash_add(behavior_table, &e->node, pid_key(pid));
+  behavior_table_count++;
   return e;
 }
 
@@ -1111,6 +1138,7 @@ static void behavior_gc_fn(struct work_struct *w) {
       removed++;
     }
   }
+  behavior_table_count -= removed;
   mutex_unlock(&behavior_lock);
 
   if (removed)
