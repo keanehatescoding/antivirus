@@ -15,12 +15,23 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ITERATIONS="${ITERATIONS:-2000}"
-BENCH_BIN="/tmp/av_bench_harness"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "This script needs root (insmod/rmmod). Re-run with sudo."
     exit 1
 fi
+
+# mktemp -d, not fixed /tmp/av_bench_* paths - this script runs as
+# root, and a fixed world-writable-directory path is a classic
+# symlink-planting target: another local user could pre-create a
+# symlink at e.g. /tmp/av_bench_harness before this runs, and gcc -o
+# (which follows symlinks) would then overwrite whatever it points to.
+# A private, unpredictably-named, 0700 directory closes this off
+# entirely - same reasoning as tests/test_avd_socket.sh's mktemp use
+# and userspace/avd/Makefile's checkdeps target.
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/av_bench.XXXXXX")" || exit 1
+trap 'rm -rf "$WORKDIR"' EXIT
+BENCH_BIN="$WORKDIR/av_bench_harness"
 
 # A module MUST be built with the same compiler family as the running
 # kernel (see the top-level README's toolchain section and
@@ -33,7 +44,10 @@ if grep -q "clang version" /proc/version 2>/dev/null; then
 fi
 
 echo "=== Building benchmark harness ==="
-cat > /tmp/av_bench_harness.c << 'EOF'
+# Unquoted heredoc delimiter (not << 'EOF') so $WORKDIR below expands -
+# safe here since the harness source itself contains no '$' or
+# backticks for the shell to misinterpret.
+cat > "$WORKDIR/av_bench_harness.c" << EOF
 /* Small timing harness: N iterations of fork+execve+wait (/bin/true),
  * and N iterations of open+close on a scratch file. Reports average
  * microseconds per operation. Not part of the shipped project - a
@@ -72,7 +86,7 @@ static void bench_execve(int n) {
 static void bench_openat(int n) {
     double start = now_us();
     for (int i = 0; i < n; i++) {
-        int fd = open("/tmp/av_bench_scratch.txt", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        int fd = open("$WORKDIR/av_bench_scratch.txt", O_WRONLY | O_CREAT | O_TRUNC, 0600);
         if (fd >= 0)
             close(fd);
     }
@@ -87,12 +101,12 @@ int main(int argc, char **argv) {
     return 0;
 }
 EOF
-gcc -O2 -o "$BENCH_BIN" /tmp/av_bench_harness.c
+gcc -O2 -o "$BENCH_BIN" "$WORKDIR/av_bench_harness.c"
 
 echo
 echo "=== Baseline: module NOT loaded ==="
 rmmod av 2>/dev/null || true
-"$BENCH_BIN" "$ITERATIONS" | tee /tmp/av_bench_baseline.txt
+"$BENCH_BIN" "$ITERATIONS" | tee "$WORKDIR/av_bench_baseline.txt"
 
 echo
 echo "=== Loading module ==="
@@ -102,20 +116,19 @@ sleep 1
 
 echo
 echo "=== With module loaded ==="
-"$BENCH_BIN" "$ITERATIONS" | tee /tmp/av_bench_loaded.txt
+"$BENCH_BIN" "$ITERATIONS" | tee "$WORKDIR/av_bench_loaded.txt"
 
 echo
 echo "=== Cleanup ==="
 rmmod av
-rm -f /tmp/av_bench_scratch.txt
 
 echo
 echo "=== Comparison ==="
 echo "baseline (no module):"
-cat /tmp/av_bench_baseline.txt
+cat "$WORKDIR/av_bench_baseline.txt"
 echo
 echo "with module loaded:"
-cat /tmp/av_bench_loaded.txt
+cat "$WORKDIR/av_bench_loaded.txt"
 echo
 echo "Note on interpreting these numbers:"
 echo "- execve overhead includes the FULL detection pipeline: hashing"
