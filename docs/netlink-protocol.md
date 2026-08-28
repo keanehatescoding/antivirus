@@ -1,8 +1,6 @@
 # Kernel ↔ Daemon Protocol (Generic Netlink)
 
-Prerequisite plumbing for v0.3.0+ (YARA, string/API heuristics, ELF
-analysis, entropy, fuzzy hashing) — all of which are too heavy/complex to
-run in kernel context. This document + `av/netlink_chan.{c,h}` +
+This document + `av/netlink_chan.{c,h}` +
 `userspace/avd/` establish the request/response channel; the actual YARA
 matching logic still needs to be added inside `avd` as its own feature
 commit.
@@ -170,6 +168,4 @@ by watching your own shell die.
   three CI targets (6.12/6.18/7.1.4), but is worth re-checking if you
   ever build against something older.
 - `avd` now runs real detection logic (weighted YARA scoring with an
-  override tier, fuzzy hashing, quarantine) rather than a stub — see
-  the top-level README's `v0.3.0`–`v1.0.0` sections for how each layer
-  works and how to test it.
+  override tier, fuzzy hashing, quarantine)
