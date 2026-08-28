@@ -32,6 +32,7 @@
  * reset". There is no longer a boundary to pace around.
  */
 
+#include <linux/capability.h>
 #include <linux/dcache.h>
 #include <linux/fcntl.h>
 #include <linux/file.h>
@@ -472,6 +473,14 @@ static ssize_t trust_proc_write(struct file *file, const char __user *ubuf,
   char cmd[8], hex[SHA256_HEX_LEN + 1], name[TRUST_NAME_LEN];
   int n;
 
+  /* DAC mode (0644) alone only checks UID 0, not the capability that
+   * UID actually holds - any root process, even one that dropped
+   * CAP_SYS_ADMIN, could otherwise mutate the trust list. The
+   * netlink channel gates the equivalent operation behind
+   * GENL_ADMIN_PERM; this proc handler needs the same bar. */
+  if (!capable(CAP_SYS_ADMIN))
+    return -EPERM;
+
   /* Reject oversized writes instead of silently truncating them -
    * same fix, same reasoning as sig_proc_write() in sigtable.c: the
    * old min(count, sizeof(kbuf) - 1) truncated the copied prefix
@@ -758,6 +767,11 @@ static ssize_t protected_proc_write(struct file *file, const char __user *ubuf, 
   char *path;
   int n;
   ssize_t ret;
+
+  /* Same DAC-vs-capability gap as trust_proc_write() above - see its
+   * comment. */
+  if (!capable(CAP_SYS_ADMIN))
+    return -EPERM;
 
   /* Reject anything but the first write to a freshly-opened fd - a
    * genuine continuation of an earlier call (its *ppos already
