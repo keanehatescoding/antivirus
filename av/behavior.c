@@ -1212,24 +1212,28 @@ void av_behavior_check_rename(pid_t pid, const char *oldpath,
   bool sensitive;
   bool rapid = false;
 
-  /* Pseudo-filesystem/device paths never count toward either
-   * heuristic here either - same reasoning as av_behavior_check_openat.
-   * Checked on BOTH ends: a rename touching /proc, /sys, or /dev on
-   * either side isn't a meaningful signal for either heuristic. */
-  if (path_is_pseudo_fs(oldpath) || path_is_pseudo_fs(newpath))
-    return;
-
   /* Sensitive-path check applies to either end - renaming FROM a
    * sensitive path (e.g. relocating /etc/shadow out from under the
    * system) or TO one (e.g. clobbering /etc/passwd via rename) are
    * both worth flagging, and neither direction is really "safer"
-   * than the other. */
+   * than the other. Computed unconditionally, and NOT folded into the
+   * pseudo-fs skip below: an early return on "either end is pseudo-fs"
+   * would let a rename like `mv /dev/shm/x /etc/shadow` suppress
+   * detection of the genuinely sensitive newpath just because oldpath
+   * happened to match /dev/ - the two paths are independent, and a
+   * pseudo-fs match on one end says nothing about the other end. */
   sensitive = path_is_sensitive(oldpath) || path_is_sensitive(newpath);
 
+  /* Pseudo-filesystem/device paths never count toward the volume-based
+   * heuristic - same reasoning as av_behavior_check_openat. Checked on
+   * BOTH ends: a rename touching /proc, /sys, or /dev on either side
+   * isn't a meaningful signal for that heuristic. This only gates the
+   * rapid-rename counter below, never the sensitive-path check above. */
   if (is_extension_append_rename(oldpath, newpath)) {
     mutex_lock(&behavior_lock);
     e = get_or_create_entry(pid);
-    if (e && !e->trusted && !path_is_rapid_write_noise(oldpath) &&
+    if (e && !e->trusted && !path_is_pseudo_fs(oldpath) &&
+        !path_is_pseudo_fs(newpath) && !path_is_rapid_write_noise(oldpath) &&
         !path_is_rapid_write_noise(newpath)) {
       /* Same true-sliding-window + distinct-source-file dedup pattern
        * as av_behavior_check_openat's write-open counter, just with
