@@ -1235,7 +1235,19 @@ void av_behavior_check_unlink(pid_t pid, const char *path,
 
   mutex_lock(&behavior_lock);
   e = get_or_create_entry(pid);
-  if (e && e->exec_path[0] != '\0' && !strcmp(e->exec_path, path))
+  /* Both sides must be genuinely-resolved absolute paths (path[0] ==
+   * '/' is the same litmus test resolve_absolute_path() itself uses
+   * for "already absolute") before trusting a strcmp() match as real
+   * identity. resolve_absolute_path() falls back to copying the raw,
+   * still-relative `path` through unresolved on a handful of rare
+   * failure paths (allocation failure, d_path() failure, or - see its
+   * own comment - a would-be truncating concatenation) rather than
+   * silently dropping the event; two DIFFERENT files that both hit
+   * one of those fallbacks could otherwise share the exact same
+   * leftover relative remainder and falsely strcmp() equal here,
+   * triggering a self-delete kill of an unrelated process. */
+  if (e && e->exec_path[0] == '/' && path[0] == '/' &&
+      !strcmp(e->exec_path, path))
     self_delete = true;
   mutex_unlock(&behavior_lock);
 

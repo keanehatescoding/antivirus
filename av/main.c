@@ -382,9 +382,13 @@ static void resolve_absolute_path(const char *path, const struct path *base,
      * lossy-result-is-dangerous reasoning as normalize_abs_path()'s
      * own >128-component bail-out above. Falling back to the
      * unresolved relative path (not absolute, but not truncated
-     * either) keeps this case from colliding with anything, matching
-     * this function's existing degraded-not-dropped fallback stance
-     * for the d_path() failure case just above. */
+     * either) matches this function's existing degraded-not-dropped
+     * fallback stance for the d_path() failure case just above - it
+     * doesn't fully rule out a collision between two different
+     * fallback results, which is why av_behavior_check_unlink() in
+     * behavior.c separately requires both sides of its self-delete
+     * comparison to start with '/' before trusting a match; this
+     * fallback deliberately never produces that. */
     int need = snprintf(out, out_len, "%s/%s", dirpath, path);
 
     if (need < 0 || (size_t)need >= out_len)
