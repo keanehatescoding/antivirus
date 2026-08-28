@@ -588,6 +588,18 @@ static int hash_file_multi(const char *path, const struct path *pwd,
   }
 
   while ((n = kernel_read(f, buf, READ_CHUNK_SIZE, &pos)) > 0) {
+    /* The i_size_read() check above only bounds the size at open
+     * time - a file that keeps growing while this loop reads it
+     * (e.g. a shell script appending to itself; ETXTBSY only
+     * protects an exec'd interpreter's own image, not a script file
+     * it's reading) would otherwise let kernel_read() keep consuming
+     * data forever, pinning this worker thread indefinitely. `pos`
+     * is kernel_read()'s own running byte count, so re-checking it
+     * against the same cap here catches that case the same way. */
+    if (pos > MAX_HASH_FILE_SIZE) {
+      ret = -EFBIG;
+      goto out;
+    }
     for (i = 0; i < 3; i++) {
       if (!ctx[i].active)
         continue;
