@@ -120,6 +120,21 @@ jobs:
           ./scripts/config --enable CONFIG_CRYPTO_SHA256
           ./scripts/config --enable CONFIG_PROC_FS
           ./scripts/config --enable CONFIG_NET
+          # Same explicit-value-wins trap as CONFIG_64BIT above:
+          # lib/Kconfig.debug's own default is "2048 if 64BIT", but
+          # tinyconfig bakes in "1024 if !64BIT" as a concrete .config
+          # value before the CONFIG_64BIT override above lands, and
+          # olddefconfig won't recompute a default over an existing
+          # explicit value. Left at 1024, av/main.c's
+          # normalize_abs_path() (a 128-entry pointer array, ~1032
+          # bytes of frame) trips -Wframe-larger-than= on every kernel
+          # version here even though it's well under what any real
+          # 64-bit kernel actually warns at - confirmed by building
+          # this matrix's kernel versions locally with tinyconfig
+          # (warns at the default 1024) vs pinned to 2048 (clean).
+          # Pin it to the real-world default so build-av's -Werror
+          # below reflects genuine warnings, not a tinyconfig artifact.
+          ./scripts/config --set-val CONFIG_FRAME_WARN 2048
           make $LLVM_ARG olddefconfig
           make $LLVM_ARG -j"$(nproc)"
 
@@ -127,12 +142,20 @@ jobs:
         run: |
           set -euxo pipefail
           KDIR="$GITHUB_WORKSPACE/linux-${{ matrix.kernel_version }}-${{ matrix.toolchain }}"
+          # -Werror via KCFLAGS (CI-only, same rationale as
+          # build-avctl/build-avd below - a contributor's local build
+          # shouldn't hard-fail on a warning from a kernel/compiler
+          # version CI doesn't use). Safe across every kernel_version x
+          # toolchain leg now that CONFIG_FRAME_WARN above is pinned
+          # to a real 64-bit kernel's default instead of tinyconfig's
+          # stricter one - that was the only warning this matrix
+          # produced when this was investigated locally.
           if [ "${{ matrix.toolchain }}" = "clang" ]; then
             make -C av KDIR="$KDIR" CC=clang LLVM=1 clean
-            make -C av KDIR="$KDIR" CC=clang LLVM=1
+            make -C av KDIR="$KDIR" CC=clang LLVM=1 KCFLAGS="-Werror"
           else
             make -C av KDIR="$KDIR" clean
-            make -C av KDIR="$KDIR"
+            make -C av KDIR="$KDIR" KCFLAGS="-Werror"
           fi
 
       - name: Verify netlink_chan.o actually linked into av.ko
