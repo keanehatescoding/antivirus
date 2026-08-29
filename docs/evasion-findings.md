@@ -1,21 +1,4 @@
-# Evasion Resistance Findings (v0.9.0)
-
-Four evasion techniques, one targeting each major detection layer,
-tested against the actual engine (not hypothetical). Three were
-verified standalone in a sandbox; the fourth needs the live kernel
-module and was verified live against it
-(`tests/evasion/test_slow_drip_evasion.sh`) - see finding #4 below,
-which was re-verified again after `sliding_window_note()` fixed part
-of what it originally found.
-
-## Summary table
-
-| # | Technique | Target layer | Result |
-|---|-----------|-------------|--------|
-| 1 | Dynamic symbol resolution (`dlopen`/`dlsym`) | API heuristics (`heuristics.yar`) | **Evaded** the specific `Imports_Ptrace` rule; the evasion technique itself tripped a separate low-confidence rule (`Imports_Dlopen`) |
-| 2 | Substantial file modification (+50KB random data) | Fuzzy hashing (`avd`'s corpus check) | **Fully evaded** — similarity score 0/100, vs. 100/100 for a minor (few-byte) variant |
-| 3 | Entropy dilution (padding a packed binary with zero bytes) | Entropy analysis (`entropy.yar`) | **Evaded** the entropy check specifically, but the same file was still caught by structural analysis (`elf_analysis.yar`) — defense-in-depth held |
-| 4 | Slow-drip file modification (bursts under threshold, paced past the window) | Behavioral heuristics (`behavior.c`) | **Re-verified live, updated**: the discrete-reset bug this originally exploited is fixed (`sliding_window_note()`); deliberate pacing with gaps *beyond* the window still evades in the tested configuration, but that's now the inherent limit of any finite windowed rate counter, not an implementation flaw |
+# Evasion Resistance Findings
 
 ## 1. Dynamic symbol resolution vs. API import heuristics
 
