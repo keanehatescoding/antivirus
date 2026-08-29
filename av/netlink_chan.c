@@ -255,8 +255,15 @@ int av_netlink_scan_request(const char *path, const char *sha256_hex,
      * with -EMSGSIZE, which av_work_fn() can't distinguish from "daemon
      * unreachable" and so falls through to fail-open, silently skipping
      * the daemon-side scan for long paths even though the daemon is up
-     * and would have answered. */
-    payload_size = nla_total_size(sizeof(u64)) +
+     * and would have answered.
+     *
+     * AV_A_REQID is written with nla_put_u64_64bit(), which - on
+     * architectures without CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS -
+     * inserts an extra padding attribute to 8-byte-align the u64
+     * payload. Sizing it with plain nla_total_size() misses that pad
+     * attribute's space on those architectures, so use
+     * nla_total_size_64bit() to match. */
+    payload_size = nla_total_size_64bit(sizeof(u64)) +
                    nla_total_size(sizeof(u32)) +
                    nla_total_size(strlen(path) + 1) +
                    nla_total_size(strlen(sha256_hex) + 1);
