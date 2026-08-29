@@ -1222,10 +1222,10 @@ static void kill_with_reason(struct pid *target_pid, const char *path,
  * Note on PID reuse: if the pid number gets recycled by an unrelated
  * new process before this sweep runs, the stale entry looks "alive"
  * and survives one more interval. That's fine - av_behavior_record_exec
- * overwrites exec_path on the new process's first execve, and the
- * write-open window/dedup state naturally resets on its own next
- * window regardless of who "owns" the entry in between. Worst case is
- * one GC_INTERVAL_MS of an entry outliving its original process. */
+ * overwrites exec_path and explicitly clears the write-open/rename
+ * window state on the new process's first execve, so it starts clean
+ * rather than inheriting the previous occupant's activity. Worst case
+ * is one GC_INTERVAL_MS of an entry outliving its original process. */
 static void behavior_gc_fn(struct work_struct *w) {
   struct av_behavior_entry *e;
   struct hlist_node *tmp;
@@ -1273,6 +1273,16 @@ void av_behavior_record_exec(pid_t pid, const char *path,
   if (e) {
     strscpy(e->exec_path, path, sizeof(e->exec_path));
     e->trusted = trusted;
+    /* A reused pid can land on a stale entry left behind by a
+     * previous, unrelated process (get_or_create_entry() matches on
+     * pid alone) - clear its sliding-window state here rather than
+     * letting it age out on its own over up to WRITE_OPEN_WINDOW_MS,
+     * so the new process doesn't inherit write/rename activity it
+     * never performed and get killed for it. */
+    e->recent_path_next = 0;
+    e->recent_path_filled = 0;
+    e->recent_rename_next = 0;
+    e->recent_rename_filled = 0;
   }
   mutex_unlock(&behavior_lock);
 }
