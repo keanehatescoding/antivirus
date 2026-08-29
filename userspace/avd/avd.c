@@ -88,6 +88,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -160,13 +161,13 @@
  * yr_rules_scan_fd() (the YARA path, see SCAN_TIMEOUT_SECS above) is
  * bounded by a timeout; libfuzzy's fuzzy_hash_file() and
  * av_tlsh_hash_fd() have no equivalent of their own and read to EOF
- * with nothing else stopping them. Only AVD_SCAN_THREADS (8) workers
- * exist, so a handful of very large files - kernel-triggered or a
- * control-socket SCAN - can tie up the whole pool for as long as the
- * read takes; kernel-side scans then queue past AVD_SCAN_QUEUE_MAX and
- * fail open. Same 256MB value as the kernel side's MAX_HASH_FILE_SIZE
- * (av/main.c) for consistency, though the two caps guard unrelated
- * code paths. */
+ * with nothing else stopping them. Only avd_scan_threads (default
+ * AVD_SCAN_THREADS_DEFAULT) workers exist, so a handful of very large
+ * files - kernel-triggered or a control-socket SCAN - can tie up the
+ * whole pool for as long as the read takes; kernel-side scans then
+ * queue past avd_scan_queue_max and fail open. Same 256MB value as
+ * the kernel side's MAX_HASH_FILE_SIZE (av/main.c) for consistency,
+ * though the two caps guard unrelated code paths. */
 #define MAX_FUZZY_TLSH_FILE_SIZE (256 * 1024 * 1024)
 #define MALICIOUS_SCORE_THRESHOLD 100
 /* handle_scan_request() (YARA scan, up to SCAN_TIMEOUT_SECS, plus the
@@ -178,12 +179,29 @@
  * so any burst of concurrent execs (or an attacker deliberately
  * racing many at once) silently dropped detection to zero for
  * everything but the first. Fixed by moving the scan itself onto a
- * fixed-size worker pool (AVD_SCAN_THREADS) fed by a bounded queue
- * (AVD_SCAN_QUEUE_MAX) - msg_handler() now only copies the request
- * and enqueues it, keeping the netlink recv loop free to keep
- * accepting new requests while scans run in parallel. */
-#define AVD_SCAN_THREADS 8
-#define AVD_SCAN_QUEUE_MAX 256
+ * worker pool (avd_scan_threads workers, default/compile-time-fallback
+ * AVD_SCAN_THREADS_DEFAULT) fed by a bounded queue (capacity
+ * avd_scan_queue_max, default AVD_SCAN_QUEUE_MAX_DEFAULT) -
+ * msg_handler() now only copies the request and enqueues it, keeping
+ * the netlink recv loop free to keep accepting new requests while
+ * scans run in parallel.
+ *
+ * Both pool sizes are runtime-tunable via the AVD_SCAN_THREADS/
+ * AVD_SCAN_QUEUE_MAX environment variables (see parse_tunable_env() in
+ * main()) rather than fixed at compile time - operators can raise
+ * scan concurrency (more CPU cores, a bigger exec/open burst to
+ * absorb) or lower it (constrained/embedded deployment) without a
+ * rebuild. Clamped to [AVD_SCAN_THREADS_MIN, AVD_SCAN_THREADS_MAX] /
+ * [AVD_SCAN_QUEUE_MIN, AVD_SCAN_QUEUE_MAX_MAX] - an unbounded operator
+ * value would otherwise size a calloc()/pthread_create() loop (worker
+ * count) or a producer/consumer backlog (queue depth) directly off an
+ * environment variable. */
+#define AVD_SCAN_THREADS_DEFAULT 8
+#define AVD_SCAN_THREADS_MIN 1
+#define AVD_SCAN_THREADS_MAX 256
+#define AVD_SCAN_QUEUE_MAX_DEFAULT 256
+#define AVD_SCAN_QUEUE_MIN 1
+#define AVD_SCAN_QUEUE_MAX_MAX 65536
 /* Sum of every matching rule's `weight` meta (see the .yar files under rules/)
  * has to clear this before avd convicts. Added after real testing killed
  * /usr/bin/zsh, /bin/sh, and /usr/bin/uwsm - all legitimate binaries that each
@@ -245,10 +263,19 @@ static int family_id;
 static volatile sig_atomic_t running = 1;
 static YR_RULES *compiled_rules;
 
+/* Runtime-tunable pool sizes - see AVD_SCAN_THREADS_DEFAULT's comment
+ * above and parse_tunable_env() below. Set once in main() before any
+ * worker thread or the netlink recv loop starts, read-only from
+ * every other thread from then on - same "populated once at startup,
+ * read-only after" reasoning as compiled_rules/fuzzy_corpus below, so
+ * no lock guards them. */
+static int avd_scan_threads = AVD_SCAN_THREADS_DEFAULT;
+static int avd_scan_queue_max = AVD_SCAN_QUEUE_MAX_DEFAULT;
+
 /* nl_send_auto() touches `sock`'s internal sequence-number/port state,
  * which libnl does not guarantee is safe for concurrent callers - so
  * every send_verdict() call (now potentially from any of the
- * AVD_SCAN_THREADS worker threads) takes this around the actual send.
+ * avd_scan_threads worker threads) takes this around the actual send.
  * Held only around message construction+send, never around the scan
  * itself, so contention is negligible. compiled_rules and
  * fuzzy_corpus need no such lock: both are populated once at startup
@@ -259,7 +286,7 @@ static YR_RULES *compiled_rules;
 static pthread_mutex_t send_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Bounded producer/consumer queue between msg_handler() (the single
- * netlink recv thread - producer) and the AVD_SCAN_THREADS scan
+ * netlink recv thread - producer) and the avd_scan_threads scan
  * workers (consumers). A linked list rather than a ring buffer since
  * depth is small and this isn't a hot path relative to the scan
  * itself. `shutting_down` lets both a full queue's producer-side wait
@@ -736,6 +763,90 @@ static int check_fuzzy_corpus(int fd, char *name_out, size_t name_out_len,
     snprintf(name_out, name_out_len, "%s", fuzzy_corpus[best_idx].name);
     *score_out = best_score;
     return 1;
+  }
+
+  return 0;
+}
+
+/*
+ * Startup regression guard for the hand-ported TLSH implementation
+ * (tlsh_core.c/tlsh_shim.c - see that port's own top comment: "any
+ * transcription error here would silently produce plausible-looking
+ * but wrong hashes for every input, not a crash"). Hashes the exact
+ * same fixed input vector as tests/test_tlsh_core.sh's "kat_a.txt"
+ * known-answer test (three repeated lines of pangram text, byte-for-
+ * byte identical - the expected digest below is the same
+ * oracle-generated value that test hardcodes) and asserts the result
+ * still matches. That test only runs in CI/manual dev runs; this
+ * makes the same check self-contained in the actual shipped daemon,
+ * so a corrupted/bit-rotted build still catches the failure at
+ * startup instead of shipping silently-wrong verdicts. Uses
+ * memfd_create() rather than a real temp file - no filesystem
+ * dependency (writable /tmp, disk space, cleanup) for what is purely
+ * an in-memory known-input check. Returns 0 if the digest matches, -1
+ * otherwise (caller should treat -1 as fatal - see its call site in
+ * main()).
+ */
+static int av_tlsh_selftest(void) {
+  static const char vector[] =
+      "The quick brown fox jumps over the lazy dog. Pack my box with five "
+      "dozen liquor jugs. How vexingly quick daft zebras jump! The five "
+      "boxing wizards jump quickly. Sphinx of black quartz, judge my "
+      "vow.\n"
+      "The quick brown fox jumps over the lazy dog. Pack my box with five "
+      "dozen liquor jugs. How vexingly quick daft zebras jump! The five "
+      "boxing wizards jump quickly. Sphinx of black quartz, judge my "
+      "vow.\n"
+      "The quick brown fox jumps over the lazy dog. Pack my box with five "
+      "dozen liquor jugs. How vexingly quick daft zebras jump! The five "
+      "boxing wizards jump quickly. Sphinx of black quartz, judge my "
+      "vow.\n";
+  static const char expected_hash[] =
+      "6DF023C4F665119516E9040C435E7572D1EC8A045313F63050745183205C1734CF06B5";
+  int fd;
+  char hash[AV_TLSH_HASH_BUFSZ];
+  int ret;
+  bool ok;
+  size_t off = 0;
+  const size_t vector_len = sizeof(vector) - 1;
+
+  fd = memfd_create("av-tlsh-selftest", MFD_CLOEXEC);
+  if (fd < 0) {
+    fprintf(stderr, "avd: TLSH self-test: memfd_create failed: %s\n",
+            strerror(errno));
+    return -1;
+  }
+
+  /* Plain retry-on-partial-write loop, not write_all() (defined much
+   * later in this file, alongside the control-socket code it's
+   * otherwise only used by) - a memfd write of under 1KB always
+   * completes in one call in practice, but looping costs nothing and
+   * avoids depending on a short write never happening. */
+  while (off < vector_len) {
+    ssize_t n = write(fd, vector + off, vector_len - off);
+
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      fprintf(stderr, "avd: TLSH self-test: could not write test vector: %s\n",
+              strerror(errno));
+      close(fd);
+      return -1;
+    }
+    off += (size_t)n;
+  }
+  lseek(fd, 0, SEEK_SET);
+
+  ret = av_tlsh_hash_fd(fd, hash, sizeof(hash), (size_t)-1);
+  close(fd);
+
+  ok = (ret == 0 && strcmp(hash, expected_hash) == 0);
+  if (!ok) {
+    fprintf(stderr,
+            "avd: TLSH self-test FAILED (ret=%d, got=%s, expected=%s) - "
+            "the TLSH port may be corrupted; refusing to start\n",
+            ret, ret == 0 ? hash : "(none)", expected_hash);
+    return -1;
   }
 
   return 0;
@@ -1581,7 +1692,7 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
 
 /* Producer side (called only from msg_handler(), the netlink recv
  * thread). Copies the request into a heap task and blocks if the
- * queue is at AVD_SCAN_QUEUE_MAX rather than growing unbounded - this
+ * queue is at avd_scan_queue_max rather than growing unbounded - this
  * is deliberate backpressure: if every worker is busy and the queue
  * is full, pausing the recv loop is no worse than the pre-fix
  * behavior (a scan already blocked the loop outright), and the
@@ -1604,7 +1715,7 @@ static bool enqueue_scan_task(uint64_t reqid, uint32_t pid, const char *path,
            sha256_hex ? sha256_hex : "");
 
   pthread_mutex_lock(&queue_lock);
-  while (queue_len >= AVD_SCAN_QUEUE_MAX && !shutting_down)
+  while (queue_len >= (size_t)avd_scan_queue_max && !shutting_down)
     pthread_cond_wait(&queue_not_full, &queue_lock);
 
   if (shutting_down) {
@@ -1625,7 +1736,7 @@ static bool enqueue_scan_task(uint64_t reqid, uint32_t pid, const char *path,
   return true;
 }
 
-/* Consumer side - runs on each of the AVD_SCAN_THREADS worker
+/* Consumer side - runs on each of the avd_scan_threads worker
  * threads. Blocks for work, exits once shutting_down is set AND the
  * queue has drained (rather than abandoning whatever's still queued,
  * since those requests are otherwise silently lost with no verdict
@@ -1880,7 +1991,7 @@ static void cmd_status(int fd) {
   write_all(fd, "COUNT 1\n", 8);
   snprintf(row, sizeof(row), "%ld\t%d\t%zu\t%zu\t%zu\t%d\n",
            (long)(time(NULL) - start_time), compiled_rules ? 1 : 0,
-           fuzzy_corpus_count, tlsh_corpus_count, qlen, AVD_SCAN_THREADS);
+           fuzzy_corpus_count, tlsh_corpus_count, qlen, avd_scan_threads);
   write_all(fd, row, strlen(row));
   write_all(fd, "END\n", 4);
 }
@@ -2534,6 +2645,39 @@ static void *control_accept_main(void *arg) {
   return NULL;
 }
 
+/* Reads `env_name` as a runtime override for one of avd_scan_threads/
+ * avd_scan_queue_max, validates it, and returns the value to use.
+ * Rejects (falls back to `default_val`, with a loud warning) rather
+ * than silently clamping an out-of-range or malformed value into
+ * range - same "reject, don't quietly reinterpret" stance avctl's
+ * check_field_len()/check_algo() take on oversized/malformed CLI
+ * input, for the same reason: a silently-clamped value would leave an
+ * operator who typo'd or miscalculated their own config believing
+ * it took effect as written. Unset is the normal case (not a
+ * warning) and just returns `default_val`. */
+static int parse_tunable_env(const char *env_name, int default_val,
+                             int min_val, int max_val) {
+  const char *val = getenv(env_name);
+  char *end;
+  long parsed;
+
+  if (!val || val[0] == '\0')
+    return default_val;
+
+  errno = 0;
+  parsed = strtol(val, &end, 10);
+  if (errno != 0 || end == val || *end != '\0' || parsed < min_val ||
+      parsed > max_val) {
+    fprintf(stderr,
+            "avd: %s=\"%s\" is not a valid integer in [%d, %d] - using "
+            "default %d\n",
+            env_name, val, min_val, max_val, default_val);
+    return default_val;
+  }
+
+  return (int)parsed;
+}
+
 int main(int argc, char **argv) {
   const char *rules_dir = DEFAULT_RULES_DIR;
   const char *corpus_file = DEFAULT_CORPUS_FILE;
@@ -2564,6 +2708,21 @@ int main(int argc, char **argv) {
   else if (getenv("AVD_SOCK_PATH"))
     control_sock_path = getenv("AVD_SOCK_PATH");
 
+  /* Env vars only, no positional argv slot - unlike rules_dir/
+   * corpus_file/etc. above, these two aren't paths a packaging script
+   * would want to override positionally, and adding a 6th/7th
+   * positional argument here would be a much easier compatibility
+   * break for existing callers (systemd unit, scripts) to trip over
+   * than an opt-in env var. */
+  avd_scan_threads = parse_tunable_env("AVD_SCAN_THREADS",
+                                       AVD_SCAN_THREADS_DEFAULT,
+                                       AVD_SCAN_THREADS_MIN,
+                                       AVD_SCAN_THREADS_MAX);
+  avd_scan_queue_max = parse_tunable_env("AVD_SCAN_QUEUE_MAX",
+                                         AVD_SCAN_QUEUE_MAX_DEFAULT,
+                                         AVD_SCAN_QUEUE_MIN,
+                                         AVD_SCAN_QUEUE_MAX_MAX);
+
   printf("avd: quarantine directory: %s\n", quarantine_dir);
   printf("avd: control socket: %s\n", control_sock_path);
 
@@ -2585,6 +2744,11 @@ int main(int argc, char **argv) {
    * with errno EPIPE instead of raising the signal, and existing error
    * handling takes it from there. */
   signal(SIGPIPE, SIG_IGN);
+
+  if (av_tlsh_selftest() != 0) {
+    fprintf(stderr, "avd: TLSH self-test failed - aborting\n");
+    return 1;
+  }
 
   if (load_rules(rules_dir) != 0) {
     fprintf(stderr, "avd: failed to initialize YARA - aborting\n");
@@ -2639,12 +2803,22 @@ int main(int argc, char **argv) {
          family_id);
 
   {
-    pthread_t workers[AVD_SCAN_THREADS];
+    /* Heap-allocated, not a stack VLA/fixed array - avd_scan_threads is
+     * an operator-tunable runtime value (see parse_tunable_env()), and
+     * this is the one place its size actually drives an allocation. */
+    pthread_t *workers = calloc((size_t)avd_scan_threads, sizeof(*workers));
     pthread_t control_thread;
     bool control_started;
     int i, spawned = 0;
 
-    for (i = 0; i < AVD_SCAN_THREADS; i++) {
+    if (!workers) {
+      fprintf(stderr, "avd: could not allocate %d scan worker slots\n",
+              avd_scan_threads);
+      nl_socket_free(sock);
+      return 1;
+    }
+
+    for (i = 0; i < avd_scan_threads; i++) {
       if (pthread_create(&workers[i], NULL, scan_worker_main, NULL) != 0) {
         fprintf(stderr, "avd: pthread_create failed for worker %d: %s\n", i,
                 strerror(errno));
@@ -2654,14 +2828,15 @@ int main(int argc, char **argv) {
     }
     if (spawned == 0) {
       fprintf(stderr, "avd: no scan workers could be started - aborting\n");
+      free(workers);
       nl_socket_free(sock);
       return 1;
     }
-    if (spawned < AVD_SCAN_THREADS)
+    if (spawned < avd_scan_threads)
       fprintf(stderr,
               "avd: only %d/%d scan workers started - continuing with "
               "reduced concurrency\n",
-              spawned, AVD_SCAN_THREADS);
+              spawned, avd_scan_threads);
 
     /* Not fatal if this fails (permissions, read-only /run, etc.) -
      * the daemon's actual job (kernel-triggered scanning) doesn't
@@ -2740,6 +2915,7 @@ int main(int argc, char **argv) {
       control_sock_fd = -1;
       unlink(control_sock_path);
     }
+    free(workers);
   }
 
   nl_socket_free(sock);

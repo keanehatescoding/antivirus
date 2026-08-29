@@ -3,12 +3,12 @@
 # tests/test_avd_socket.sh - exercises avd's control socket protocol
 # (see docs/avd-socket-protocol.md): STATUS, VERDICTS RECENT, SCAN,
 # and QUARANTINE LIST/RESTORE/DELETE. Runs everything as root (this
-# script requires root anyway, for insmod/rmmod), so it does NOT cover
-# the SO_PEERCRED permission gate that rejects SCAN/QUARANTINE
-# RESTORE/DELETE from a non-root peer - that would need a second,
-# unprivileged connection alongside the root one this script already
-# makes, which is a real gap worth closing separately, not something
-# to claim coverage of here.
+# script requires root anyway, for insmod/rmmod), but the SO_PEERCRED
+# permission gate that rejects SCAN/QUARANTINE RESTORE/DELETE from a
+# non-root peer is still covered: the "unprivileged peer rejected"
+# section below makes a second connection with setpriv-dropped
+# credentials (uid "nobody", never 0) alongside the root one the rest
+# of this script uses.
 #
 # Unlike test_sigtable.sh (which expects the module already loaded and
 # never touches avd), this script builds and loads the module AND
@@ -159,6 +159,48 @@ if command -v socat >/dev/null 2>&1; then
 else
     echo "  SKIP: socat not installed - skipping raw-protocol STATUS/VERDICTS checks"
     echo "  (Arch/CachyOS: sudo pacman -S socat / Debian/Ubuntu: sudo apt install socat)"
+fi
+
+section "unprivileged peer rejected on SCAN/QUARANTINE RESTORE/QUARANTINE DELETE"
+# Connects as an actual non-root peer (not just "pass a fake uid
+# somewhere") so the daemon's real SO_PEERCRED gate - which reads the
+# kernel-captured credentials of whoever connect()'d, not anything the
+# client itself can claim - is what's under test. setpriv drops this
+# root test script's privileges just for the socat child; "nobody" is
+# used as a UID/GID guaranteed to exist and never be 0 on any Linux
+# system. Skipped gracefully (like the STATUS/VERDICTS raw-protocol
+# checks above) if either optional tool is missing, rather than
+# failing the whole suite over it.
+if command -v socat >/dev/null 2>&1 && command -v setpriv >/dev/null 2>&1; then
+    unpriv_send() {
+        # $1 = command line to send
+        setpriv --reuid=nobody --regid=nobody --clear-groups \
+            socat -t2 - "UNIX-CONNECT:$TEST_SOCK_PATH" <<<"$1" 2>>"$SOCAT_LOG"
+    }
+
+    UNPRIV_SCAN_RESP="$(unpriv_send "SCAN $TEST_FILE")"
+    if echo "$UNPRIV_SCAN_RESP" | grep -q '^ERR permission denied'; then
+        pass "unprivileged SCAN rejected"
+    else
+        fail "unprivileged SCAN not rejected as expected: $UNPRIV_SCAN_RESP"
+    fi
+
+    UNPRIV_RESTORE_RESP="$(unpriv_send "QUARANTINE RESTORE bogus-id")"
+    if echo "$UNPRIV_RESTORE_RESP" | grep -q '^ERR permission denied'; then
+        pass "unprivileged QUARANTINE RESTORE rejected"
+    else
+        fail "unprivileged QUARANTINE RESTORE not rejected as expected: $UNPRIV_RESTORE_RESP"
+    fi
+
+    UNPRIV_DELETE_RESP="$(unpriv_send "QUARANTINE DELETE bogus-id")"
+    if echo "$UNPRIV_DELETE_RESP" | grep -q '^ERR permission denied'; then
+        pass "unprivileged QUARANTINE DELETE rejected"
+    else
+        fail "unprivileged QUARANTINE DELETE not rejected as expected: $UNPRIV_DELETE_RESP"
+    fi
+else
+    echo "  SKIP: socat and/or setpriv not installed - skipping unprivileged-peer checks"
+    echo "  (Arch/CachyOS: sudo pacman -S socat util-linux / Debian/Ubuntu: sudo apt install socat util-linux)"
 fi
 
 section "SCAN a clean file"
