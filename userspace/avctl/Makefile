@@ -1,5 +1,10 @@
 CC ?= gcc
-CFLAGS ?= -Wall -Wextra -O2
+# Same hardening rationale as userspace/avd/Makefile: avctl's
+# add/del/scan/quarantine commands run privileged (pkexec), so the
+# extra runtime checks _FORTIFY_SOURCE and stack-protector buy are
+# worth the small overhead.
+CFLAGS ?= -Wall -Wextra -O2 -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
+          -Wformat -Wformat-security
 
 # install target only - avctl itself is still most commonly just built
 # and run in place (./avctl, see the top-level README's examples),

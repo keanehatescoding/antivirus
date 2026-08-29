@@ -91,11 +91,15 @@ int av_sigtable_add(enum av_algo algo, const char *hex, const char *name) {
    * headers - see av_sigtable_del() below for the same workaround. */
   struct av_sig_entry *existing = NULL;
   struct av_sig_entry *e;
+  size_t i;
 
   if (algo >= AV_ALGO_COUNT)
     return -EINVAL;
   if (strlen(hex) != algo_hexlen[algo])
     return -EINVAL;
+  for (i = 0; i < algo_hexlen[algo]; i++)
+    if (!isxdigit(hex[i]))
+      return -EINVAL;
 
   e = kmalloc(sizeof(*e), GFP_KERNEL);
   if (!e)

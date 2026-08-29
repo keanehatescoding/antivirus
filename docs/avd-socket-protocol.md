@@ -156,7 +156,8 @@ it gets there.
   there beyond the existing root-only gate.
 - **`SCAN` is not rate-limited and does not share the kernel-triggered
   scan queue.** Unlike `AV_C_SCAN_REQUEST` (which goes through the
-  bounded `AVD_SCAN_QUEUE_MAX`/`AVD_SCAN_THREADS` worker pool - see
+  bounded worker pool (size/queue depth runtime-tunable via the
+  `AVD_SCAN_THREADS`/`AVD_SCAN_QUEUE_MAX` environment variables - see
   `docs/netlink-protocol.md`), a control-socket `SCAN` command calls
   `perform_scan()` directly on that connection's own thread. Bounded
   only by `AVD_CONTROL_MAX_CONNS` (how many control connections can be

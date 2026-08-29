@@ -1,5 +1,12 @@
 CC ?= gcc
-CFLAGS ?= -Wall -Wextra -O2
+# _FORTIFY_SOURCE needs -O1+ to have any effect (already satisfied by
+# -O2 above); avd runs privileged (root, via systemd) so the extra
+# runtime checks it and -fstack-protector-strong buy are worth the
+# small overhead. -Wformat-security is redundant with -Wall/-Wextra's
+# -Wformat but is spelled out anyway since it's the one CodeQL/distro
+# hardening scanners specifically check for.
+CFLAGS ?= -Wall -Wextra -O2 -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
+          -Wformat -Wformat-security
 PKG_CONFIG ?= pkg-config
 
 # install target only - PREFIX/SYSCONFDIR/UNITDIR follow the usual

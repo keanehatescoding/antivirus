@@ -169,21 +169,43 @@ static struct workqueue_struct *av_wq;
  * load is a far smaller risk than exhausting atomic memory
  * system-wide, which affects every other kernel subsystem too. */
 #define AV_MAX_INFLIGHT_WORK 4096
+/* Slots reserved exclusively for execve/execveat: openat/unlink/
+ * unlinkat/rename/renameat/renameat2 are capped at
+ * (AV_MAX_INFLIGHT_WORK - AV_EXEC_RESERVED_WORK) via
+ * av_work_admit_nonexec() below, so a burst of those (e.g. `rm -rf`
+ * on a big tree) can never fully starve exec detection - exec always
+ * has this much headroom to itself, on top of whatever the non-exec
+ * hooks aren't currently using. One shared counter, not a separate
+ * one per class: exec is still free to use the full budget when
+ * non-exec traffic is quiet, it just can't be shut out entirely. */
+#define AV_EXEC_RESERVED_WORK 512
 static atomic_t av_inflight_work = ATOMIC_INIT(0);
 
-/* Call before allocating a *_work struct in a *_pre handler. Returns
- * true if under the cap (caller may proceed to kmalloc); false if at
- * or over it (caller must skip the event without allocating). Must be
- * paired with exactly one av_work_release() call on every path that
- * follows a true return, whether the *_pre handler bails out early
- * afterward (validation failure) or the work item runs to completion
- * on the workqueue. */
-static inline bool av_work_admit(void) {
-  if (atomic_inc_return(&av_inflight_work) > AV_MAX_INFLIGHT_WORK) {
+static inline bool av_work_admit_capped(unsigned int cap) {
+  if (atomic_inc_return(&av_inflight_work) > cap) {
     atomic_dec(&av_inflight_work);
     return false;
   }
   return true;
+}
+
+/* Call before allocating a *_work struct in an execve/execveat *_pre
+ * handler. Returns true if under the cap (caller may proceed to
+ * kmalloc); false if at or over it (caller must skip the event
+ * without allocating). Must be paired with exactly one
+ * av_work_release() call on every path that follows a true return,
+ * whether the *_pre handler bails out early afterward (validation
+ * failure) or the work item runs to completion on the workqueue. */
+static inline bool av_work_admit(void) {
+  return av_work_admit_capped(AV_MAX_INFLIGHT_WORK);
+}
+
+/* Same contract as av_work_admit(), for the non-exec hooks (openat/
+ * unlink/unlinkat/rename/renameat/renameat2) - capped short of the
+ * full budget so those always leave AV_EXEC_RESERVED_WORK slots for
+ * exec detection. */
+static inline bool av_work_admit_nonexec(void) {
+  return av_work_admit_capped(AV_MAX_INFLIGHT_WORK - AV_EXEC_RESERVED_WORK);
 }
 
 static inline void av_work_release(void) {
@@ -1286,7 +1308,7 @@ static int handler_pre_openat(struct kprobe *p, struct pt_regs *regs) {
   if (!resolve_dfd_path(dfd, &base))
     return 0;
 
-  if (!av_work_admit()) {
+  if (!av_work_admit_nonexec()) {
     path_put(&base);
     return 0;
   }
@@ -1374,7 +1396,7 @@ static int schedule_unlink_work(const char __user *user_path, int dfd) {
   if (!resolve_dfd_path(dfd, &base))
     return 0;
 
-  if (!av_work_admit()) {
+  if (!av_work_admit_nonexec()) {
     path_put(&base);
     return 0;
   }
@@ -1514,7 +1536,7 @@ static int schedule_rename_work(const char __user *user_oldpath, int olddfd,
     return 0;
   }
 
-  if (!av_work_admit()) {
+  if (!av_work_admit_nonexec()) {
     path_put(&old_base);
     path_put(&new_base);
     return 0;

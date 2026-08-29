@@ -409,6 +409,8 @@ static void hex_tolower(char *hex) {
 }
 
 int av_behavior_trust_add(const char *sha256_hex, const char *name) {
+  /* Same NULL-initializer workaround as hash_is_trusted() above. */
+  struct av_trust_entry *existing = NULL;
   struct av_trust_entry *e;
   char lower_hex[SHA256_HEX_LEN + 1];
 
@@ -426,6 +428,20 @@ int av_behavior_trust_add(const char *sha256_hex, const char *name) {
   strscpy(e->name, name, sizeof(e->name));
 
   mutex_lock(&trust_lock);
+  /* Reject a duplicate instead of silently adding a second entry
+   * alongside it - same reasoning as av_behavior_protect_add()'s
+   * duplicate check above. Without this, av_behavior_trust_del()
+   * would only ever remove ONE of the two entries, leaving the hash
+   * still trusted after what looks like a successful `trust del`.
+   * Checked under the same lock as the insert below - no separate
+   * pre-check, so no TOCTOU window. */
+  hash_for_each_possible(trust_table, existing, node, hex_key(lower_hex)) {
+    if (!strncasecmp(existing->sha256_hex, lower_hex, SHA256_HEX_LEN)) {
+      mutex_unlock(&trust_lock);
+      kfree(e);
+      return -EEXIST;
+    }
+  }
   hash_add(trust_table, &e->node, hex_key(lower_hex));
   mutex_unlock(&trust_lock);
 
@@ -435,6 +451,7 @@ int av_behavior_trust_add(const char *sha256_hex, const char *name) {
 int av_behavior_trust_del(const char *sha256_hex) {
   /* Same NULL-initializer workaround as hash_is_trusted() above. */
   struct av_trust_entry *e = NULL;
+  struct hlist_node *tmp = NULL;
   int ret = -ENOENT;
   char lower_hex[SHA256_HEX_LEN + 1];
 
@@ -445,12 +462,14 @@ int av_behavior_trust_del(const char *sha256_hex) {
   hex_tolower(lower_hex);
 
   mutex_lock(&trust_lock);
-  hash_for_each_possible(trust_table, e, node, hex_key(lower_hex)) {
+  /* _safe iteration + no break: av_behavior_trust_add() now rejects
+   * duplicates going forward, but any dupes already stored by an
+   * older build should still all be cleared by a single del(). */
+  hash_for_each_possible_safe(trust_table, e, tmp, node, hex_key(lower_hex)) {
     if (!strncasecmp(e->sha256_hex, lower_hex, SHA256_HEX_LEN)) {
       hash_del(&e->node);
       kfree(e);
       ret = 0;
-      break;
     }
   }
   mutex_unlock(&trust_lock);
