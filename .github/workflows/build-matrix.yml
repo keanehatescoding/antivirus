@@ -11,6 +11,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   # Reads .github/kernel-versions.json and hands its "versions" array to
   # the build job's matrix below via fromJSON(). Split into its own job

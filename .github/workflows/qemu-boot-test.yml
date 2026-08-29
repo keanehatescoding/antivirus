@@ -22,6 +22,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   # Same job as build-matrix.yml's own load-kernel-matrix - reads
   # .github/kernel-versions.json and hands its "versions" array to the
