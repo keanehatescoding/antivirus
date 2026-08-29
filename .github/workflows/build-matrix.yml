@@ -73,11 +73,13 @@ jobs:
         uses: actions/cache@v6
         with:
           path: linux-${{ matrix.kernel_version }}-${{ matrix.toolchain }}
-          # v6: bumped from v5 because caches built under v5 are the
-          # broken 32-bit (CONFIG_X86_32) trees this commit fixes -
-          # without a key bump, cache hits would keep serving them and
-          # silently skip the corrected build step below forever.
-          key: kernel-tree-v6-${{ matrix.kernel_version }}-${{ matrix.toolchain }}
+          # v7: bumped from v6 because caches built under v6 predate
+          # the CONFIG_FRAME_WARN=2048 pin below - without a key bump,
+          # a cache hit would keep serving trees still built with
+          # tinyconfig's stricter 1024 default, and the corrected
+          # config step below would silently never run to fix it (same
+          # reason v6 was bumped from v5, see below).
+          key: kernel-tree-v7-${{ matrix.kernel_version }}-${{ matrix.toolchain }}
 
       - name: Download and build a minimal kernel
         if: steps.cache-kernel.outputs.cache-hit != 'true'
