@@ -21,15 +21,25 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-# mktemp -d, not fixed /tmp/av_bench_* paths - this script runs as
-# root, and a fixed world-writable-directory path is a classic
-# symlink-planting target: another local user could pre-create a
-# symlink at e.g. /tmp/av_bench_harness before this runs, and gcc -o
-# (which follows symlinks) would then overwrite whatever it points to.
-# A private, unpredictably-named, 0700 directory closes this off
-# entirely - same reasoning as tests/test_avd_socket.sh's mktemp use
-# and userspace/avd/Makefile's checkdeps target.
-WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/av_bench.XXXXXX")" || exit 1
+# mktemp -d under a hardcoded /tmp, not fixed /tmp/av_bench_* paths
+# and not "${TMPDIR:-/tmp}" - this script runs as root, and a fixed
+# world-writable-directory path is a classic symlink-planting target:
+# another local user could pre-create a symlink at e.g.
+# /tmp/av_bench_harness before this runs, and gcc -o (which follows
+# symlinks) would then overwrite whatever it points to. A private,
+# unpredictably-named, 0700 directory closes that off - same reasoning
+# as tests/test_avd_socket.sh's mktemp use and userspace/avd/Makefile's
+# checkdeps target - but only if its PARENT is trusted. sudo normally
+# strips TMPDIR, but env_keep, --preserve-env, or running as root
+# directly can all preserve it: an attacker-controlled TMPDIR pointing
+# at a directory they own would let them race mktemp's own directory
+# out from under this script (delete/replace it with a symlink) right
+# after it's created, since nothing but the attacker's own permissions
+# protects an entry inside a directory they own. /tmp itself doesn't
+# have that problem - its sticky bit means no other user can rename or
+# delete an entry root created there, regardless of /tmp's own
+# world-writable mode - so hardcode it rather than honor TMPDIR here.
+WORKDIR="$(mktemp -d -- /tmp/av_bench.XXXXXX)" || exit 1
 trap 'rm -rf "$WORKDIR"' EXIT
 BENCH_BIN="$WORKDIR/av_bench_harness"
 
