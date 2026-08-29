@@ -15,12 +15,33 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ITERATIONS="${ITERATIONS:-2000}"
-BENCH_BIN="/tmp/av_bench_harness"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "This script needs root (insmod/rmmod). Re-run with sudo."
     exit 1
 fi
+
+# mktemp -d under a hardcoded /tmp, not fixed /tmp/av_bench_* paths
+# and not "${TMPDIR:-/tmp}" - this script runs as root, and a fixed
+# world-writable-directory path is a classic symlink-planting target:
+# another local user could pre-create a symlink at e.g.
+# /tmp/av_bench_harness before this runs, and gcc -o (which follows
+# symlinks) would then overwrite whatever it points to. A private,
+# unpredictably-named, 0700 directory closes that off - same reasoning
+# as tests/test_avd_socket.sh's mktemp use and userspace/avd/Makefile's
+# checkdeps target - but only if its PARENT is trusted. sudo normally
+# strips TMPDIR, but env_keep, --preserve-env, or running as root
+# directly can all preserve it: an attacker-controlled TMPDIR pointing
+# at a directory they own would let them race mktemp's own directory
+# out from under this script (delete/replace it with a symlink) right
+# after it's created, since nothing but the attacker's own permissions
+# protects an entry inside a directory they own. /tmp itself doesn't
+# have that problem - its sticky bit means no other user can rename or
+# delete an entry root created there, regardless of /tmp's own
+# world-writable mode - so hardcode it rather than honor TMPDIR here.
+WORKDIR="$(mktemp -d -- /tmp/av_bench.XXXXXX)" || exit 1
+trap 'rm -rf "$WORKDIR"' EXIT
+BENCH_BIN="$WORKDIR/av_bench_harness"
 
 # A module MUST be built with the same compiler family as the running
 # kernel (see the top-level README's toolchain section and
@@ -33,7 +54,18 @@ if grep -q "clang version" /proc/version 2>/dev/null; then
 fi
 
 echo "=== Building benchmark harness ==="
-cat > /tmp/av_bench_harness.c << 'EOF'
+# Quoted heredoc delimiter ('EOF', not EOF) - the scratch path is
+# passed to the compiled harness as argv[2] (see the invocations
+# below), NOT interpolated into this C source. WORKDIR is normally
+# unpredictable and root-owned, but sudo doesn't always strip TMPDIR
+# (env_keep, --preserve-env, or running as root directly can all
+# preserve it) - an attacker-controlled TMPDIR containing a literal
+# '"' or '\' would otherwise land inside a C string literal here and
+# could break out of it into arbitrary code the root-owned gcc then
+# compiles. argv is passed through execve() untouched by the shell
+# that invokes it, so this can't happen regardless of what WORKDIR
+# contains.
+cat > "$WORKDIR/av_bench_harness.c" << 'EOF'
 /* Small timing harness: N iterations of fork+execve+wait (/bin/true),
  * and N iterations of open+close on a scratch file. Reports average
  * microseconds per operation. Not part of the shipped project - a
@@ -69,10 +101,10 @@ static void bench_execve(int n) {
            n, elapsed / n);
 }
 
-static void bench_openat(int n) {
+static void bench_openat(int n, const char *scratch_path) {
     double start = now_us();
     for (int i = 0; i < n; i++) {
-        int fd = open("/tmp/av_bench_scratch.txt", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        int fd = open(scratch_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
         if (fd >= 0)
             close(fd);
     }
@@ -82,17 +114,18 @@ static void bench_openat(int n) {
 
 int main(int argc, char **argv) {
     int n = argc > 1 ? atoi(argv[1]) : 1000;
+    const char *scratch_path = argc > 2 ? argv[2] : "av_bench_scratch.txt";
     bench_execve(n);
-    bench_openat(n);
+    bench_openat(n, scratch_path);
     return 0;
 }
 EOF
-gcc -O2 -o "$BENCH_BIN" /tmp/av_bench_harness.c
+gcc -O2 -o "$BENCH_BIN" "$WORKDIR/av_bench_harness.c"
 
 echo
 echo "=== Baseline: module NOT loaded ==="
 rmmod av 2>/dev/null || true
-"$BENCH_BIN" "$ITERATIONS" | tee /tmp/av_bench_baseline.txt
+"$BENCH_BIN" "$ITERATIONS" "$WORKDIR/av_bench_scratch.txt" | tee "$WORKDIR/av_bench_baseline.txt"
 
 echo
 echo "=== Loading module ==="
@@ -102,20 +135,19 @@ sleep 1
 
 echo
 echo "=== With module loaded ==="
-"$BENCH_BIN" "$ITERATIONS" | tee /tmp/av_bench_loaded.txt
+"$BENCH_BIN" "$ITERATIONS" "$WORKDIR/av_bench_scratch.txt" | tee "$WORKDIR/av_bench_loaded.txt"
 
 echo
 echo "=== Cleanup ==="
 rmmod av
-rm -f /tmp/av_bench_scratch.txt
 
 echo
 echo "=== Comparison ==="
 echo "baseline (no module):"
-cat /tmp/av_bench_baseline.txt
+cat "$WORKDIR/av_bench_baseline.txt"
 echo
 echo "with module loaded:"
-cat /tmp/av_bench_loaded.txt
+cat "$WORKDIR/av_bench_loaded.txt"
 echo
 echo "Note on interpreting these numbers:"
 echo "- execve overhead includes the FULL detection pipeline: hashing"

@@ -155,6 +155,19 @@
  * was added as its own deliberate feature (see avctl's save/load). */
 #define AVD_VERDICT_HISTORY_MAX 500
 #define SCAN_TIMEOUT_SECS 10
+
+/* Cap on what check_fuzzy_corpus()/check_tlsh_corpus() will read.
+ * yr_rules_scan_fd() (the YARA path, see SCAN_TIMEOUT_SECS above) is
+ * bounded by a timeout; libfuzzy's fuzzy_hash_file() and
+ * av_tlsh_hash_fd() have no equivalent of their own and read to EOF
+ * with nothing else stopping them. Only AVD_SCAN_THREADS (8) workers
+ * exist, so a handful of very large files - kernel-triggered or a
+ * control-socket SCAN - can tie up the whole pool for as long as the
+ * read takes; kernel-side scans then queue past AVD_SCAN_QUEUE_MAX and
+ * fail open. Same 256MB value as the kernel side's MAX_HASH_FILE_SIZE
+ * (av/main.c) for consistency, though the two caps guard unrelated
+ * code paths. */
+#define MAX_FUZZY_TLSH_FILE_SIZE (256 * 1024 * 1024)
 #define MALICIOUS_SCORE_THRESHOLD 100
 /* handle_scan_request() (YARA scan, up to SCAN_TIMEOUT_SECS, plus the
  * fuzzy-hash pass) used to run synchronously inside msg_handler(),
@@ -278,6 +291,10 @@ struct verdict_record {
   uint64_t id;
   time_t timestamp;
   uint32_t pid; /* 0 for on-demand scans - no owning process */
+  uid_t uid;    /* owner of the scanned file (fstat() at scan time), or
+                 * (uid_t)-1 if that fstat() failed - see perform_scan().
+                 * Used by cmd_verdicts_recent() to keep one user's scan
+                 * history (paths, hashes) from leaking to another. */
   char path[PATH_MAX];
   char sha256_hex[65];
   uint8_t verdict; /* AV_VERDICT_CLEAN / AV_VERDICT_MALICIOUS */
@@ -579,11 +596,54 @@ static int load_fuzzy_corpus(const char *path) {
  * Takes `fd` rather than a path - see handle_scan_request()'s comment
  * on why the whole scan/quarantine sequence now reads through one fd
  * opened once at the top, instead of re-resolving a path string at
- * each step. Hashes via a dup()'d handle so this doesn't disturb
- * `fd`'s own read offset for whatever the caller does with it next;
- * fuzzy_hash_file() seeks its handle to the start itself and restores
- * position when done, so no manual lseek is needed here either way.
+ * each step. Hashes via a dup()'d handle, same convention as
+ * check_tlsh_corpus()/av_tlsh_hash_fd() - but unlike the
+ * fuzzy_hash_file() this replaced (which explicitly seeks back to the
+ * original position when done), that dup()'d handle is left wherever
+ * the read loop stopped: dup()'d fds share the same underlying file
+ * offset as the original, so `fd` itself is left there too. No
+ * current caller relies on `fd`'s position surviving this call (every
+ * one either re-seeks or closes it immediately after), but don't add
+ * one that does without restoring the position first. Streamed
+ * through libfuzzy's incremental fuzzy_update()/fuzzy_digest() API in
+ * fixed-size chunks rather than handed to fuzzy_hash_file() directly -
+ * see MAX_FUZZY_TLSH_FILE_SIZE's comment for why.
  */
+/* Shared size gate for check_fuzzy_corpus()/check_tlsh_corpus() - see
+ * MAX_FUZZY_TLSH_FILE_SIZE's comment for why this exists. Returns
+ * true if `fd` is small enough to fuzzy/TLSH-hash; on fstat() failure
+ * fails open (returns true) so a stat error alone doesn't disable
+ * these checks for otherwise-normal files, matching this codebase's
+ * general fail-open stance on inconclusive information.
+ *
+ * A REJECT-ONLY gate - callers must still read up to the fixed
+ * MAX_FUZZY_TLSH_FILE_SIZE cap themselves (not whatever size this
+ * check happened to measure). An earlier version of this function
+ * also reported the measured size back to check_fuzzy_corpus() to
+ * size its read buffer exactly; that size became the actual read
+ * bound instead of just an accept/reject threshold, which under-hashed
+ * a file that grew after this fstat() (hashing a stale, truncated
+ * snapshot instead of current content) and produced a bogus empty-file
+ * digest whenever st_size raced to 0 - worse than the unbounded
+ * fuzzy_hash_file() this cap replaced. Streaming through a fixed
+ * buffer (see check_fuzzy_corpus()) already made that size-hint
+ * unnecessary for memory reasons, so it's gone entirely now - both
+ * callers just read-to-EOF-or-MAX_FUZZY_TLSH_FILE_SIZE, exactly like
+ * av_tlsh_hash_fd(). */
+static bool fuzzy_tlsh_size_ok(int fd, const char *label) {
+  struct stat st;
+
+  if (fstat(fd, &st) != 0)
+    return true;
+  if (st.st_size > (off_t)MAX_FUZZY_TLSH_FILE_SIZE) {
+    fprintf(stderr,
+            "avd: skipping %s hash - file is %lld bytes, over the %d cap\n",
+            label, (long long)st.st_size, MAX_FUZZY_TLSH_FILE_SIZE);
+    return false;
+  }
+  return true;
+}
+
 static int check_fuzzy_corpus(int fd, char *name_out, size_t name_out_len,
                               int *score_out) {
   char file_hash[FUZZY_MAX_RESULT];
@@ -591,24 +651,74 @@ static int check_fuzzy_corpus(int fd, char *name_out, size_t name_out_len,
   size_t best_idx = 0;
   size_t i;
   int dup_fd;
-  FILE *fp;
+  unsigned char buf[65536];
+  size_t total = 0;
+  ssize_t n;
+  struct fuzzy_state *state;
   int hash_ret;
 
   if (fuzzy_corpus_count == 0)
+    return 0;
+  if (!fuzzy_tlsh_size_ok(fd, "fuzzy"))
     return 0;
 
   dup_fd = dup(fd);
   if (dup_fd < 0)
     return -1;
-
-  fp = fdopen(dup_fd, "rb");
-  if (!fp) {
+  if (lseek(dup_fd, 0, SEEK_SET) < 0) {
     close(dup_fd);
     return -1;
   }
 
-  hash_ret = fuzzy_hash_file(fp, file_hash);
-  fclose(fp); /* also closes dup_fd */
+  state = fuzzy_new();
+  if (!state) {
+    close(dup_fd);
+    return -1;
+  }
+
+  /* Stream at most MAX_FUZZY_TLSH_FILE_SIZE bytes through a fixed-size
+   * buffer and libfuzzy's incremental fuzzy_update()/fuzzy_digest()
+   * API - constant memory regardless of the cap, same shape as
+   * av_tlsh_hash_fd()'s own 64KB-buffer loop in tlsh_shim.c, and the
+   * same fixed bound check_tlsh_corpus() passes it (not whatever size
+   * fuzzy_tlsh_size_ok() happened to measure a moment earlier - see
+   * that function's comment for why reading to a stale measured size
+   * instead of this fixed cap was itself a bug). An earlier version of
+   * this loop instead read one malloc()'d `want`-sized snapshot before
+   * calling fuzzy_hash_buf() on it - correct, but with 8 concurrent
+   * scan workers and a cap up to 256MB, that traded the worker-thread-
+   * time exhaustion this cap exists to fix for a ~2GB daemon-memory
+   * exhaustion vector instead. Bounding the read itself (rather than
+   * the buffer size) keeps the same concurrent-growth protection - the
+   * loop still can never consume more than the cap - without ever
+   * holding more than one 64KB chunk at a time. */
+  while (total < MAX_FUZZY_TLSH_FILE_SIZE) {
+    size_t chunk = sizeof(buf);
+
+    if (MAX_FUZZY_TLSH_FILE_SIZE - total < chunk)
+      chunk = MAX_FUZZY_TLSH_FILE_SIZE - total;
+
+    n = read(dup_fd, buf, chunk);
+    if (n == 0)
+      break;
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      fuzzy_free(state);
+      close(dup_fd);
+      return -1;
+    }
+    if (fuzzy_update(state, buf, (size_t)n) != 0) {
+      fuzzy_free(state);
+      close(dup_fd);
+      return -1;
+    }
+    total += (size_t)n;
+  }
+  close(dup_fd);
+
+  hash_ret = fuzzy_digest(state, file_hash, 0);
+  fuzzy_free(state);
 
   if (hash_ret != 0)
     return -1;
@@ -754,12 +864,20 @@ static int check_tlsh_corpus(int fd, char *name_out, size_t name_out_len,
 
   if (tlsh_corpus_count == 0)
     return 0;
+  if (!fuzzy_tlsh_size_ok(fd, "TLSH"))
+    return 0;
 
   dup_fd = dup(fd);
   if (dup_fd < 0)
     return -1;
 
-  hash_ret = av_tlsh_hash_fd(dup_fd, file_hash, sizeof(file_hash));
+  /* max_len backstops fuzzy_tlsh_size_ok()'s earlier fstat()-based
+   * check against a file that keeps growing after that check ran -
+   * the read loop inside av_tlsh_hash_fd() itself now can never
+   * consume more than MAX_FUZZY_TLSH_FILE_SIZE bytes regardless of
+   * how much more data shows up concurrently. */
+  hash_ret = av_tlsh_hash_fd(dup_fd, file_hash, sizeof(file_hash),
+                             MAX_FUZZY_TLSH_FILE_SIZE);
   close(dup_fd);
 
   if (hash_ret == -2)
@@ -852,7 +970,7 @@ static int yara_callback(YR_SCAN_CONTEXT *context, int message,
  * single exit path, so every scan - kernel-triggered or on-demand,
  * clean or malicious, YARA/fuzzy/TLSH/no-rules-loaded - gets an entry.
  */
-static void record_verdict_history(uint32_t pid, const char *path,
+static void record_verdict_history(uint32_t pid, uid_t uid, const char *path,
                                     const char *sha256_hex, uint8_t verdict,
                                     const char *rule_name, int score,
                                     bool on_demand) {
@@ -863,6 +981,7 @@ static void record_verdict_history(uint32_t pid, const char *path,
   rec->id = verdict_history_next_id++;
   rec->timestamp = time(NULL);
   rec->pid = pid;
+  rec->uid = uid;
   snprintf(rec->path, sizeof(rec->path), "%s", path ? path : "");
   snprintf(rec->sha256_hex, sizeof(rec->sha256_hex), "%s",
            sha256_hex ? sha256_hex : "");
@@ -1278,6 +1397,11 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
   char sha256_buf[65] = "";
   const char *hash;
   int ret;
+  struct stat owner_st;
+  /* (uid_t)-1 (never a real uid) if the fstat() fails - callers treat
+   * that as "owner unknown", visible to root only. See struct
+   * verdict_record's uid field comment. */
+  uid_t owner_uid = fstat(fd, &owner_st) == 0 ? owner_st.st_uid : (uid_t)-1;
 
   memset(out, 0, sizeof(*out));
   out->verdict = AV_VERDICT_CLEAN;
@@ -1410,7 +1534,7 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
 
 record:
   snprintf(out->sha256_hex, sizeof(out->sha256_hex), "%s", hash);
-  record_verdict_history(pid, path, out->sha256_hex, out->verdict,
+  record_verdict_history(pid, owner_uid, path, out->sha256_hex, out->verdict,
                          out->rule_name, out->score, on_demand);
 }
 
@@ -1761,21 +1885,31 @@ static void cmd_status(int fd) {
   write_all(fd, "END\n", 4);
 }
 
-static void cmd_verdicts_recent(int fd, size_t n) {
+/* A peer may only see verdict history for files it owns - root sees
+ * everything, an entry whose owner couldn't be determined ((uid_t)-1,
+ * see perform_scan()) is root-only. Without this, any local user could
+ * read every other user's (and root's) scanned paths and SHA-256
+ * hashes over the world-writable control socket. */
+static bool verdict_visible_to(const struct verdict_record *rec,
+                               uid_t peer_uid, bool is_root) {
+  return is_root || rec->uid == peer_uid;
+}
+
+static void cmd_verdicts_recent(int fd, size_t n, uid_t peer_uid,
+                                bool is_root) {
   struct verdict_record *snap;
   char hdr[32];
   size_t avail, take, i;
 
   pthread_mutex_lock(&verdict_history_lock);
   avail = verdict_history_count;
-  take = n < avail ? n : avail;
-  snap = take ? malloc(take * sizeof(*snap)) : NULL;
-  if (take && !snap) {
+  snap = avail ? malloc(avail * sizeof(*snap)) : NULL;
+  if (avail && !snap) {
     pthread_mutex_unlock(&verdict_history_lock);
     send_err(fd, "out of memory");
     return;
   }
-  for (i = 0; i < take; i++) {
+  for (i = 0; i < avail; i++) {
     /* Newest first - see verdict_history_next's own comment for why
      * (verdict_history_next - 1 - i) mod MAX is the i-th most recent
      * entry. */
@@ -1785,11 +1919,26 @@ static void cmd_verdicts_recent(int fd, size_t n) {
   }
   pthread_mutex_unlock(&verdict_history_lock);
 
+  /* Two passes over the (already newest-first, at most
+   * AVD_VERDICT_HISTORY_MAX = 500 rows) snapshot: first count how many
+   * this peer may see so COUNT is accurate before any row is sent (the
+   * wire format requires COUNT up front - see docs/avd-socket-protocol.md),
+   * then emit exactly those, still capped at `n`. */
+  take = 0;
+  for (i = 0; i < avail && take < n; i++) {
+    if (verdict_visible_to(&snap[i], peer_uid, is_root))
+      take++;
+  }
+
   write_all(fd, "OK\n", 3);
   snprintf(hdr, sizeof(hdr), "COUNT %zu\n", take);
   write_all(fd, hdr, strlen(hdr));
-  for (i = 0; i < take; i++) {
+  for (i = 0, take = 0; i < avail && take < n; i++) {
     char row[PATH_MAX + 256];
+
+    if (!verdict_visible_to(&snap[i], peer_uid, is_root))
+      continue;
+    take++;
 
     snprintf(row, sizeof(row), "%llu\t%ld\t%u\t%s\t%s\t%s\t%s\t%d\t%d\n",
              (unsigned long long)snap[i].id, (long)snap[i].timestamp,
@@ -1819,10 +1968,12 @@ static int filter_quarantined(const struct dirent *de) {
   return len > suflen && !strcmp(de->d_name + len - suflen, suffix);
 }
 
-static void cmd_quarantine_list(int fd) {
+static void cmd_quarantine_list(int fd, uid_t peer_uid, bool is_root) {
   struct dirent **namelist;
   char hdr[32];
   int n, i;
+  bool *visible = NULL;
+  int visible_count = 0;
 
   n = scandir(quarantine_dir, &namelist, filter_quarantined, alphasort);
   if (n < 0) {
@@ -1830,8 +1981,36 @@ static void cmd_quarantine_list(int fd) {
     return;
   }
 
+  /* Same owner-only visibility rule as cmd_verdicts_recent() - a
+   * quarantined file's path/hash is exactly the kind of information
+   * that shouldn't leak to an unrelated local user. An entry with no
+   * metadata (or a read failure) has no known owner, so it's
+   * root-only - fail closed rather than guess. Precomputed into
+   * `visible` (parallel to namelist) so COUNT, sent before any row,
+   * matches what actually gets emitted below. */
+  visible = n ? malloc((size_t)n * sizeof(*visible)) : NULL;
+  if (n && !visible) {
+    for (i = 0; i < n; i++)
+      free(namelist[i]);
+    free(namelist);
+    send_err(fd, "out of memory");
+    return;
+  }
+  for (i = 0; i < n; i++) {
+    char meta_path[PATH_MAX + 72]; /* see cmd_quarantine_restore()'s comment */
+    struct quarantine_meta meta;
+
+    snprintf(meta_path, sizeof(meta_path), "%s/%s.meta", quarantine_dir,
+             namelist[i]->d_name);
+
+    visible[i] = is_root || (read_quarantine_meta(meta_path, &meta) == 0 &&
+                             meta.original_uid == peer_uid);
+    if (visible[i])
+      visible_count++;
+  }
+
   write_all(fd, "OK\n", 3);
-  snprintf(hdr, sizeof(hdr), "COUNT %d\n", n);
+  snprintf(hdr, sizeof(hdr), "COUNT %d\n", visible_count);
   write_all(fd, hdr, strlen(hdr));
 
   for (i = 0; i < n; i++) {
@@ -1842,6 +2021,11 @@ static void cmd_quarantine_list(int fd) {
     char meta_path[PATH_MAX + 72]; /* see cmd_quarantine_restore()'s comment */
     struct quarantine_meta meta;
     char row[PATH_MAX * 2 + 256];
+
+    if (!visible[i]) {
+      free(namelist[i]);
+      continue;
+    }
 
     snprintf(id, sizeof(id), "%.*s", (int)(namelen - suflen),
              namelist[i]->d_name);
@@ -1856,7 +2040,9 @@ static void cmd_quarantine_list(int fd) {
       /* No metadata - quarantined before this feature existed, or the
        * sidecar write itself failed (see quarantine_file()'s comment).
        * Still list it (it's a real quarantined file on disk) rather
-       * than hiding it, just without the extra fields. */
+       * than hiding it, just without the extra fields. Only reachable
+       * here when is_root, since a missing/unreadable meta makes
+       * visible[i] false for anyone else above. */
       snprintf(row, sizeof(row), "%s\t?\t0\t?\t?\n", id);
 
     /* Stop at the first failed write, same reasoning as
@@ -1868,11 +2054,13 @@ static void cmd_quarantine_list(int fd) {
       for (i++; i < n; i++)
         free(namelist[i]);
       free(namelist);
+      free(visible);
       return;
     }
     free(namelist[i]);
   }
   free(namelist);
+  free(visible);
   write_all(fd, "END\n", 4);
 }
 
@@ -2052,11 +2240,13 @@ static void cmd_scan(int fd, const char *path) {
  * One control-socket connection, one command. Every state-changing
  * verb (SCAN, QUARANTINE RESTORE/DELETE) requires `is_root` - resolved
  * once by the caller via SO_PEERCRED, NOT re-checked per verb inside
- * here, so this is the single gate all three go through. Read-only
- * verbs (STATUS, VERDICTS, QUARANTINE LIST) answer any peer, matching
- * this codebase's existing precedent of world-readable /proc state
- * (e.g. /proc/kernel_av_signatures is 0644) with writes gated
- * separately - see docs/avd-socket-protocol.md.
+ * here, so this is the single gate all three go through. STATUS
+ * answers any peer (aggregate counts only, nothing per-file). VERDICTS
+ * and QUARANTINE LIST answer any peer too, but each row is filtered to
+ * `peer_uid` (root sees everything) inside cmd_verdicts_recent()/
+ * cmd_quarantine_list() - unlike STATUS, these carry other users'
+ * paths and SHA-256 hashes, which the world-writable socket must not
+ * hand out to an unrelated local user. See docs/avd-socket-protocol.md.
  */
 /*
  * sizeof(literal) - 1, NOT a hand-counted length - a manually-counted
@@ -2073,7 +2263,8 @@ static void cmd_scan(int fd, const char *path) {
 #define PREFIX_MATCH(line, literal) \
   (!strncmp((line), (literal), sizeof(literal) - 1))
 
-static void handle_control_line(int fd, const char *line, bool is_root) {
+static void handle_control_line(int fd, const char *line, uid_t peer_uid,
+                                bool is_root) {
   unsigned long n;
   char *end;
 
@@ -2087,9 +2278,9 @@ static void handle_control_line(int fd, const char *line, bool is_root) {
       send_err(fd, "malformed VERDICTS RECENT (expected a count)");
       return;
     }
-    cmd_verdicts_recent(fd, (size_t)n);
+    cmd_verdicts_recent(fd, (size_t)n, peer_uid, is_root);
   } else if (!strcmp(line, "QUARANTINE LIST")) {
-    cmd_quarantine_list(fd);
+    cmd_quarantine_list(fd, peer_uid, is_root);
   } else if (PREFIX_MATCH(line, "QUARANTINE RESTORE ")) {
     if (!is_root) {
       send_err(fd, "permission denied (use: pkexec avctl quarantine restore "
@@ -2129,7 +2320,11 @@ static int control_conn_count;
 static void *control_conn_main(void *arg) {
   struct control_conn_ctx *ctx = arg;
   char line[AVD_SOCK_LINE_MAX];
-  struct ucred cred;
+  /* uid pre-set to the same "unknown owner" sentinel perform_scan()
+   * uses ((uid_t)-1, never a real uid in practice) so a failed
+   * getsockopt() below can't leave cred.uid as uninitialized garbage
+   * that might accidentally match a real verdict/quarantine owner. */
+  struct ucred cred = {.pid = 0, .uid = (uid_t)-1, .gid = (gid_t)-1};
   socklen_t cred_len = sizeof(cred);
   struct timeval tv;
   bool is_root = false;
@@ -2179,7 +2374,7 @@ static void *control_conn_main(void *arg) {
     send_err(ctx->fd,
              "malformed request (missing newline, line too long, or timed out)");
   else if (len > 0)
-    handle_control_line(ctx->fd, line, is_root);
+    handle_control_line(ctx->fd, line, cred.uid, is_root);
   /* len == 0: peer connected and disconnected without sending
    * anything - nothing to respond to, not an error. */
 

@@ -371,8 +371,46 @@ static void resolve_absolute_path(const char *path, const struct path *base,
   if (IS_ERR(dirpath))
     strscpy(out, path, out_len);
   else {
-    snprintf(out, out_len, "%s/%s", dirpath, path);
-    normalize_abs_path(out, out_len);
+    /* snprintf()'s return value is how many bytes WOULD have been
+     * written absent truncation - checking it against out_len catches
+     * silent truncation the assignment-and-move-on version above
+     * couldn't. Two distinct, deeply-nested files whose combined
+     * dirpath+path exceeds out_len would otherwise truncate to the
+     * identical string, which self-delete correlation (a plain
+     * strcmp() on this output) would then treat as the same file -
+     * same lossy-result-is-dangerous reasoning as normalize_abs_path()'s
+     * own >128-component bail-out above. Falling back to the
+     * unresolved relative path (not absolute, but not truncated
+     * either) matches this function's existing degraded-not-dropped
+     * fallback stance for the d_path() failure case just above - it
+     * doesn't fully rule out a collision between two different
+     * fallback results, which is why av_behavior_check_unlink() in
+     * behavior.c separately requires both sides of its self-delete
+     * comparison to start with '/' before trusting a match; this
+     * fallback deliberately never produces that.
+     *
+     * Known, accepted tradeoff: path_is_sensitive() in behavior.c
+     * also runs against this output, and its "/boot/" prefix check
+     * (and, in practice, its "/etc/passwd"-shaped substring checks
+     * too, whenever the sensitive directory context lived in `dirpath`
+     * rather than the trailing `path` component - the common shape
+     * for this overflow case, e.g. a deeply nested ~/.ssh/... tree)
+     * can no longer fire once `dirpath` is discarded here. Before this
+     * truncation guard existed, the (collision-prone) truncated-but-
+     * still-absolute result could still trigger that detection if the
+     * sensitive segment survived truncation. There's no single output
+     * string that's simultaneously safe for strcmp()-based identity
+     * comparison AND guaranteed to retain sensitive-path context once
+     * `dirpath` no longer fits - collision-safety was judged worth
+     * more than sensitive-path recall in this narrow (approaching
+     * PATH_MAX nesting depth), rarely-hit fallback, not a change made
+     * without noticing the cost. */
+    int need = snprintf(out, out_len, "%s/%s", dirpath, path);
+
+    if (need < 0 || (size_t)need >= out_len)
+      strscpy(out, path, out_len);
+    else
+      normalize_abs_path(out, out_len);
   }
 
   kfree(tmp);
@@ -570,6 +608,18 @@ static int hash_file_multi(const char *path, const struct path *pwd,
   }
 
   while ((n = kernel_read(f, buf, READ_CHUNK_SIZE, &pos)) > 0) {
+    /* The i_size_read() check above only bounds the size at open
+     * time - a file that keeps growing while this loop reads it
+     * (e.g. a shell script appending to itself; ETXTBSY only
+     * protects an exec'd interpreter's own image, not a script file
+     * it's reading) would otherwise let kernel_read() keep consuming
+     * data forever, pinning this worker thread indefinitely. `pos`
+     * is kernel_read()'s own running byte count, so re-checking it
+     * against the same cap here catches that case the same way. */
+    if (pos > MAX_HASH_FILE_SIZE) {
+      ret = -EFBIG;
+      goto out;
+    }
     for (i = 0; i < 3; i++) {
       if (!ctx[i].active)
         continue;

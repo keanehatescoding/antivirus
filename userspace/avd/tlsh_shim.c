@@ -34,10 +34,11 @@ size_t av_tlsh_hash_maxlen(void) {
   return TLSH_DIGEST_HEXLEN;
 }
 
-int av_tlsh_hash_fd(int fd, char *out, size_t outlen) {
+int av_tlsh_hash_fd(int fd, char *out, size_t outlen, size_t max_len) {
   tlsh_ctx ctx;
   tlsh_digest digest;
   unsigned char buf[65536];
+  size_t total = 0;
   ssize_t n;
   int any_data = 0;
 
@@ -46,8 +47,16 @@ int av_tlsh_hash_fd(int fd, char *out, size_t outlen) {
 
   tlsh_init(&ctx);
 
-  for (;;) {
-    n = read(fd, buf, sizeof(buf));
+  while (total < max_len) {
+    size_t want = sizeof(buf);
+
+    /* Never ask read() for more than the remaining budget - avoids
+     * reading (and hashing) even one byte past max_len when the
+     * remainder is smaller than the buffer. */
+    if (max_len - total < want)
+      want = max_len - total;
+
+    n = read(fd, buf, want);
     if (n == 0)
       break;
     if (n < 0) {
@@ -62,6 +71,7 @@ int av_tlsh_hash_fd(int fd, char *out, size_t outlen) {
       return -1;
     }
     tlsh_update(&ctx, buf, (unsigned int)n);
+    total += (size_t)n;
     any_data = 1;
   }
   if (!any_data) {

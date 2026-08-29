@@ -37,12 +37,20 @@ size_t av_tlsh_hash_maxlen(void);
  * as fuzzy_hash_file()'s own internal seek-to-start behavior, which
  * check_fuzzy_corpus() in avd.c already relies on). Unlike
  * fuzzy_hash_file(), this does NOT restore the position afterward -
- * it reads straight through to EOF and leaves `fd` there. Callers
- * should pass a dup()'d fd, same convention as check_fuzzy_corpus(),
- * and not rely on the original fd's position afterward - remember
- * dup()'d fds share the same underlying offset, so this also leaves
- * the fd it was dup()'d from sitting at EOF. Writes the hex-encoded
- * hash into `out` (NUL-terminated).
+ * it reads straight through to EOF (or `max_len` bytes, whichever
+ * comes first) and leaves `fd` there. Callers should pass a dup()'d
+ * fd, same convention as check_fuzzy_corpus(), and not rely on the
+ * original fd's position afterward - remember dup()'d fds share the
+ * same underlying offset, so this also leaves the fd it was dup()'d
+ * from sitting wherever the read stopped. Writes the hex-encoded hash
+ * into `out` (NUL-terminated).
+ *
+ * `max_len`: stops reading once this many bytes have been consumed,
+ * hashing that prefix rather than the whole file - even if the file
+ * keeps growing underneath this call (e.g. a concurrent writer), the
+ * read loop can never exceed `max_len` regardless of how much more
+ * data shows up. Pass SIZE_MAX for "no cap, hash the whole file" (the
+ * unbounded behavior this function used to always have).
  *
  * Returns 0 on success, -1 on a read/I/O error, -2 if the file didn't
  * contain enough data for TLSH to produce a valid hash (MIN_DATA_LENGTH
@@ -56,7 +64,7 @@ size_t av_tlsh_hash_maxlen(void);
  * than silently truncated either way - a truncated hash would still
  * parse as a well-formed-looking but WRONG hash downstream, a worse
  * failure mode than an honest error here). */
-int av_tlsh_hash_fd(int fd, char *out, size_t outlen);
+int av_tlsh_hash_fd(int fd, char *out, size_t outlen, size_t max_len);
 
 /* Compares two hex-encoded TLSH hashes and returns this project's own
  * totalDiff()-equivalent distance (tlsh_total_diff() in tlsh_core.c,

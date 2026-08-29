@@ -94,8 +94,8 @@ and would need a heavier framing format to fully close.
 | Command | Auth | Response |
 |---|---|---|
 | `STATUS` | any | 1 row: `uptime_secs\trules_loaded(0/1)\tfuzzy_corpus_count\ttlsh_corpus_count\tscan_queue_len\tscan_threads` |
-| `VERDICTS RECENT <n>` | any | up to `n` most-recent rows (newest first): `id\ttimestamp\tpid\tpath\tsha256\tverdict(CLEAN/MALICIOUS)\trule_name\tscore\ton_demand(0/1)` |
-| `QUARANTINE LIST` | any | one row per quarantined file: `id\toriginal_path\ttimestamp\trule_name\tsha256` |
+| `VERDICTS RECENT <n>` | any, filtered | up to `n` most-recent rows *the caller owns* (newest first): `id\ttimestamp\tpid\tpath\tsha256\tverdict(CLEAN/MALICIOUS)\trule_name\tscore\ton_demand(0/1)` |
+| `QUARANTINE LIST` | any, filtered | one row per quarantined file *the caller owns*: `id\toriginal_path\ttimestamp\trule_name\tsha256` |
 | `SCAN <absolute-path>` | **root** | 1 row: `verdict(CLEAN/MALICIOUS)\trule_name\tscore\tsha256` |
 | `QUARANTINE RESTORE <id>` | **root** | `OK` only, no rows |
 | `QUARANTINE DELETE <id>` | **root** | `OK` only, no rows |
@@ -113,10 +113,21 @@ separately, rather than two sockets with two different modes. Right
 after `accept()`, `avd` reads the connecting process's credentials via
 `SO_PEERCRED` (kernel-populated at `connect()` time from the actual
 peer process - not attacker-writable, same trust boundary as
-`nlmsg_get_src()` in `msg_handler()` on the netlink side). `STATUS`,
-`VERDICTS`, and `QUARANTINE LIST` answer any peer; `SCAN`,
+`nlmsg_get_src()` in `msg_handler()` on the netlink side). `SCAN`,
 `QUARANTINE RESTORE`, and `QUARANTINE DELETE` require `uid == 0`,
 returning `ERR permission denied ...` otherwise.
+
+`STATUS` answers any peer with aggregate counts only - nothing
+per-file. `VERDICTS RECENT` and `QUARANTINE LIST` also answer any
+peer, but unlike `/proc/kernel_av_signatures` (which holds no
+per-user data), each row is a specific file's path and SHA-256 hash -
+worth protecting the same way file contents themselves are. Both
+filter their rows to ones the connecting peer's uid owns (the
+scanned/quarantined file's original owner, not the triggering
+process's pid) before sending `COUNT`; `uid == 0` sees every row
+unfiltered. A row whose owner can't be determined (missing/unreadable
+quarantine metadata, or a failed `fstat()` at scan time) is treated as
+root-only rather than shown to everyone.
 
 Callers that need one of the three privileged verbs use `pkexec avctl
 scan|quarantine restore|quarantine delete ...` (see
