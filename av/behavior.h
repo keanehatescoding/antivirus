@@ -63,9 +63,13 @@ void av_behavior_exit(void);
  * own binary, and so the rapid-write heuristic can tell if this
  * process's binary is on the trusted list. `pid` is the tgid - see
  * the note above. `sha256_hex` is the already-computed digest from
- * hash_file_multi() in main.c - reused, not recomputed. */
+ * hash_file_multi() in main.c - reused, not recomputed. `start_time`
+ * is the exec'ing task's `task_struct->start_time`, captured by the
+ * caller while running in that task's own context - see the
+ * pid-reuse-vs-re-exec note on this function's definition for why
+ * it's needed. */
 void av_behavior_record_exec(pid_t pid, const char *path,
-                              const char *sha256_hex);
+                              const char *sha256_hex, u64 start_time);
 
 /* Called from the openat work handler. If the open is write-intent
  * (flags indicate O_WRONLY/O_RDWR/O_CREAT/O_TRUNC) this updates the

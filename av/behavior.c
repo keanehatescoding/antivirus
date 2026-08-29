@@ -296,6 +296,17 @@ struct av_behavior_entry {
                  * is on the trust list - exempts the rapid-write
                  * counter specifically, see behavior.h */
 
+  u64 start_time; /* task_struct->start_time of the task that last
+                   * recorded an exec into this entry - set at fork
+                   * and unchanged across that same task's own later
+                   * execve() calls, so comparing it against the
+                   * current exec's start_time lets
+                   * av_behavior_record_exec() tell a genuine pid
+                   * reuse (different task, different start_time)
+                   * apart from the same still-running process
+                   * exec'ing again. See that function for why this
+                   * matters. */
+
   unsigned long last_touched; /* jiffies at the most recent
                                * get_or_create_entry() lookup (hit or
                                * miss) for this pid - see that
@@ -1222,10 +1233,10 @@ static void kill_with_reason(struct pid *target_pid, const char *path,
  * Note on PID reuse: if the pid number gets recycled by an unrelated
  * new process before this sweep runs, the stale entry looks "alive"
  * and survives one more interval. That's fine - av_behavior_record_exec
- * overwrites exec_path on the new process's first execve, and the
- * write-open window/dedup state naturally resets on its own next
- * window regardless of who "owns" the entry in between. Worst case is
- * one GC_INTERVAL_MS of an entry outliving its original process. */
+ * overwrites exec_path and explicitly clears the write-open/rename
+ * window state on the new process's first execve, so it starts clean
+ * rather than inheriting the previous occupant's activity. Worst case
+ * is one GC_INTERVAL_MS of an entry outliving its original process. */
 static void behavior_gc_fn(struct work_struct *w) {
   struct av_behavior_entry *e;
   struct hlist_node *tmp;
@@ -1259,7 +1270,7 @@ static void behavior_gc_fn(struct work_struct *w) {
 }
 
 void av_behavior_record_exec(pid_t pid, const char *path,
-                             const char *sha256_hex) {
+                             const char *sha256_hex, u64 start_time) {
   struct av_behavior_entry *e;
   /* cppcheck-suppress knownConditionTrueFalse
    * Same false positive as av_behavior_trust_del() above -
@@ -1273,6 +1284,29 @@ void av_behavior_record_exec(pid_t pid, const char *path,
   if (e) {
     strscpy(e->exec_path, path, sizeof(e->exec_path));
     e->trusted = trusted;
+    /* A reused pid can land on a stale entry left behind by a
+     * previous, unrelated process (get_or_create_entry() matches on
+     * pid alone), but av_behavior_record_exec() also fires on every
+     * OTHER execve of a process that's still running (e.g. a shell
+     * `exec`, or a process re-executing itself) - NOT just on actual
+     * pid reuse. Resetting the window unconditionally on every exec
+     * would let any process wipe its own write/rename counters on
+     * demand simply by exec'ing something, turning this into an
+     * attacker-controlled evasion primitive instead of a PID-reuse
+     * fix. task_struct->start_time is set at fork and untouched by
+     * that same task's own later execve() calls, so a differing
+     * start_time (including the zeroed value on a freshly-kzalloc'd
+     * entry) reliably means this pid was actually recycled by a
+     * different task - only then is it safe to clear the sliding-
+     * window state rather than letting it age out on its own over up
+     * to WRITE_OPEN_WINDOW_MS. */
+    if (e->start_time != start_time) {
+      e->start_time = start_time;
+      e->recent_path_next = 0;
+      e->recent_path_filled = 0;
+      e->recent_rename_next = 0;
+      e->recent_rename_filled = 0;
+    }
   }
   mutex_unlock(&behavior_lock);
 }
