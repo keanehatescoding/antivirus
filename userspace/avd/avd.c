@@ -596,12 +596,18 @@ static int load_fuzzy_corpus(const char *path) {
  * Takes `fd` rather than a path - see handle_scan_request()'s comment
  * on why the whole scan/quarantine sequence now reads through one fd
  * opened once at the top, instead of re-resolving a path string at
- * each step. Hashes via a dup()'d handle so this doesn't disturb
- * `fd`'s own read offset for whatever the caller does with it next;
- * that dup()'d handle is explicitly seeked to the start and streamed
+ * each step. Hashes via a dup()'d handle, same convention as
+ * check_tlsh_corpus()/av_tlsh_hash_fd() - but unlike the
+ * fuzzy_hash_file() this replaced (which explicitly seeks back to the
+ * original position when done), that dup()'d handle is left wherever
+ * the read loop stopped: dup()'d fds share the same underlying file
+ * offset as the original, so `fd` itself is left there too. No
+ * current caller relies on `fd`'s position surviving this call (every
+ * one either re-seeks or closes it immediately after), but don't add
+ * one that does without restoring the position first. Streamed
  * through libfuzzy's incremental fuzzy_update()/fuzzy_digest() API in
- * fixed-size chunks, rather than handed to fuzzy_hash_file() - see
- * MAX_FUZZY_TLSH_FILE_SIZE's comment for why.
+ * fixed-size chunks rather than handed to fuzzy_hash_file() directly -
+ * see MAX_FUZZY_TLSH_FILE_SIZE's comment for why.
  */
 /* Shared size gate for check_fuzzy_corpus()/check_tlsh_corpus() - see
  * MAX_FUZZY_TLSH_FILE_SIZE's comment for why this exists. Returns
@@ -610,12 +616,21 @@ static int load_fuzzy_corpus(const char *path) {
  * these checks for otherwise-normal files, matching this codebase's
  * general fail-open stance on inconclusive information.
  *
- * `size_out`, if non-NULL, receives the size this check measured -
- * check_fuzzy_corpus() uses it to size its read buffer exactly rather
- * than always allocating the full cap. Left unset (caller should
- * fall back to MAX_FUZZY_TLSH_FILE_SIZE) when fstat() failed, since
- * there's no measured size to report in that case. */
-static bool fuzzy_tlsh_size_ok(int fd, const char *label, size_t *size_out) {
+ * A REJECT-ONLY gate - callers must still read up to the fixed
+ * MAX_FUZZY_TLSH_FILE_SIZE cap themselves (not whatever size this
+ * check happened to measure). An earlier version of this function
+ * also reported the measured size back to check_fuzzy_corpus() to
+ * size its read buffer exactly; that size became the actual read
+ * bound instead of just an accept/reject threshold, which under-hashed
+ * a file that grew after this fstat() (hashing a stale, truncated
+ * snapshot instead of current content) and produced a bogus empty-file
+ * digest whenever st_size raced to 0 - worse than the unbounded
+ * fuzzy_hash_file() this cap replaced. Streaming through a fixed
+ * buffer (see check_fuzzy_corpus()) already made that size-hint
+ * unnecessary for memory reasons, so it's gone entirely now - both
+ * callers just read-to-EOF-or-MAX_FUZZY_TLSH_FILE_SIZE, exactly like
+ * av_tlsh_hash_fd(). */
+static bool fuzzy_tlsh_size_ok(int fd, const char *label) {
   struct stat st;
 
   if (fstat(fd, &st) != 0)
@@ -626,8 +641,6 @@ static bool fuzzy_tlsh_size_ok(int fd, const char *label, size_t *size_out) {
             label, (long long)st.st_size, MAX_FUZZY_TLSH_FILE_SIZE);
     return false;
   }
-  if (size_out)
-    *size_out = (size_t)st.st_size;
   return true;
 }
 
@@ -638,10 +651,6 @@ static int check_fuzzy_corpus(int fd, char *name_out, size_t name_out_len,
   size_t best_idx = 0;
   size_t i;
   int dup_fd;
-  /* Unset by fuzzy_tlsh_size_ok() means "fstat() failed" - fall back
-   * to the full cap rather than an unbounded/zero-size read in that
-   * case, same fail-open stance as the size check itself. */
-  size_t want = MAX_FUZZY_TLSH_FILE_SIZE;
   unsigned char buf[65536];
   size_t total = 0;
   ssize_t n;
@@ -650,7 +659,7 @@ static int check_fuzzy_corpus(int fd, char *name_out, size_t name_out_len,
 
   if (fuzzy_corpus_count == 0)
     return 0;
-  if (!fuzzy_tlsh_size_ok(fd, "fuzzy", &want))
+  if (!fuzzy_tlsh_size_ok(fd, "fuzzy"))
     return 0;
 
   dup_fd = dup(fd);
@@ -667,25 +676,27 @@ static int check_fuzzy_corpus(int fd, char *name_out, size_t name_out_len,
     return -1;
   }
 
-  /* Stream at most `want` bytes through a fixed-size buffer and
-   * libfuzzy's incremental fuzzy_update()/fuzzy_digest() API -
-   * constant memory regardless of `want`, same shape as
-   * av_tlsh_hash_fd()'s own 64KB-buffer loop in tlsh_shim.c. An
-   * earlier version of this bound instead read the whole `want`-sized
-   * snapshot into one malloc()'d buffer before calling
-   * fuzzy_hash_buf() on it - correct, but with 8 concurrent scan
-   * workers and `want` up to MAX_FUZZY_TLSH_FILE_SIZE (256MB), that
-   * traded the worker-thread-time exhaustion this cap exists to fix
-   * for a ~2GB daemon-memory exhaustion vector instead. Bounding the
-   * read itself (rather than the buffer size) keeps the same
-   * concurrent-growth protection - the loop still can never consume
-   * more than `want` bytes - without ever holding more than one 64KB
-   * chunk at a time. */
-  while (total < want) {
+  /* Stream at most MAX_FUZZY_TLSH_FILE_SIZE bytes through a fixed-size
+   * buffer and libfuzzy's incremental fuzzy_update()/fuzzy_digest()
+   * API - constant memory regardless of the cap, same shape as
+   * av_tlsh_hash_fd()'s own 64KB-buffer loop in tlsh_shim.c, and the
+   * same fixed bound check_tlsh_corpus() passes it (not whatever size
+   * fuzzy_tlsh_size_ok() happened to measure a moment earlier - see
+   * that function's comment for why reading to a stale measured size
+   * instead of this fixed cap was itself a bug). An earlier version of
+   * this loop instead read one malloc()'d `want`-sized snapshot before
+   * calling fuzzy_hash_buf() on it - correct, but with 8 concurrent
+   * scan workers and a cap up to 256MB, that traded the worker-thread-
+   * time exhaustion this cap exists to fix for a ~2GB daemon-memory
+   * exhaustion vector instead. Bounding the read itself (rather than
+   * the buffer size) keeps the same concurrent-growth protection - the
+   * loop still can never consume more than the cap - without ever
+   * holding more than one 64KB chunk at a time. */
+  while (total < MAX_FUZZY_TLSH_FILE_SIZE) {
     size_t chunk = sizeof(buf);
 
-    if (want - total < chunk)
-      chunk = want - total;
+    if (MAX_FUZZY_TLSH_FILE_SIZE - total < chunk)
+      chunk = MAX_FUZZY_TLSH_FILE_SIZE - total;
 
     n = read(dup_fd, buf, chunk);
     if (n == 0)
@@ -853,7 +864,7 @@ static int check_tlsh_corpus(int fd, char *name_out, size_t name_out_len,
 
   if (tlsh_corpus_count == 0)
     return 0;
-  if (!fuzzy_tlsh_size_ok(fd, "TLSH", NULL))
+  if (!fuzzy_tlsh_size_ok(fd, "TLSH"))
     return 0;
 
   dup_fd = dup(fd);
