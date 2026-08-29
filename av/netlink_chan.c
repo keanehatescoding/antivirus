@@ -132,7 +132,7 @@ static int av_nl_verdict_doit(struct sk_buff *skb, struct genl_info *info)
     struct av_pending_scan *p = NULL, *found = NULL;
     u64 reqid;
     u8 verdict;
-    const char *rule_name = "";
+    char rule_name[AV_RULE_NAME_MAXLEN + 1] = "";
 
     if (!info->attrs[AV_A_REQID] || !info->attrs[AV_A_VERDICT])
         return -EINVAL;
@@ -155,7 +155,7 @@ static int av_nl_verdict_doit(struct sk_buff *skb, struct genl_info *info)
     reqid = nla_get_u64(info->attrs[AV_A_REQID]);
     verdict = nla_get_u8(info->attrs[AV_A_VERDICT]);
     if (info->attrs[AV_A_RULE_NAME])
-        rule_name = nla_data(info->attrs[AV_A_RULE_NAME]);
+        nla_strscpy(rule_name, info->attrs[AV_A_RULE_NAME], sizeof(rule_name));
 
     spin_lock(&pending_lock);
     list_for_each_entry(p, &pending_list, list) {
@@ -226,6 +226,7 @@ int av_netlink_scan_request(const char *path, const char *sha256_hex,
     u32 portid;
     bool registered;
     int ret;
+    size_t payload_size;
 
     spin_lock(&daemon_lock);
     registered = daemon_registered;
@@ -247,7 +248,20 @@ int av_netlink_scan_request(const char *path, const char *sha256_hex,
     list_add(&p->list, &pending_list);
     spin_unlock(&pending_lock);
 
-    skb = genlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
+    /* Size the skb from the actual attributes being written rather than
+     * guessing with NLMSG_DEFAULT_SIZE - AV_A_PATH alone can be up to
+     * PATH_MAX, which doesn't fit in NLMSG_DEFAULT_SIZE's ~3.7-3.8KB of
+     * usable space. Undersizing here makes nla_put_string() below fail
+     * with -EMSGSIZE, which av_work_fn() can't distinguish from "daemon
+     * unreachable" and so falls through to fail-open, silently skipping
+     * the daemon-side scan for long paths even though the daemon is up
+     * and would have answered. */
+    payload_size = nla_total_size(sizeof(u64)) +
+                   nla_total_size(sizeof(u32)) +
+                   nla_total_size(strlen(path) + 1) +
+                   nla_total_size(strlen(sha256_hex) + 1);
+
+    skb = genlmsg_new(payload_size, GFP_KERNEL);
     if (!skb) {
         ret = -ENOMEM;
         goto err_remove_pending;
