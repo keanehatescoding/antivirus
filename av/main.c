@@ -446,6 +446,11 @@ struct av_work {
                     * av_behavior_record_exec() keys behavior state by
                     * process rather than by the individual thread that
                     * happened to call execve(). */
+  u64 start_time;  /* current->start_time, captured here while still
+                    * running in the exec'ing task's own context - see
+                    * av_behavior_record_exec()'s comment for why this
+                    * is needed to distinguish a genuine pid reuse from
+                    * the same process exec'ing again. */
   struct path pwd; /* the exec'ing process's cwd at the moment
                     * handler_pre() ran, captured via get_fs_pwd()
                     * (atomic-safe: it's just a refcount bump under
@@ -915,7 +920,7 @@ static void av_work_fn(struct work_struct *w) {
    * immediately it'll never reach the unlink hook anyway, and this
    * keeps the recording logic in one place rather than duplicated
    * across the signature-match/daemon-match/clean branches. */
-  av_behavior_record_exec(aw->tgid, abs_path, digest.sha256);
+  av_behavior_record_exec(aw->tgid, abs_path, digest.sha256, aw->start_time);
 
   if (av_sigtable_match(&digest, sig_name, sizeof(sig_name))) {
     snprintf(reason, sizeof(reason), "signature:%s", sig_name);
@@ -1081,6 +1086,7 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
 
   aw->target_pid = get_task_pid(current, PIDTYPE_PID);
   aw->tgid = task_tgid_nr(current);
+  aw->start_time = current->start_time;
   /* get_fs_pwd() takes fs->lock and bumps refcounts under it - no
    * sleeping, so this is fine in this atomic kprobe context. This is
    * the fix for the relative-path evasion: capture the calling
@@ -1210,6 +1216,7 @@ static int handler_pre_execveat(struct kprobe *p, struct pt_regs *regs) {
 
   aw->target_pid = get_task_pid(current, PIDTYPE_PID);
   aw->tgid = task_tgid_nr(current);
+  aw->start_time = current->start_time;
   INIT_WORK(&aw->work, av_work_fn);
   queue_work(av_wq, &aw->work);
 
