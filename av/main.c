@@ -376,10 +376,9 @@ static void resolve_absolute_path(const char *path, const struct path *base,
      * silent truncation the assignment-and-move-on version above
      * couldn't. Two distinct, deeply-nested files whose combined
      * dirpath+path exceeds out_len would otherwise truncate to the
-     * identical string, which self-delete correlation and
-     * sensitive-path matching (both plain strcmp()/prefix checks on
-     * this output) would then treat as the same file - same
-     * lossy-result-is-dangerous reasoning as normalize_abs_path()'s
+     * identical string, which self-delete correlation (a plain
+     * strcmp() on this output) would then treat as the same file -
+     * same lossy-result-is-dangerous reasoning as normalize_abs_path()'s
      * own >128-component bail-out above. Falling back to the
      * unresolved relative path (not absolute, but not truncated
      * either) matches this function's existing degraded-not-dropped
@@ -388,7 +387,24 @@ static void resolve_absolute_path(const char *path, const struct path *base,
      * fallback results, which is why av_behavior_check_unlink() in
      * behavior.c separately requires both sides of its self-delete
      * comparison to start with '/' before trusting a match; this
-     * fallback deliberately never produces that. */
+     * fallback deliberately never produces that.
+     *
+     * Known, accepted tradeoff: path_is_sensitive() in behavior.c
+     * also runs against this output, and its "/boot/" prefix check
+     * (and, in practice, its "/etc/passwd"-shaped substring checks
+     * too, whenever the sensitive directory context lived in `dirpath`
+     * rather than the trailing `path` component - the common shape
+     * for this overflow case, e.g. a deeply nested ~/.ssh/... tree)
+     * can no longer fire once `dirpath` is discarded here. Before this
+     * truncation guard existed, the (collision-prone) truncated-but-
+     * still-absolute result could still trigger that detection if the
+     * sensitive segment survived truncation. There's no single output
+     * string that's simultaneously safe for strcmp()-based identity
+     * comparison AND guaranteed to retain sensitive-path context once
+     * `dirpath` no longer fits - collision-safety was judged worth
+     * more than sensitive-path recall in this narrow (approaching
+     * PATH_MAX nesting depth), rarely-hit fallback, not a change made
+     * without noticing the cost. */
     int need = snprintf(out, out_len, "%s/%s", dirpath, path);
 
     if (need < 0 || (size_t)need >= out_len)
