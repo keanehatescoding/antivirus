@@ -295,6 +295,12 @@ struct av_behavior_entry {
   bool trusted; /* set at record_exec time if this binary's SHA-256
                  * is on the trust list - exempts the rapid-write
                  * counter specifically, see behavior.h */
+
+  unsigned long last_touched; /* jiffies at the most recent
+                               * get_or_create_entry() lookup (hit or
+                               * miss) for this pid - see that
+                               * function's LRU-eviction comment for
+                               * why this exists. */
 };
 
 /* Shared true-sliding-window dedup check for both the write-open and
@@ -939,8 +945,77 @@ static void protected_table_destroy(void) {
  * reduction that is needed. */
 static u32 pid_key(pid_t pid) { return (u32)pid; }
 
+/* Evicts the single least-recently-touched entry in behavior_table
+ * (smallest last_touched, updated by every get_or_create_entry()
+ * lookup below - see that field's comment) to make room for a new
+ * one when the table is already at MAX_BEHAVIOR_ENTRIES. O(n) full
+ * scan, same cost class as behavior_gc_fn()'s existing sweep at the
+ * same scale, called only on the create-while-full path (not every
+ * lookup). Returns false if the table was empty (can't happen in
+ * practice - this is only ever called once behavior_table_count has
+ * already reached a nonzero MAX_BEHAVIOR_ENTRIES - but checked rather
+ * than assumed).
+ *
+ * Why eviction instead of an outright refusal (this cap's original
+ * shape): a hard "refuse once full" cap has no reclaim path for
+ * entries whose *process is still alive* - behavior_gc_fn() only
+ * reclaims dead pids. An unprivileged user well within a typical
+ * RLIMIT_NPROC can start MAX_BEHAVIOR_ENTRIES live processes (no
+ * malicious activity needed, just staying alive) and permanently fill
+ * the table with entries GC will never touch. Every subsequent
+ * process then gets e == NULL from get_or_create_entry() forever -
+ * and av_behavior_check_unlink()'s self-delete kill depends entirely
+ * on exec_path having been recorded, which never happens for an
+ * untracked pid. That's not "only degrading the volume-based
+ * heuristics" (this function's stance before this comment) - it's a
+ * cheap, durable bypass of a real kill path. LRU eviction closes that:
+ * the table can never stay permanently full of untouchable entries,
+ * because SOME entry is always the least-recently-touched one and
+ * becomes evictable. A process actively triggering the checks that
+ * matter (openat/unlink/rename/exec) keeps refreshing its own
+ * last_touched and is never the eviction target; only idle entries -
+ * the ones least likely to be mid-attack right now - get reclaimed
+ * under pressure. */
+static bool evict_lru_entry(void) {
+  /* e deliberately left uninitialized (unlike get_or_create_entry()'s
+   * NULL-initialized e above) - hash_for_each() always assigns it via
+   * hlist_entry_safe() before the loop body runs, same as
+   * hash_for_each_possible() elsewhere in this file, but cppcheck's
+   * inability to expand this macro without full kernel headers
+   * manifests differently here: instead of a knownConditionTrueFalse
+   * false positive on `e` itself, it misreads the whole `oldest = e`
+   * assignment below as copying from an uninitialized struct. Explicit
+   * suppression, same false-positive class as every other
+   * hash_for_each*() call site in this file. */
+  struct av_behavior_entry *e, *oldest = NULL;
+  int bkt;
+
+  hash_for_each(behavior_table, bkt, e, node) {
+    /* cppcheck-suppress knownConditionTrueFalse
+     * False positive: cppcheck can't see that hash_for_each() may run
+     * its body zero or more times, so it doesn't track `oldest`
+     * possibly still being NULL here across iterations - at runtime
+     * this genuinely can be true on the first matching iteration. */
+    if (!oldest || time_before(e->last_touched, oldest->last_touched))
+      /* cppcheck-suppress uninitvar
+       * See the comment on `e`'s declaration above - hash_for_each()
+       * always assigns e to a real table entry before this runs. */
+      oldest = e;
+  }
+
+  if (!oldest)
+    return false;
+
+  hash_del(&oldest->node);
+  kfree(oldest);
+  behavior_table_count--;
+  return true;
+}
+
 /* Finds or creates the entry for `pid`. Always called under
- * behavior_lock. Returns NULL only on allocation failure. */
+ * behavior_lock. Returns NULL only on allocation failure (kzalloc, or
+ * the table was somehow at capacity with nothing evictable - see
+ * evict_lru_entry()'s "can't happen in practice" note). */
 static struct av_behavior_entry *get_or_create_entry(pid_t pid) {
   /* Initialized to NULL only to satisfy static analyzers that can't
    * expand hash_for_each_possible() (a nested kernel macro requiring
@@ -951,21 +1026,22 @@ static struct av_behavior_entry *get_or_create_entry(pid_t pid) {
   struct av_behavior_entry *e = NULL;
 
   hash_for_each_possible(behavior_table, e, node, pid_key(pid)) {
-    if (e->pid == pid)
+    if (e->pid == pid) {
+      e->last_touched = jiffies;
       return e;
+    }
   }
 
   if (behavior_table_count >= MAX_BEHAVIOR_ENTRIES) {
     /* At capacity - kick GC to run as soon as possible (instead of
-     * waiting up to GC_INTERVAL_MS) so a burst of short-lived
-     * processes recovers headroom quickly, then decline to track
-     * this pid for now. Every caller already treats a NULL entry as
-     * "skip behavior tracking for this op" - the sensitive-path
-     * checks that don't depend on `e` still run regardless, so this
-     * only degrades the volume-based heuristics, never the kill
-     * path. */
+     * waiting up to GC_INTERVAL_MS) so a burst of short-lived,
+     * already-exited processes recovers headroom quickly, then evict
+     * whichever live entry has gone longest untouched to make room
+     * regardless - see evict_lru_entry()'s comment for why a live
+     * table can't be allowed to just stay full. */
     mod_delayed_work(behavior_gc_wq, &behavior_gc_work, 0);
-    return NULL;
+    if (!evict_lru_entry())
+      return NULL;
   }
 
   e = kzalloc(sizeof(*e), GFP_KERNEL);
@@ -973,6 +1049,7 @@ static struct av_behavior_entry *get_or_create_entry(pid_t pid) {
     return NULL;
 
   e->pid = pid;
+  e->last_touched = jiffies;
   hash_add(behavior_table, &e->node, pid_key(pid));
   behavior_table_count++;
   return e;
