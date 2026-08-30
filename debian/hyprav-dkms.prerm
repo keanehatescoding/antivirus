@@ -8,8 +8,16 @@ set -e
 # own Version field in dpkg's database always names exactly the
 # version being removed/replaced here, regardless of how many
 # /usr/src/hyprav-av-<version>/ directories happen to exist.
-DKMS_VER=$(dpkg-query -W -f='${Version}' hyprav-dkms 2>/dev/null | \
-    sed -E 's/^[0-9]+://; s/-[^-]+$//')
+# Captured separately from the sed normalization below - piping
+# straight into sed would make the pipeline's exit status sed's (which
+# succeeds even on empty input), silently hiding a dpkg-query failure
+# behind a plain empty DKMS_VER.
+DKMS_FULL_VER=$(dpkg-query -W -f='${Version}' hyprav-dkms 2>/dev/null) || DKMS_FULL_VER=""
+DKMS_VER=$(echo "$DKMS_FULL_VER" | sed -E 's/^[0-9]+://; s/-[^-]+$//')
+
+if [ -z "$DKMS_VER" ]; then
+    echo "hyprav-dkms: could not determine package version via dpkg-query; skipping dkms removal" >&2
+fi
 
 case "$1" in
     remove|deconfigure|upgrade)
