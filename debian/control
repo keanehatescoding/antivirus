@@ -72,5 +72,5 @@ Description: GTK4 management console for HyprAV
  signatures/trust list/protected paths/policy management, sitting on
  top of avd and avctl. A normal desktop app, not a daemon - nothing to
  enable or start, just launch it. Privileged actions go through
- pkexec avctl, gated by the org.hyprav.avctl.manage polkit action
+ pkexec avctl, gated by the per-verb org.hyprav.avctl.* polkit actions
  installed by the hyprav package.

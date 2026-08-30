@@ -39,9 +39,10 @@ docs/
 packaging/
   avd.service          - systemd unit for running avd persistently -
                         see "Running avd persistently" below
-  org.hyprav.avctl.policy - polkit action backing every privileged avctl
-                        command (scan, quarantine restore/delete, and
-                        anything the GUI does) - see "GUI: av-gui" below
+  org.hyprav.avctl.policy - per-verb polkit actions backing every
+                        privileged avctl command (scan, quarantine
+                        restore/delete, and anything the GUI does) -
+                        see "GUI: av-gui" below
   flatpak/, appimage/  - sandboxed/portable builds of the GUI console
                         ONLY (not the kernel module or avd) - see "GUI:
                         av-gui" below
@@ -347,8 +348,9 @@ Neither needs root.
 
 **Writes** (every add/remove/restore/delete/scan button) run `pkexec
 avctl ...` (`av_gui/pkexec_helper.py`), gated by the
-`org.hyprav.avctl.policy` polkit action — one authentication prompt
-per action, not a GUI that runs as root for its whole lifetime. `avd`
+`org.hyprav.avctl.policy`'s per-verb polkit actions — one
+authentication prompt per button click, not a GUI that runs as root
+for its whole lifetime. `avd`
 independently re-checks the caller's uid via `SO_PEERCRED` on its own
 three privileged verbs regardless of how the request got there, so
 this isn't the only gate either (see docs/avd-socket-protocol.md's

@@ -3,26 +3,39 @@
  "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <!--
-  org.hyprav.avctl.policy - polkit action for avctl's privileged
-  operations (signature/trust/protected-path/policy writes, on-demand
-  scan, quarantine restore/delete). Used as: pkexec avctl <verb> ...
+  org.hyprav.avctl.policy - per-verb polkit actions for avctl's
+  privileged operations. Used as: pkexec avctl <verb> ...
 
-  One action, not one per verb - avctl already IS the single trusted
-  entry point for every privileged write this project has (the
-  /proc-backed ones directly, scan/quarantine via avd's control
-  socket - see docs/avd-socket-protocol.md); avd itself independently
-  re-checks the caller's uid via SO_PEERCRED for its own three
-  privileged verbs (see handle_control_line() in userspace/avd/avd.c),
-  so this policy isn't the only gate either way. Splitting this into
-  per-verb actions later (e.g. "scan" vs. "modify trust list" vs.
-  "restore quarantine") is a reasonable future refinement once this
-  single action has seen real use - not done up front, matching this
-  project's own habit of shipping the simple version first.
+  One action per verb, selected automatically by polkit via the
+  org.freedesktop.policykit.exec.argv1 annotation (matches argv[1] of
+  the pkexec'd command - see pkexec(1)'s "WRAPPER USAGE" section).
+  This used to be a single org.hyprav.avctl.manage action covering
+  every verb, on the theory that avctl already IS the single trusted
+  entry point for every privileged write this project has - true, but
+  it meant authorizing for ANY one avctl action (say, an on-demand
+  scan) implicitly authorized all of them (say, clearing the trust
+  list), which is more than most operators actually want to grant.
+  Splitting was deferred until the single-action version had shipped
+  and seen real use; it has, so this is that follow-up.
 
-  auth_admin (not auth_admin_keep): re-prompt every time rather than
-  caching authorization for a grace period - these are infrequent,
-  security-relevant actions (killing/quarantining/restoring files,
-  changing what's trusted), where re-prompting is the safer default.
+  Only verbs that actually go through pkexec need an action here.
+  Read-only verbs (list, trust list, protect list, policy get, save)
+  never route through pkexec (av-gui calls avctl directly for those -
+  see README.md's "Reads go through two unprivileged paths" and
+  av_gui/procfs_client.py) and so aren't listed below; a bare
+  `pkexec avctl list` will now fail with "no such action" instead of
+  prompting for auth it doesn't need, which is the point.
+
+  avd itself independently re-checks the caller's uid via SO_PEERCRED
+  for its own three privileged verbs (see handle_control_line() in
+  userspace/avd/avd.c), so these policy actions aren't the only gate
+  either way.
+
+  auth_admin (not auth_admin_keep) throughout: re-prompt every time
+  rather than caching authorization for a grace period - these are
+  infrequent, security-relevant actions (killing/quarantining/
+  restoring files, changing what's trusted), where re-prompting is
+  the safer default.
 
   @BINDIR@ below is a template placeholder (matches packaging/
   avd.service's own convention) rendered by userspace/avctl/Makefile's
@@ -33,14 +46,99 @@
   <vendor>HyprAV</vendor>
   <vendor_url>https://github.com/keanehatescoding/HyprAV</vendor_url>
 
-  <action id="org.hyprav.avctl.manage">
-    <description>Manage HyprAV signatures, trust list, protected paths, policy, on-demand scans, and quarantine</description>
-    <message>Authentication is required to change HyprAV's configuration or quarantine state</message>
+  <action id="org.hyprav.avctl.scan">
+    <description>Run an on-demand HyprAV scan</description>
+    <message>Authentication is required to scan a file with HyprAV</message>
     <defaults>
       <allow_any>no</allow_any>
       <allow_inactive>no</allow_inactive>
       <allow_active>auth_admin</allow_active>
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">@BINDIR@/avctl</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">scan</annotate>
+  </action>
+
+  <action id="org.hyprav.avctl.quarantine">
+    <description>Restore or delete a HyprAV-quarantined file</description>
+    <message>Authentication is required to restore or delete a quarantined file</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@BINDIR@/avctl</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">quarantine</annotate>
+  </action>
+
+  <action id="org.hyprav.avctl.trust">
+    <description>Modify HyprAV's trust list</description>
+    <message>Authentication is required to change HyprAV's trust list</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@BINDIR@/avctl</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">trust</annotate>
+  </action>
+
+  <action id="org.hyprav.avctl.protect">
+    <description>Modify HyprAV's protected-path list</description>
+    <message>Authentication is required to change HyprAV's protected-path list</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@BINDIR@/avctl</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">protect</annotate>
+  </action>
+
+  <action id="org.hyprav.avctl.daemon-policy">
+    <description>Change HyprAV's daemon fail-open/fail-closed policy</description>
+    <message>Authentication is required to change HyprAV's daemon policy</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@BINDIR@/avctl</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">policy</annotate>
+  </action>
+
+  <action id="org.hyprav.avctl.load">
+    <description>Bulk-load HyprAV signatures, trust list, and protected paths from a file</description>
+    <message>Authentication is required to load HyprAV configuration from a file</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@BINDIR@/avctl</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">load</annotate>
+  </action>
+
+  <action id="org.hyprav.avctl.add-signature">
+    <description>Add a HyprAV signature</description>
+    <message>Authentication is required to add a HyprAV signature</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@BINDIR@/avctl</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">add</annotate>
+  </action>
+
+  <action id="org.hyprav.avctl.del-signature">
+    <description>Remove a HyprAV signature</description>
+    <message>Authentication is required to remove a HyprAV signature</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@BINDIR@/avctl</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">del</annotate>
   </action>
 </policyconfig>
