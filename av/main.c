@@ -1790,12 +1790,20 @@ static int __init av_init(void) {
 
   /* max_active bounded to av_wq_max_active rather than 0 (per-CPU
    * default, effectively unbounded for WQ_UNBOUND at this queue's
-   * volume) - caps how many *_work_fn instances run concurrently
-   * across all CPUs, so a burst (build, checkout, rm -rf) can't spin
-   * up hundreds of worker threads all doing PATH_MAX kmallocs and
-   * path resolution at once. Pending items beyond that still queue
-   * (bounded separately by av_inflight_work / AV_MAX_INFLIGHT_WORK
-   * above) and drain as workers free up, rather than being dropped. */
+   * volume) - bounds how many *_work_fn instances run concurrently, so
+   * a burst (build, checkout, rm -rf) can't spin up hundreds of worker
+   * threads all doing PATH_MAX kmallocs and path resolution at once.
+   * NOT a strict, single-counter global ceiling: current kernels
+   * enforce WQ_UNBOUND's max_active per NUMA node (proportional to
+   * each node's online CPUs, with an 8-per-node floor), so the true
+   * aggregate across all nodes can exceed this value by a small,
+   * kernel-version-dependent amount on multi-node hardware - see
+   * WQ_UNBOUND_MAX_ACTIVE's own kernel documentation. Still the right
+   * knob for this module's actual goal (avoid an unbounded pile of
+   * concurrent worker threads under a burst), just not an exact one.
+   * Pending items beyond that still queue (bounded separately by
+   * av_inflight_work / AV_MAX_INFLIGHT_WORK above) and drain as
+   * workers free up, rather than being dropped. */
   if (av_wq_max_active < AV_WQ_MAX_ACTIVE_MIN ||
       av_wq_max_active > AV_WQ_MAX_ACTIVE_MAX) {
     pr_warn("kernel-av: av_wq_max_active=%d out of range [%d,%d], "
