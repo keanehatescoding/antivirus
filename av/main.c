@@ -181,6 +181,23 @@ static struct workqueue_struct *av_wq;
 #define AV_EXEC_RESERVED_WORK 512
 static atomic_t av_inflight_work = ATOMIC_INIT(0);
 
+/* Workqueue concurrency cap - see the comment beside its use in
+ * av_init() below. A module param (not just a compile-time constant)
+ * since the right value depends on the host's core count and how
+ * bursty its exec/write workload is, which an operator shouldn't have
+ * to rebuild the module to tune. Read-only: av_wq is created once at
+ * module load from this value, so changing it after load wouldn't do
+ * anything without also plumbing workqueue_set_max_active() through a
+ * write callback - not worth the complexity for a knob this rarely
+ * touched. Set it at `insmod`/modprobe.d time instead. */
+#define AV_WQ_MAX_ACTIVE_DEFAULT 32
+#define AV_WQ_MAX_ACTIVE_MIN 1
+#define AV_WQ_MAX_ACTIVE_MAX 4096
+static int av_wq_max_active = AV_WQ_MAX_ACTIVE_DEFAULT;
+module_param(av_wq_max_active, int, 0444);
+MODULE_PARM_DESC(av_wq_max_active,
+                 "Max concurrently-running kernel_av_wq workers (default 32, clamped to [1,4096])");
+
 static inline bool av_work_admit_capped(unsigned int cap) {
   if (atomic_inc_return(&av_inflight_work) > cap) {
     atomic_dec(&av_inflight_work);
@@ -1768,8 +1785,15 @@ static int __init av_init(void) {
    * path resolution at once. Pending items beyond that still queue
    * (bounded separately by av_inflight_work / AV_MAX_INFLIGHT_WORK
    * above) and drain as workers free up, rather than being dropped. */
-#define AV_WQ_MAX_ACTIVE 32
-  av_wq = alloc_workqueue("kernel_av_wq", WQ_UNBOUND, AV_WQ_MAX_ACTIVE);
+  if (av_wq_max_active < AV_WQ_MAX_ACTIVE_MIN ||
+      av_wq_max_active > AV_WQ_MAX_ACTIVE_MAX) {
+    pr_warn("kernel-av: av_wq_max_active=%d out of range [%d,%d], "
+            "using default %d\n",
+            av_wq_max_active, AV_WQ_MAX_ACTIVE_MIN, AV_WQ_MAX_ACTIVE_MAX,
+            AV_WQ_MAX_ACTIVE_DEFAULT);
+    av_wq_max_active = AV_WQ_MAX_ACTIVE_DEFAULT;
+  }
+  av_wq = alloc_workqueue("kernel_av_wq", WQ_UNBOUND, av_wq_max_active);
   if (!av_wq) {
     pr_err("kernel-av: failed to allocate workqueue\n");
     ret = -ENOMEM;
