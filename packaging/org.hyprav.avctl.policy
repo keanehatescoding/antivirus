@@ -22,9 +22,10 @@
   Read-only verbs (list, trust list, protect list, policy get, save)
   never route through pkexec (av-gui calls avctl directly for those -
   see README.md's "Reads go through two unprivileged paths" and
-  av_gui/procfs_client.py) and so aren't listed below; a bare
-  `pkexec avctl list` will now fail with "no such action" instead of
-  prompting for auth it doesn't need, which is the point.
+  av_gui/procfs_client.py) and so aren't listed below. When no
+  exec.path and exec.argv1 rule matches, pkexec falls back to
+  org.freedesktop.policykit.exec and may request generic authorization
+  instead of failing with "no such action."
 
   avd itself independently re-checks the caller's uid via SO_PEERCRED
   for its own three privileged verbs (see handle_control_line() in
