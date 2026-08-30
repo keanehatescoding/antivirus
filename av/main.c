@@ -207,7 +207,7 @@ static atomic_t av_inflight_work = ATOMIC_INIT(0);
 static int av_wq_max_active = AV_WQ_MAX_ACTIVE_DEFAULT;
 module_param(av_wq_max_active, int, 0444);
 MODULE_PARM_DESC(av_wq_max_active,
-                 "Max concurrently-running kernel_av_wq workers (default 32, clamped to [1, the kernel's own WQ_UNBOUND_MAX_ACTIVE ceiling])");
+                 "Max concurrently-running kernel_av_wq workers (default 32; must be within [1, the kernel's own WQ_UNBOUND_MAX_ACTIVE ceiling], otherwise reset to the default)");
 
 static inline bool av_work_admit_capped(unsigned int cap) {
   if (atomic_inc_return(&av_inflight_work) > cap) {
