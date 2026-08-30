@@ -1030,11 +1030,29 @@ static int do_quarantine_list(void)
     return 0;
 }
 
+/* Not tied to a kernel-side field width like AVCTL_HASH_HEX_MAXLEN/
+ * AVCTL_NAME_MAXLEN above - avd's own quarantine_id_valid()
+ * (userspace/avd/avd.c) is what actually bounds a valid id, at
+ * PATH_MAX - 32. This just needs to be comfortably under
+ * do_quarantine_restore()/do_quarantine_delete()'s cmd[300] buffer so
+ * check_field_len() rejects an oversized/newline-containing id before
+ * the snprintf() truncation check below even runs. */
+#define AVCTL_ID_MAXLEN 255
+
 static int do_quarantine_restore(const char *id)
 {
     char cmd[300];
     char *resp, *cursor;
     int n;
+
+    /* Every other field formatted into a control-socket command
+     * (hash, name, path) is run through check_field_len(), which
+     * rejects both an over-length value and one containing an
+     * embedded newline - a raw newline here would let a
+     * caller-supplied id make avd's line-oriented parser see a
+     * second, attacker-influenced line. */
+    if (check_field_len("id", id, AVCTL_ID_MAXLEN))
+        return 1;
 
     /* Reject up front rather than letting snprintf() silently
      * truncate: a truncated id would ask avd to restore a DIFFERENT
@@ -1064,6 +1082,11 @@ static int do_quarantine_delete(const char *id)
     char cmd[300];
     char *resp, *cursor;
     int n;
+
+    /* See do_quarantine_restore()'s identical check for why this
+     * rejects an embedded newline. */
+    if (check_field_len("id", id, AVCTL_ID_MAXLEN))
+        return 1;
 
     /* See do_quarantine_restore()'s identical check for why this
      * rejects rather than lets snprintf() silently truncate. */
