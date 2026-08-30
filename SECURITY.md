@@ -8,13 +8,14 @@ or PR.
 
 ## Supported versions
 
-There are no tagged releases yet; development happens on a single branch.
-Only current `master` HEAD is supported.
+Tags exist for past milestones (`v0.1.0` through `v0.9.0`), but `master`
+is currently well over a hundred commits ahead of the latest one. Only
+current `master` HEAD is supported.
 
-| Branch             | Supported |
-| ------------------- | :-------: |
-| `master` (HEAD)     | ✅ |
-| anything else        | ❌ |
+| Version                    | Supported |
+| ---------------------------- | :-------: |
+| `master` (HEAD)               | ✅ |
+| `v0.9.0` and earlier tags     | ❌ |
 
 When you report something, include the commit SHA you tested against
 (`git rev-parse HEAD`).
