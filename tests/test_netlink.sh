@@ -158,7 +158,12 @@ else
 fi
 
 OVERSIZED_OUT="$("$HELPER" oversized-verdict 2>&1)"
-if echo "$OVERSIZED_OUT" | grep -qi 'invalid'; then
+# Unlike malformed-verdict (av_nl_verdict_doit() returns -EINVAL
+# directly), this one is rejected by genl's own nla_policy length
+# check in the kernel's validate_nla() before doit() ever runs, which
+# reports a string past its policy .len as -ERANGE ("Input data out
+# of range" via libnl's nl_geterror()), not -EINVAL - match either.
+if echo "$OVERSIZED_OUT" | grep -qi 'invalid\|out of range'; then
     pass "AV_C_VERDICT with an over-limit AV_A_RULE_NAME rejected"
 else
     fail "oversized AV_C_VERDICT not rejected as expected: $OVERSIZED_OUT"
