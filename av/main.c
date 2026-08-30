@@ -192,11 +192,19 @@ static atomic_t av_inflight_work = ATOMIC_INIT(0);
  * touched. Set it at `insmod`/modprobe.d time instead. */
 #define AV_WQ_MAX_ACTIVE_DEFAULT 32
 #define AV_WQ_MAX_ACTIVE_MIN 1
-#define AV_WQ_MAX_ACTIVE_MAX 4096
+/* WQ_MAX_ACTIVE (include/linux/workqueue.h) is the kernel's own hard
+ * cap on any workqueue's max_active, currently 2048 - alloc_workqueue()
+ * silently clamps anything above that down to it rather than erroring,
+ * so accepting a wider range here would let an operator set e.g. 3000
+ * and have this module's own module param keep reporting 3000 while
+ * the actually-effective cap was quietly 2048. Matching the kernel's
+ * own limit means every value this module accepts is also the value
+ * that actually takes effect. */
+#define AV_WQ_MAX_ACTIVE_MAX 2048
 static int av_wq_max_active = AV_WQ_MAX_ACTIVE_DEFAULT;
 module_param(av_wq_max_active, int, 0444);
 MODULE_PARM_DESC(av_wq_max_active,
-                 "Max concurrently-running kernel_av_wq workers (default 32, clamped to [1,4096])");
+                 "Max concurrently-running kernel_av_wq workers (default 32, clamped to [1,2048] - 2048 is the kernel's own WQ_MAX_ACTIVE ceiling)");
 
 static inline bool av_work_admit_capped(unsigned int cap) {
   if (atomic_inc_return(&av_inflight_work) > cap) {
