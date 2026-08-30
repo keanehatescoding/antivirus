@@ -3,13 +3,23 @@
 # (manual maintainer-script version, not dh_dkms - see debian/rules).
 #
 # The version isn't hardcoded here - maintainer scripts are static
-# files, not templated by debhelper, so it's derived at runtime from
-# the /usr/src/hyprav-av-<version>/ directory debian/rules created
-# (named after DEB_VERSION_UPSTREAM at build time).
+# files, not templated by debhelper, so it's derived at runtime - from
+# dpkg's own package database, not by globbing
+# /usr/src/hyprav-av-*/. That directory can (transiently, e.g. after a
+# failed/partial upgrade) hold more than one version, and `ls -d ... |
+# head -n1` picked whichever one the filesystem/locale order happened
+# to return first, not necessarily the version actually being
+# configured here. By the time postinst runs, dpkg has already
+# unpacked and registered the new version, so hyprav-dkms's own
+# Version field always names exactly the version this invocation is
+# for. Strip the epoch and Debian revision the same way
+# /usr/share/dpkg/pkg-info.mk derives DEB_VERSION_UPSTREAM at build
+# time (which is what named the /usr/src/hyprav-av-<version>/
+# directory in the first place), so the two stay in sync.
 set -e
 
-DKMS_DIR=$(ls -d /usr/src/hyprav-av-*/ 2>/dev/null | head -n1)
-DKMS_VER=$(basename "$DKMS_DIR" | sed 's/^hyprav-av-//')
+DKMS_VER=$(dpkg-query -W -f='${Version}' hyprav-dkms 2>/dev/null | \
+    sed -E 's/^[0-9]+://; s/-[^-]+$//')
 
 case "$1" in
     configure)
