@@ -36,7 +36,8 @@ install: checkdeps
 	cp -r av_gui "$(DESTDIR)$(LIBDIR)/"
 	find "$(DESTDIR)$(LIBDIR)/av_gui" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 	mkdir -p "$(DESTDIR)$(PREFIX)/bin"
-	sed -e 's|@LIBDIR@|$(LIBDIR)|g' bin/av-gui > "$(DESTDIR)$(PREFIX)/bin/av-gui"
+	sed -e 's|@LIBDIR@|$(LIBDIR)|g' -e 's|@BINDIR@|$(PREFIX)/bin|g' bin/av-gui \
+		> "$(DESTDIR)$(PREFIX)/bin/av-gui"
 	chmod 0755 "$(DESTDIR)$(PREFIX)/bin/av-gui"
 	mkdir -p "$(DESTDIR)$(DATADIR)/applications"
 	sed -e 's|@BINDIR@|$(PREFIX)/bin|g' data/av-gui.desktop \

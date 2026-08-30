@@ -29,4 +29,22 @@ case "$LIBDIR" in
     @*@) LIBDIR="$(cd "$(dirname "$0")/.." && pwd)" ;;
 esac
 
+# @BINDIR@ is the same $(PREFIX)/bin this script itself was installed
+# into (see data/av-gui.desktop's Exec= for the same substitution) -
+# avctl is installed to that same PREFIX by convention (debian/rules
+# passes the identical PREFIX to both components' install targets), so
+# this is how pkexec_helper.py learns the real AVCTL_PATH instead of
+# relying on its own hardcoded fallback, which only matches a default
+# PREFIX=/usr/local install. Left unset when run uninstalled (the
+# @BINDIR@ placeholder was never substituted) - pkexec wouldn't find
+# an installed policy to authorize against in that case anyway.
+BINDIR="@BINDIR@"
+case "$BINDIR" in
+    @*@) BINDIR="" ;;
+esac
+if [ -n "$BINDIR" ]; then
+    AVCTL_PATH="$BINDIR/avctl"
+    export AVCTL_PATH
+fi
+
 PYTHONPATH="$LIBDIR${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m av_gui.app "$@"

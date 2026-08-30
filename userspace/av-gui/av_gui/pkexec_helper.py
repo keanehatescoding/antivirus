@@ -23,7 +23,11 @@ from . import host_exec
 # org.freedesktop.policykit.exec.path in packaging/org.hyprav.avctl.policy,
 # and userspace/avctl/Makefile install target's own comment on why) -
 # this must match that install location, not wherever av-gui itself
-# happens to be run from.
+# happens to be run from. bin/av-gui's launcher shim sets AVCTL_PATH
+# for real installs, derived from the same PREFIX avctl itself was
+# installed to (see that script's @BINDIR@ comment) - the
+# /usr/local/bin/avctl literal below is only a fallback for a
+# from-source/dev run where that substitution never happened.
 AVCTL_PATH = os.environ.get("AVCTL_PATH", "/usr/local/bin/avctl")
 
 
