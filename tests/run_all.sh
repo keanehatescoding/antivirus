@@ -47,6 +47,12 @@ echo "### test_avd_socket.sh (avd control socket / avctl scan+quarantine) ###"
 "$REPO_ROOT/tests/test_avd_socket.sh" || FAIL=1
 
 echo
+echo "### test_netlink.sh (kernel<->avd Generic Netlink channel) ###"
+# Builds+loads/unloads the module and starts/stops avd itself, same
+# shape as test_avd_socket.sh above.
+"$REPO_ROOT/tests/test_netlink.sh" || FAIL=1
+
+echo
 if [ "$FAIL" -ne 0 ]; then
     echo "run_all.sh: one or more test suites FAILED"
     exit 1

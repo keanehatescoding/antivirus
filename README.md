@@ -189,7 +189,18 @@ tests/
                         restore/delete - builds+loads the module AND
                         starts avd itself, against a throwaway
                         quarantine dir/socket path
-  run_all.sh           - runs all five of the above (used by the pre-push hook)
+  test_netlink.sh      - kernel<->avd Generic Netlink channel tests:
+                        unprivileged/malformed/oversized AV_C_VERDICT
+                        rejection, portid pinning, daemon
+                        re-registration, and a real
+                        AV_C_SCAN_REQUEST/AV_C_VERDICT round trip
+                        (clean + YARA-only malicious) - builds+loads
+                        the module AND starts avd itself, same shape
+                        as test_avd_socket.sh
+  netlink_test_helper.c - throwaway genl client built only by
+                        test_netlink.sh, never linked into avd or any
+                        shipped binary
+  run_all.sh           - runs all six of the above (used by the pre-push hook)
   benchmark.sh          - v1.0.0: execve/openat hook overhead, module
                         loaded vs unloaded (needs root, real numbers only
                         from your VM - see the benchmarking section)
@@ -511,9 +522,26 @@ safe to run anywhere:
   sudo tests/test_avd_socket.sh
   ```
 
+- **`test_netlink.sh`** — exercises the kernel↔avd Generic Netlink
+  channel (see docs/netlink-protocol.md): a non-`CAP_NET_ADMIN` process
+  can't send `AV_C_REGISTER`/`AV_C_VERDICT` (via `setpriv`, skipped
+  gracefully if unavailable), a malformed or oversized-attribute
+  `AV_C_VERDICT` is rejected without wedging the module, only the
+  currently-registered daemon's portid is honored ("portid pinning"),
+  a second `AV_C_REGISTER` replaces the first (documented, known
+  behavior), and a real end-to-end `AV_C_SCAN_REQUEST`/`AV_C_VERDICT`
+  round trip via the real `avd` binary for both a clean and a
+  YARA-only-malicious (no signature-table entry) exec. Builds a
+  throwaway genl test client (`netlink_test_helper.c`, never linked
+  into `avd` or any shipped binary) alongside the module/avd/avctl.
+  Needs root:
+  ```bash
+  sudo tests/test_netlink.sh
+  ```
+
 Run `test_detection.sh` from a fresh snapshot when testing anything that
 touches `handler_pre`/`av_work_fn` — same caution as manual testing.
-All five scripts print a pass/fail count and exit non-zero on any
+All six scripts print a pass/fail count and exit non-zero on any
 failure, so they're suitable for a pre-commit or pre-tag check even
 without CI runtime support.
 
