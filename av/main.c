@@ -192,19 +192,22 @@ static atomic_t av_inflight_work = ATOMIC_INIT(0);
  * touched. Set it at `insmod`/modprobe.d time instead. */
 #define AV_WQ_MAX_ACTIVE_DEFAULT 32
 #define AV_WQ_MAX_ACTIVE_MIN 1
-/* WQ_MAX_ACTIVE (include/linux/workqueue.h) is the kernel's own hard
- * cap on any workqueue's max_active, currently 2048 - alloc_workqueue()
- * silently clamps anything above that down to it rather than erroring,
- * so accepting a wider range here would let an operator set e.g. 3000
- * and have this module's own module param keep reporting 3000 while
- * the actually-effective cap was quietly 2048. Matching the kernel's
- * own limit means every value this module accepts is also the value
- * that actually takes effect. */
-#define AV_WQ_MAX_ACTIVE_MAX 2048
+/* WQ_UNBOUND_MAX_ACTIVE (include/linux/workqueue.h) is the kernel's
+ * own hard cap on an unbound workqueue's max_active - alloc_workqueue()
+ * silently clamps anything above it down rather than erroring, so
+ * accepting a wider range here would let an operator set a value this
+ * module keeps reporting back via the module param while the
+ * actually-effective cap was silently lower. This constant has moved
+ * across kernel versions (512 for a long time, later bumped higher) -
+ * referencing it directly, rather than hardcoding whatever number
+ * today's kernel happens to define, means this bound always matches
+ * whatever the kernel THIS MODULE WAS ACTUALLY BUILT AGAINST enforces,
+ * regardless of version. */
+#define AV_WQ_MAX_ACTIVE_MAX WQ_UNBOUND_MAX_ACTIVE
 static int av_wq_max_active = AV_WQ_MAX_ACTIVE_DEFAULT;
 module_param(av_wq_max_active, int, 0444);
 MODULE_PARM_DESC(av_wq_max_active,
-                 "Max concurrently-running kernel_av_wq workers (default 32, clamped to [1,2048] - 2048 is the kernel's own WQ_MAX_ACTIVE ceiling)");
+                 "Max concurrently-running kernel_av_wq workers (default 32, clamped to [1, the kernel's own WQ_UNBOUND_MAX_ACTIVE ceiling])");
 
 static inline bool av_work_admit_capped(unsigned int cap) {
   if (atomic_inc_return(&av_inflight_work) > cap) {
@@ -1785,7 +1788,7 @@ static int __init av_init(void) {
     goto err_daemon_policy_proc;
   }
 
-  /* max_active bounded to AV_WQ_MAX_ACTIVE rather than 0 (per-CPU
+  /* max_active bounded to av_wq_max_active rather than 0 (per-CPU
    * default, effectively unbounded for WQ_UNBOUND at this queue's
    * volume) - caps how many *_work_fn instances run concurrently
    * across all CPUs, so a burst (build, checkout, rm -rf) can't spin
