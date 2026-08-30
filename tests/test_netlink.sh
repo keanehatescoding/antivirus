@@ -148,6 +148,25 @@ fi
 
 section "unprivileged AV_C_REGISTER/AV_C_VERDICT rejected"
 if [ "$HAVE_SETPRIV" -eq 1 ]; then
+    # $HELPER lives under the repo tree, unlike test_avd_socket.sh's
+    # equivalent check (which only connects to a socket path, never
+    # execs a repo binary as "nobody"). If any parent directory isn't
+    # traversable by "nobody" (e.g. a home directory checked out at
+    # its common 0750 default), setpriv fails with "Permission
+    # denied" before av_nl_register_doit() ever runs - which doesn't
+    # contain "permitted", so the greps below would misreport a real
+    # environment limitation as a detection FAIL. Probe once and
+    # downgrade to SKIP instead.
+    UNPRIV_PROBE="$(setpriv --reuid="$NOBODY_UID" --regid="$NOBODY_GID" --clear-groups "$HELPER" resolve 2>&1)"
+    if echo "$UNPRIV_PROBE" | grep -qi 'permission denied'; then
+        echo "  SKIP: \"nobody\" cannot execute $HELPER (a parent directory isn't"
+        echo "  traversable by it, e.g. a repo checked out under a 0750 home dir)"
+        HAVE_SETPRIV=0
+        SKIPPED_VIA_PROBE=1
+    fi
+fi
+
+if [ "$HAVE_SETPRIV" -eq 1 ]; then
     UNPRIV_REGISTER="$(setpriv --reuid="$NOBODY_UID" --regid="$NOBODY_GID" --clear-groups "$HELPER" register 2>&1)"
     if echo "$UNPRIV_REGISTER" | grep -qi 'permitted'; then
         pass "unprivileged AV_C_REGISTER rejected"
@@ -161,7 +180,7 @@ if [ "$HAVE_SETPRIV" -eq 1 ]; then
     else
         fail "unprivileged AV_C_VERDICT not rejected as expected: $UNPRIV_VERDICT"
     fi
-else
+elif [ "${SKIPPED_VIA_PROBE:-0}" -ne 1 ]; then
     echo "  SKIP: setpriv not installed, or the \"nobody\" user/group could not"
     echo "  be resolved - skipping unprivileged-sender checks"
     echo "  (Arch/CachyOS: sudo pacman -S util-linux / Debian/Ubuntu: sudo apt install util-linux)"
@@ -242,9 +261,15 @@ coproc DAEMON_X { "$HELPER" batch 2>&1; }
 # `coproc` without NAME uses $COPROC_PID) - already declared above so
 # `set -u` doesn't choke if cleanup() runs before this line does.
 
+# -t 10 on every read below: if a helper process ever exited or wedged
+# without printing a reply line, an untimed `read -u` would block this
+# whole script (and therefore run_all.sh/the pre-push hook) forever
+# instead of failing loudly. A timeout just leaves the target variable
+# empty, which the existing pass/fail greps below already treat as a
+# failure - no separate handling needed.
 DAEMON_X_REG=""
 printf 'register\n' >&"${DAEMON_X[1]}"
-read -r -u "${DAEMON_X[0]}" DAEMON_X_REG
+read -r -t 10 -u "${DAEMON_X[0]}" DAEMON_X_REG
 if echo "$DAEMON_X_REG" | grep -q '^OK'; then
     pass "daemon X's AV_C_REGISTER accepted"
 else
@@ -253,7 +278,7 @@ fi
 
 DAEMON_X_VERDICT_BEFORE=""
 printf 'verdict 1 0\n' >&"${DAEMON_X[1]}"
-read -r -u "${DAEMON_X[0]}" DAEMON_X_VERDICT_BEFORE
+read -r -t 10 -u "${DAEMON_X[0]}" DAEMON_X_VERDICT_BEFORE
 if echo "$DAEMON_X_VERDICT_BEFORE" | grep -q '^OK'; then
     pass "AV_C_VERDICT from X accepted while X is still the pinned daemon"
 else
@@ -264,7 +289,7 @@ coproc DAEMON_Y { "$HELPER" batch 2>&1; }
 
 DAEMON_Y_REG=""
 printf 'register\n' >&"${DAEMON_Y[1]}"
-read -r -u "${DAEMON_Y[0]}" DAEMON_Y_REG
+read -r -t 10 -u "${DAEMON_Y[0]}" DAEMON_Y_REG
 if echo "$DAEMON_Y_REG" | grep -q '^OK'; then
     pass "daemon Y's AV_C_REGISTER (second registration) accepted"
 else
@@ -275,7 +300,7 @@ fi
 # above, must now be rejected, and Y's must now be accepted.
 DAEMON_X_VERDICT_AFTER=""
 printf 'verdict 1 0\n' >&"${DAEMON_X[1]}"
-read -r -u "${DAEMON_X[0]}" DAEMON_X_VERDICT_AFTER
+read -r -t 10 -u "${DAEMON_X[0]}" DAEMON_X_VERDICT_AFTER
 if echo "$DAEMON_X_VERDICT_AFTER" | grep -qi 'permitted'; then
     pass "AV_C_VERDICT from X (old daemon) rejected after Y registered - portid was replaced, not just added"
 else
@@ -284,7 +309,7 @@ fi
 
 DAEMON_Y_VERDICT=""
 printf 'verdict 1 0\n' >&"${DAEMON_Y[1]}"
-read -r -u "${DAEMON_Y[0]}" DAEMON_Y_VERDICT
+read -r -t 10 -u "${DAEMON_Y[0]}" DAEMON_Y_VERDICT
 if echo "$DAEMON_Y_VERDICT" | grep -q '^OK'; then
     pass "AV_C_VERDICT from Y (new daemon) accepted"
 else
