@@ -89,7 +89,7 @@ builds.
 tests/run_all.sh
 ```
 
-Runs the five automated test scripts (two standalone, three needing a VM
+Runs the six automated test scripts (two standalone, four needing a VM
 and root). See the wiki's **Testing** page for what each one checks and for
 manual, step-by-step walkthroughs of every detection layer (signatures,
 YARA, ELF analysis, entropy, fuzzy hashing, behavioral heuristics,
