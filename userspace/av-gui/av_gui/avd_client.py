@@ -129,6 +129,12 @@ def verdicts_recent(n=100):
         "id", "timestamp", "pid", "path", "sha256", "verdict",
         "rule_name", "score", "on_demand",
     ]
+    for r in rows:
+        if len(r) != len(keys):
+            raise AvdError(
+                f"malformed VERDICTS RECENT row: expected {len(keys)} "
+                f"fields, got {len(r)}"
+            )
     return [dict(zip(keys, r)) for r in rows]
 
 
@@ -137,4 +143,10 @@ def quarantine_list():
     rule_name, sha256."""
     rows = _parse_rows(_request("QUARANTINE LIST"))
     keys = ["id", "original_path", "timestamp", "rule_name", "sha256"]
+    for r in rows:
+        if len(r) != len(keys):
+            raise AvdError(
+                f"malformed QUARANTINE LIST row: expected {len(keys)} "
+                f"fields, got {len(r)}"
+            )
     return [dict(zip(keys, r)) for r in rows]
