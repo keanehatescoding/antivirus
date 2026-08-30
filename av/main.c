@@ -181,6 +181,34 @@ static struct workqueue_struct *av_wq;
 #define AV_EXEC_RESERVED_WORK 512
 static atomic_t av_inflight_work = ATOMIC_INIT(0);
 
+/* Workqueue concurrency cap - see the comment beside its use in
+ * av_init() below. A module param (not just a compile-time constant)
+ * since the right value depends on the host's core count and how
+ * bursty its exec/write workload is, which an operator shouldn't have
+ * to rebuild the module to tune. Read-only: av_wq is created once at
+ * module load from this value, so changing it after load wouldn't do
+ * anything without also plumbing workqueue_set_max_active() through a
+ * write callback - not worth the complexity for a knob this rarely
+ * touched. Set it at `insmod`/modprobe.d time instead. */
+#define AV_WQ_MAX_ACTIVE_DEFAULT 32
+#define AV_WQ_MAX_ACTIVE_MIN 1
+/* WQ_UNBOUND_MAX_ACTIVE (include/linux/workqueue.h) is the kernel's
+ * own hard cap on an unbound workqueue's max_active - alloc_workqueue()
+ * silently clamps anything above it down rather than erroring, so
+ * accepting a wider range here would let an operator set a value this
+ * module keeps reporting back via the module param while the
+ * actually-effective cap was silently lower. This constant has moved
+ * across kernel versions (512 for a long time, later bumped higher) -
+ * referencing it directly, rather than hardcoding whatever number
+ * today's kernel happens to define, means this bound always matches
+ * whatever the kernel THIS MODULE WAS ACTUALLY BUILT AGAINST enforces,
+ * regardless of version. */
+#define AV_WQ_MAX_ACTIVE_MAX WQ_UNBOUND_MAX_ACTIVE
+static int av_wq_max_active = AV_WQ_MAX_ACTIVE_DEFAULT;
+module_param(av_wq_max_active, int, 0444);
+MODULE_PARM_DESC(av_wq_max_active,
+                 "Max concurrently-running kernel_av_wq workers (default 32; must be within [1, the kernel's own WQ_UNBOUND_MAX_ACTIVE ceiling], otherwise reset to the default)");
+
 static inline bool av_work_admit_capped(unsigned int cap) {
   if (atomic_inc_return(&av_inflight_work) > cap) {
     atomic_dec(&av_inflight_work);
@@ -1760,16 +1788,31 @@ static int __init av_init(void) {
     goto err_daemon_policy_proc;
   }
 
-  /* max_active bounded to AV_WQ_MAX_ACTIVE rather than 0 (per-CPU
+  /* max_active bounded to av_wq_max_active rather than 0 (per-CPU
    * default, effectively unbounded for WQ_UNBOUND at this queue's
-   * volume) - caps how many *_work_fn instances run concurrently
-   * across all CPUs, so a burst (build, checkout, rm -rf) can't spin
-   * up hundreds of worker threads all doing PATH_MAX kmallocs and
-   * path resolution at once. Pending items beyond that still queue
-   * (bounded separately by av_inflight_work / AV_MAX_INFLIGHT_WORK
-   * above) and drain as workers free up, rather than being dropped. */
-#define AV_WQ_MAX_ACTIVE 32
-  av_wq = alloc_workqueue("kernel_av_wq", WQ_UNBOUND, AV_WQ_MAX_ACTIVE);
+   * volume) - bounds how many *_work_fn instances run concurrently, so
+   * a burst (build, checkout, rm -rf) can't spin up hundreds of worker
+   * threads all doing PATH_MAX kmallocs and path resolution at once.
+   * NOT a strict, single-counter global ceiling: current kernels
+   * enforce WQ_UNBOUND's max_active per NUMA node (proportional to
+   * each node's online CPUs, with an 8-per-node floor), so the true
+   * aggregate across all nodes can exceed this value by a small,
+   * kernel-version-dependent amount on multi-node hardware - see
+   * WQ_UNBOUND_MAX_ACTIVE's own kernel documentation. Still the right
+   * knob for this module's actual goal (avoid an unbounded pile of
+   * concurrent worker threads under a burst), just not an exact one.
+   * Pending items beyond that still queue (bounded separately by
+   * av_inflight_work / AV_MAX_INFLIGHT_WORK above) and drain as
+   * workers free up, rather than being dropped. */
+  if (av_wq_max_active < AV_WQ_MAX_ACTIVE_MIN ||
+      av_wq_max_active > AV_WQ_MAX_ACTIVE_MAX) {
+    pr_warn("kernel-av: av_wq_max_active=%d out of range [%d,%d], "
+            "using default %d\n",
+            av_wq_max_active, AV_WQ_MAX_ACTIVE_MIN, AV_WQ_MAX_ACTIVE_MAX,
+            AV_WQ_MAX_ACTIVE_DEFAULT);
+    av_wq_max_active = AV_WQ_MAX_ACTIVE_DEFAULT;
+  }
+  av_wq = alloc_workqueue("kernel_av_wq", WQ_UNBOUND, av_wq_max_active);
   if (!av_wq) {
     pr_err("kernel-av: failed to allocate workqueue\n");
     ret = -ENOMEM;
