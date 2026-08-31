@@ -121,7 +121,7 @@ quarantine (list/restore/delete), an on-demand scan page, and
 signatures/trust list/protected paths/policy management, sitting on
 top of avd and avctl. A normal desktop app, not a daemon - launch it
 on demand. Privileged actions go through pkexec avctl, gated by the
-org.hyprav.avctl.manage polkit action installed by the base package.
+per-verb org.hyprav.avctl.* polkit actions installed by the base package.
 
 %prep
 %autosetup -n antivirus-%{gitcommit}

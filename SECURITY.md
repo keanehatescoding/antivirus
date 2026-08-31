@@ -30,7 +30,7 @@ When you report something, include the commit SHA you tested against
 - `userspace/avd/` — the root-privileged scanning/quarantine daemon and its
   Unix control socket (`/run/avd/control.sock`)
 - `userspace/avctl/` — the CLI and its polkit policy (`org.hyprav.avctl.policy`,
-  the `org.hyprav.avctl.manage` action)
+  the per-verb `org.hyprav.avctl.*` actions)
 - `userspace/av-gui/` — the GTK4 console and its `pkexec` bridge to `avctl`
 - Packaging under `debian/` and `packaging/` — the DKMS `postinst`/`prerm`
   scripts run as root, so a bad one is a real finding, not just a build issue
