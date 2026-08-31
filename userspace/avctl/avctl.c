@@ -678,14 +678,15 @@ static int do_protect(int argc, char **argv)
             fprintf(stderr, "avctl: protect add requires an absolute path\n");
             return 1;
         }
-        /* Reject up front rather than letting snprintf() silently
-         * truncate: a truncated write would ask the kernel side to
-         * protect/unprotect a DIFFERENT (shorter) path than the one
-         * printed back to the caller, with no error either side. */
-        if (strlen(argv[3]) >= PATH_MAX) {
-            fprintf(stderr, "avctl: path too long (max %d bytes)\n", PATH_MAX - 1);
+        /* check_field_len(), not just a length check: a truncated
+         * write would ask the kernel side to protect a DIFFERENT
+         * (shorter) path than the one printed back to the caller with
+         * no error either side, and '\n' is a legal byte in a Linux
+         * filename that would truncate the same way at the kernel's
+         * line-oriented proc parser - same reasoning as
+         * do_quarantine_restore()'s identical check. */
+        if (check_field_len("path", argv[3], PATH_MAX - 1))
             return 1;
-        }
         n = snprintf(cmd, sizeof(cmd), "add %s", argv[3]);
         if (n < 0 || (size_t)n >= sizeof(cmd)) {
             fprintf(stderr, "avctl: path too long to format\n");
@@ -702,10 +703,10 @@ static int do_protect(int argc, char **argv)
             usage(argv[0]);
             return 1;
         }
-        if (strlen(argv[3]) >= PATH_MAX) {
-            fprintf(stderr, "avctl: path too long (max %d bytes)\n", PATH_MAX - 1);
+        /* See the "add" branch above for why this is check_field_len()
+         * and not just a length check. */
+        if (check_field_len("path", argv[3], PATH_MAX - 1))
             return 1;
-        }
         n = snprintf(cmd, sizeof(cmd), "del %s", argv[3]);
         if (n < 0 || (size_t)n >= sizeof(cmd)) {
             fprintf(stderr, "avctl: path too long to format\n");
@@ -940,10 +941,16 @@ static int do_scan(const char *path)
         fprintf(stderr, "avctl: scan requires an absolute path\n");
         return 1;
     }
-    if (strlen(path) >= PATH_MAX) {
-        fprintf(stderr, "avctl: path too long (max %d bytes)\n", PATH_MAX - 1);
+    /* check_field_len() rather than a bare length check: a path is a
+     * filename component away from user control (av-gui's scan page
+     * takes it straight from a GtkFileDialog, and '\n' is a legal
+     * byte in a Linux filename), and this is formatted straight into
+     * a line-oriented control-socket command below - see
+     * do_quarantine_restore()'s identical comment for why an embedded
+     * newline here would let a crafted path smuggle a second,
+     * attacker-influenced line past avd's parser. */
+    if (check_field_len("path", path, PATH_MAX - 1))
         return 1;
-    }
     n = snprintf(cmd, sizeof(cmd), "SCAN %s", path);
     if (n < 0 || (size_t)n >= sizeof(cmd)) {
         fprintf(stderr, "avctl: path too long to format\n");
