@@ -19,8 +19,12 @@ set -eu
 # (installed below from ./av-gui-launcher) for the runtime side of
 # this.
 #
-# NOT build-tested end-to-end in this checkout (no appimagetool
-# available) - review before relying on it.
+# Build-tested end-to-end (real appimagetool, real av-gui launch out
+# of the resulting AppImage via APPIMAGE_EXTRACT_AND_RUN=1 - GTK4
+# initialized and rendered against the host's own GTK4/PyGObject, as
+# documented above) - see .github/workflows/release.yml's
+# build-appimage job, which runs this exact script in CI on every
+# tagged release.
 #
 # Needs appimagetool on PATH (or $APPIMAGETOOL) -
 # https://github.com/AppImage/AppImageKit/releases

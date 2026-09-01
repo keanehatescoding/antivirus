@@ -15,6 +15,14 @@ name: Build distro packages
 on:
   push:
   pull_request:
+  # Lets .github/workflows/release.yml (tag-triggered) run these same
+  # three jobs via `uses: ./.github/workflows/build-packages.yml`
+  # instead of re-declaring deb/arch/rpm build steps a second time in
+  # a second file - one definition, two callers. Every step below
+  # behaves identically either way except the version-stamping steps
+  # in build-deb/build-rpm, which are gated on `startsWith(github.ref,
+  # 'refs/tags/')` and so are no-ops on a plain push/PR trigger.
+  workflow_call:
 
 # None of these jobs push, comment, or otherwise write anything back to
 # the repository - read-only is enough, and persist-credentials: false
@@ -44,6 +52,26 @@ jobs:
             build-essential dpkg-dev debhelper \
             pkg-config libnl-genl-3-dev libyara-dev libfuzzy-dev \
             python3-gi gir1.2-gtk-4.0
+
+      # debian/changelog's only entry is hardcoded "hyprav (0.9.0) ...",
+      # written once when packaging was added and never bumped since -
+      # DEB_VERSION_UPSTREAM (debian/rules, via
+      # /usr/share/dpkg/pkg-info.mk) reads straight off that top entry,
+      # so every .deb this job ever built reported "0.9.0" regardless
+      # of what was actually tagged. Harmless for the push/PR case
+      # (nothing here claims to be a release), but wrong for
+      # release.yml's tag-triggered call - stamp the real tag onto the
+      # top entry's version field first, release builds only. Only the
+      # first `(...)` on the file is touched (sed's `0,/re/` limits the
+      # match to the top entry), which is exactly the version field per
+      # debian's changelog format.
+      - name: Stamp debian/changelog with the release tag's version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euxo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "0,/([^)]*)/{s/([^)]*)/(${VERSION})/}" debian/changelog
+          dpkg-parsechangelog -SVersion
 
       - name: dpkg-buildpackage
         # Unsigned (-us -uc) - no GPG key available in CI, and these
@@ -175,23 +203,20 @@ jobs:
   build-rpm:
     runs-on: ubuntu-latest
     container: fedora:latest
-    # Originally added because BuildRequires: tlsh-devel never resolved
-    # on any shipping Fedora release (see packaging/fedora/hyprav.spec's
-    # history) - that's fixed now that TLSH is vendored pure C, no
-    # external package needed. Left in place because a second, separate,
-    # pre-existing bug in this job was masked behind that one and is now
-    # the thing actually failing it: packaging/fedora/hyprav.spec hardcodes
-    # `%global gitcommit 32d9af8`, which wins over this job's own
-    # `--define "gitcommit $GITCOMMIT"` when the spec is parsed (RPM's
-    # %global unconditionally redefines, it doesn't just provide a
-    # default), so the tarball %prep looks for under _sourcedir never
-    # matches the one `git archive` actually produced below. Not a TLSH
-    # issue - the spec's gitcommit needs to come from something that
-    # isn't clobbered by %global (e.g. this job sed-patching the spec's
-    # %global line to the real $GITCOMMIT before rpmbuild runs, rather
-    # than relying on --define alone). continue-on-error still keeps
-    # this from blocking CI/PRs over it. Drop this once THAT's fixed.
-    continue-on-error: true
+    # No longer continue-on-error: this job used to have two stacked
+    # bugs - BuildRequires: tlsh-devel never resolving on any shipping
+    # Fedora release (fixed by vendoring TLSH as pure C, see
+    # packaging/fedora/hyprav.spec's history) and the spec's
+    # `%global gitcommit 32d9af8` winning over this job's own
+    # `--define "gitcommit $GITCOMMIT"` (RPM's %global unconditionally
+    # redefines, it doesn't just provide a default), which made the
+    # %prep tarball lookup never match what `git archive` actually
+    # produced below. The guarded `%if 0%{!?gitcommit:1}` form
+    # (packaging/fedora/hyprav.spec) fixes the second one - confirmed
+    # with a real rpmbuild run against this exact job's steps
+    # (podman run fedora:latest, same dnf builddep + rpmbuild -bb
+    # invocation), which produced Version: 0.9.0.129.g<the checked-out
+    # commit>, not the stale 32d9af8 fallback.
     steps:
       # git must exist BEFORE actions/checkout runs, not after - a
       # real CI run showed that without it, checkout silently falls
@@ -247,18 +272,37 @@ jobs:
           dnf builddep -y --define "gitcommit $GITCOMMIT" \
             packaging/fedora/hyprav.spec
 
+      # Release builds only (see build-deb's changelog-stamping step
+      # above for the same reasoning): hyprav.spec's Version defaults
+      # to a fixed placeholder string (packaging/fedora/hyprav.spec's
+      # own comment on the pkgversion guard) - override it with the
+      # actual tag so the built .rpm's Version matches what
+      # packaging/arch/PKGBUILD's pkgver() already computes for the
+      # same commit (same `git describe --long --tags` transform,
+      # dots-only so it's valid in both an rpm Version and a pacman
+      # pkgver - neither format allows a literal hyphen).
+      - name: Determine RPM package version (release builds only)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euxo pipefail
+          RPM_PKGVERSION="$(git describe --long --tags | sed 's/^v//; s/-/.r/; s/-/./')"
+          echo "RPM_PKGVERSION=$RPM_PKGVERSION" >> "$GITHUB_ENV"
+
       - name: rpmbuild
         run: |
-          rpmbuild -bb \
-            --define "gitcommit $GITCOMMIT" \
+          set -euxo pipefail
+          defines=(--define "gitcommit $GITCOMMIT")
+          if [ -n "${RPM_PKGVERSION:-}" ]; then
+            defines+=(--define "pkgversion $RPM_PKGVERSION")
+          fi
+          rpmbuild -bb "${defines[@]}" \
             --define "_sourcedir $GITHUB_WORKSPACE/rpmbuild-sources" \
             --define "_rpmdir $GITHUB_WORKSPACE/rpmbuild-out" \
             packaging/fedora/hyprav.spec
 
       - name: Upload .rpm packages
-        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: rpm-packages
           path: rpmbuild-out/**/*.rpm
-          if-no-files-found: warn
+          if-no-files-found: error
