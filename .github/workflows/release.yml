@@ -114,8 +114,15 @@ jobs:
       # releases of appimagetool itself, continuous is the one every
       # AppImage build guide points at.
       - name: Download appimagetool
+        # -f: a 4xx/5xx response otherwise still exits 0 with the error
+        # page saved as the "binary", which chmod +x happily accepts -
+        # the failure only surfaces later, confusingly, when
+        # build-appimage.sh tries to execute it. --retry/--retry-all-errors
+        # covers a transient GitHub Releases hiccup instead of failing
+        # the whole job on the first blip.
         run: |
-          curl -Lo /usr/local/bin/appimagetool \
+          curl -fsSL --retry 3 --retry-all-errors \
+            -o /usr/local/bin/appimagetool \
             https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x /usr/local/bin/appimagetool
 
