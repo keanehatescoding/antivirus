@@ -42,8 +42,25 @@
 %global gitcommit 32d9af8
 %endif
 
+# Same guarded-%%global idiom as gitcommit above, so a real release
+# build (.github/workflows/release.yml, triggered on a v* tag) can pass
+# --define "pkgversion $VERSION" and get a Version: that actually
+# matches the tag, instead of every release forever reporting this
+# fallback string. Kept as a SEPARATE macro from gitcommit rather than
+# folding gitcommit into Version's default here, because the two serve
+# different callers: gitcommit only affects %prep's Source0 tarball
+# lookup (build-packages.yml's PR/push CI job passes only gitcommit,
+# never pkgversion, and must keep resolving Source0 to the commit it
+# actually checked out); pkgversion only affects the displayed/compared
+# package Version. A plain, unguarded rpmbuild (no --define at all,
+# e.g. a developer running this spec by hand) still gets exactly
+# today's literal string, unchanged.
+%if 0%{!?pkgversion:1}
+%global pkgversion 0.9.0.129.g%{gitcommit}
+%endif
+
 Name:           hyprav
-Version:        0.9.0.129.g%{gitcommit}
+Version:        %{pkgversion}
 Release:        1%{?dist}
 Summary:        Kernel-level Linux antivirus (kprobe execve/file monitor + YARA/entropy/fuzzy-hash daemon)
 

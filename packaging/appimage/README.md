@@ -37,9 +37,12 @@ extra burden - it's the same `python-gobject`/`gtk4` (Arch),
 
 ## Build
 
-Not build-tested end-to-end in the environment this was written in
-(no `appimagetool` available there) - review before relying on it.
-Needs `appimagetool` on `PATH` (or `$APPIMAGETOOL`):
+Build-tested end-to-end: `appimagetool` produced a working AppImage
+and running it (`APPIMAGE_EXTRACT_AND_RUN=1 ./HyprAV-avgui-*.AppImage`,
+needed where FUSE isn't available - see `.github/workflows/release.yml`)
+actually launched av-gui against the host's GTK4. Also built on every
+tagged release by that workflow's `build-appimage` job. Needs
+`appimagetool` on `PATH` (or `$APPIMAGETOOL`):
 <https://github.com/AppImage/AppImageKit/releases>
 
 ```bash

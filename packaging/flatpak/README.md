@@ -40,7 +40,9 @@ this manifest's `finish-args` grant:
 Bump `runtime-version` in `org.hyprav.avgui.yml` to whatever's
 currently available first if `49` has aged out (already bumped once
 from `47`, which fell off Flathub between this manifest being written
-and first built).
+and first built). Also built (bundled as a single-file `.flatpak` via
+`flatpak build-bundle`) on every tagged release by
+`.github/workflows/release.yml`'s `build-flatpak` job.
 
 ```bash
 flatpak install flathub org.gnome.Platform//49 org.gnome.Sdk//49

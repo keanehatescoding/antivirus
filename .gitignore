@@ -26,3 +26,12 @@ packaging/flatpak/.flatpak-builder/
 packaging/flatpak/build-dir/
 packaging/appimage/AppDir/
 packaging/appimage/*.AppImage
+# packaging/flatpak/README.md's own build instructions (and
+# .github/workflows/release.yml's build-flatpak job) run
+# flatpak-builder from the repo root, not from packaging/flatpak/ -
+# same build-dir/.flatpak-builder cache dirs as above, plus the
+# exported repo and bundled .flatpak, just rooted here instead.
+/.flatpak-builder/
+/build-dir/
+/repo/
+/*.flatpak
