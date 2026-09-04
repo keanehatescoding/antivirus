@@ -13,6 +13,7 @@
  */
 
 #include <linux/ctype.h>
+#include <linux/capability.h>
 #include <linux/hashtable.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -32,6 +33,15 @@ struct av_sig_entry {
 };
 
 #define SIGTABLE_BITS 10 /* 1024 buckets - plenty for a student-scale DB */
+/* Upper bound on stored signatures - without this, repeated `sig add`
+writes grow the table without limit (each entry is a kmalloc'd node),
+so a privileged writer (or, before the capable() gate below, any
+writer that passes the proc file's DAC check) could exhaust kernel
+memory. 8192 matches MAX_BEHAVIOR_ENTRIES in behavior.c and caps
+worst-case usage at ~1-2MB. Enforced inside av_sigtable_add() under
+sig_lock so the check and the insert below are atomic - no TOCTOU
+between "table not full" and "insert". Returns -ENOSPC when full. */
+#define MAX_SIG_ENTRIES 8192
 static DEFINE_HASHTABLE(sig_table, SIGTABLE_BITS);
 static DEFINE_MUTEX(sig_lock);
 static size_t sig_count; /* read via READ_ONCE(), written under sig_lock - see
@@ -125,6 +135,14 @@ int av_sigtable_add(enum av_algo algo, const char *hex, const char *name) {
       kfree(e);
       return -EEXIST;
     }
+  }
+  /* Bound total entries - see MAX_SIG_ENTRIES above. Checked under
+   * sig_lock alongside the duplicate check and the insert, so two
+   * concurrent adds cannot both pass the check and overshoot the cap. */
+  if (READ_ONCE(sig_count) >= MAX_SIG_ENTRIES) {
+    mutex_unlock(&sig_lock);
+    kfree(e);
+    return -ENOSPC;
   }
   hash_add(sig_table, &e->node, hex_key(e->hex));
   WRITE_ONCE(sig_count, sig_count + 1);
@@ -225,6 +243,15 @@ static ssize_t sig_proc_write(struct file *file, const char __user *ubuf,
   enum av_algo algo;
   int n;
 
+  /* DAC mode (0644) alone only checks UID 0, not the capability that
+   * UID actually holds - any root process, even one that dropped
+   * CAP_SYS_ADMIN, could otherwise mutate the signature table. The
+   * netlink channel gates the equivalent operation behind
+   * GENL_ADMIN_PERM; this proc handler needs the same bar. Matches
+   * trust_proc_write() (behavior.c) and protected_proc_write(). */
+  if (!capable(CAP_SYS_ADMIN))
+    return -EPERM;
+
   /* Reject oversized writes instead of silently truncating them.
    * The old min(count, sizeof(kbuf) - 1) read a short prefix of an
    * over-long write but still returned `count` as if the whole
@@ -252,8 +279,9 @@ static ssize_t sig_proc_write(struct file *file, const char __user *ubuf,
     if (n < 4)
       return -EINVAL;
     /* Propagate the real error - specifically -EEXIST for a
-     * duplicate add - rather than flattening every failure to
-     * -EINVAL. avctl's write_command() reports strerror(errno),
+     * duplicate add and -ENOSPC when the table is at MAX_SIG_ENTRIES -
+     * rather than flattening every failure to -EINVAL. avctl's
+     * write_command() reports strerror(errno),
      * so this is the difference between a caller seeing "File
      * exists" (duplicate, an actionable answer) and "Invalid
      * argument" (which duplicate adds used to report too, even
