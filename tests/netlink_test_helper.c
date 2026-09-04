@@ -17,7 +17,7 @@
  *   netlink_test_helper malformed-verdict
  *   netlink_test_helper oversized-verdict
  *   netlink_test_helper batch
- *
+ *   netlink_test_helper drain      (batch mode: discard queued input - see below)
  * Every mode above but `batch` is single-shot: connect, do one thing,
  * exit - which also closes the socket, so its kernel-assigned netlink
  * portid is gone by the time the next invocation runs (a *different*
@@ -42,10 +42,14 @@
 #include <netlink/genl/ctrl.h>
 #include <netlink/genl/genl.h>
 #include <netlink/netlink.h>
+#include <netlink/socket.h>
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "../av/netlink_proto.h"
 
@@ -190,6 +194,38 @@ static int run_command(int argc, char **argv)
         return send_and_report(AV_C_VERDICT, fill_verdict, &a);
     }
 
+    if (!strcmp(argv[0], "drain")) {
+        /* Discard every datagram currently queued on this connection's
+         * socket, then report OK. Only meaningful in batch mode (a
+         * single-shot connection starts with an empty buffer by
+         * construction), where the socket stays open across shell
+         * commands: while this connection's portid is the registered
+         * daemon, *every* exec on the system - including the test
+         * script's own external commands - makes the kernel unicast an
+         * async SCAN_REQUEST at it, and a queued upcall makes the next
+         * synchronous nl_send_sync() fail with NLE_SEQ_MISMATCH (plus
+         * stale replies corrupting later reads). Draining immediately
+         * before a register/verdict, with builtins only in between,
+         * keeps each exchange exact. Raw recv(), not libnl dispatch:
+         * consumption is all that matters here, and bypassing libnl
+         * keeps its sequence/callback state untouched for the real
+         * exchanges that follow. */
+        static char buf[8192];
+        for (;;) {
+            ssize_t n = recv(nl_socket_get_fd(sock), buf, sizeof(buf),
+                             MSG_DONTWAIT);
+            if (n >= 0)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;
+            fprintf(stderr, "ERR -1 drain recv failed: %s\n",
+                    strerror(errno));
+            return 1;
+        }
+        printf("OK\n");
+        return 0;
+    }
+
     fprintf(stderr, "ERR -1 unknown verb: %s\n", argv[0]);
     return 2;
 }
@@ -197,7 +233,7 @@ static int run_command(int argc, char **argv)
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s resolve|register|verdict|malformed-verdict|oversized-verdict|batch\n",
+        fprintf(stderr, "usage: %s resolve|register|verdict|malformed-verdict|oversized-verdict|batch|drain\n",
                 argv[0]);
         return 2;
     }
