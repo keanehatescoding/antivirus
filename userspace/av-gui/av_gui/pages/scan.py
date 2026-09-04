@@ -66,10 +66,17 @@ class Page:
         def done(ok, stdout, stderr):
             """Callback invoked after the scan command completes."""
             if ok:
-                self._result_label.set_label(stdout.strip() or "(no output)")
+                # Scan output echoes the scanned path, which may carry
+                # surrogate escapes for a non-UTF-8 filename - sanitize
+                # before handing it to Gtk.Label (see show_toast()).
+                self._result_label.set_label(
+                    path_validation.for_display(stdout.strip() or "(no output)")
+                )
                 self._toast("Scan complete")
             else:
                 self._result_label.set_label(
-                    f"Scan failed: {(stderr or stdout).strip() or 'unknown error'}"
+                    path_validation.for_display(
+                        f"Scan failed: {(stderr or stdout).strip() or 'unknown error'}"
+                    )
                 )
         pkexec_helper.run_privileged(["scan", path], done)

@@ -102,6 +102,26 @@ class ForDisplayTest(unittest.TestCase):
         bad = b"/tmp/\x80".decode("utf-8", errors="surrogateescape")
         Gtk.Label(label=path_validation.for_display(bad))  # must not raise
 
+    def test_toast_and_scan_boundaries(self):
+        """Payloads reaching show_toast()/scan _result_label stay GTK-safe."""
+        payloads = [
+            # Quarantine id read back from avd with a non-UTF-8 byte.
+            "Restored " + b"a\x80id".decode("utf-8", "surrogateescape"),
+            # avctl stderr echoing a non-UTF-8 path.
+            "Scan failed: "
+            + b"/tmp/\x80: permission denied".decode(
+                "utf-8", "surrogateescape"
+            ),
+            # Scan stdout echoing a non-UTF-8 path.
+            b"/tmp/\x80: MALICIOUS".decode("utf-8", "surrogateescape"),
+        ]
+        for payload in payloads:
+            # Exactly what show_toast() and scan's done() now pass to
+            # Gtk.Label.set_label() - must be strict-UTF-8 encodable.
+            path_validation.for_display(payload).encode("utf-8")
+        # Normal output is byte-identical through the same path.
+        self.assertEqual(path_validation.for_display("CLEAN\n"), "CLEAN\n")
+
 
 class PrivilegedPathTest(unittest.TestCase):
     """Allowlist + trust checks for the pkexec resolver."""
