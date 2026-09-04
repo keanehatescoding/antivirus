@@ -1532,6 +1532,21 @@ static void perform_scan(int fd, const char *path, const char *sha256_hex,
   if (!compiled_rules)
     goto record;
 
+  /* sha256_fd() above drains through a dup()'d handle, and dup() shares
+   * the underlying file offset with the original fd (same open file
+   * description) - so on any on-demand scan (no precomputed sha256_hex,
+   * i.e. every avctl/GUI SCAN request) `fd` is sitting at EOF here and
+   * YARA would scan zero bytes and always report CLEAN. Rewind before
+   * scanning; yr_rules_scan_fd() does not do this itself. Fail open on
+   * a rewind error, matching this function's stance on inconclusive
+   * information elsewhere. */
+  if (lseek(fd, 0, SEEK_SET) < 0) {
+    fprintf(stderr, "avd: lseek(\"%s\", SEEK_SET) before YARA scan failed: "
+                    "%s - failing open\n",
+            path, strerror(errno));
+    goto record;
+  }
+
   ret = yr_rules_scan_fd(compiled_rules, fd, 0, yara_callback, &ctx,
                          SCAN_TIMEOUT_SECS);
   if (ret != ERROR_SUCCESS) {

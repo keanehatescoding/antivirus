@@ -128,7 +128,13 @@ install: avd
 		../../packaging/avd.service > "$(DESTDIR)$(UNITDIR)/avd.service"
 	chmod 0644 "$(DESTDIR)$(UNITDIR)/avd.service"
 	mkdir -p "$(DESTDIR)$(SYSCONFDIR)/rules"
-	install -m 0644 ../../rules/*.yar "$(DESTDIR)$(SYSCONFDIR)/rules/"
+	# Explicit production rule list, NOT a ../../rules/*.yar glob: test/demo
+	# rules (see tests/fixtures/test.yar, whose weight=100 override=true
+	# Suspicious_Shell rule false-positives on any script containing
+	# "/bin/sh -i") must never ship to production even if one is ever
+	# placed back under rules/ by mistake.
+	install -m 0644 ../../rules/heuristics.yar ../../rules/elf_analysis.yar \
+		../../rules/entropy.yar "$(DESTDIR)$(SYSCONFDIR)/rules/"
 	install -m 0644 ../../corpus/fuzzy_hashes.txt \
 		"$(DESTDIR)$(SYSCONFDIR)/fuzzy_hashes.txt"
 	install -m 0644 ../../corpus/tlsh_hashes.txt \

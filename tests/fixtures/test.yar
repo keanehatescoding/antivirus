@@ -1,5 +1,14 @@
 /*
- * test.yar - a minimal rule set for testing the YARA integration itself.
+ * test.yar - TEST FIXTURE ONLY, never installed to production (see
+ * userspace/avd/Makefile's explicit production rule list and
+ * packaging/arch/PKGBUILD's backup=() array, neither of which
+ * references this file). It lives under tests/fixtures/ rather than
+ * rules/ precisely so the install globs can never pick it up: its
+ * Suspicious_Shell_Reverse_Shell_String rule (weight=100,
+ * override=true on the literal string "/bin/sh -i") would otherwise
+ * quarantine legitimate scripts on every fresh install (issue #86).
+ *
+ * A minimal rule set for testing the YARA integration itself.
  *
  * This deliberately does NOT duplicate the SHA-256 EICAR signature
  * already in av/main.c - the point is to prove the YARA path works
