@@ -83,7 +83,7 @@ for f in "${STAGED[@]}"; do
                 FAIL=1
             fi
             ;;
-        rules/*.yar|rules/*.yara)
+        rules/*.yar|rules/*.yara|tests/fixtures/*.yar|tests/fixtures/*.yara)
             if command -v yara >/dev/null 2>&1; then
                 echo "  - yara --compiled-rules check: $f"
                 # `yara <rules> <target>` requires a scan target even to

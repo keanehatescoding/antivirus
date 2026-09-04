@@ -54,6 +54,14 @@ HELPER="$TESTS_DIR/netlink_test_helper"
 # angles at once.
 TEST_TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/av_test_nl.XXXXXX")" || exit 1
 TEST_QUARANTINE_DIR="$TEST_TMP_DIR/quarantine"
+# Staged rules dir: production rules plus the tests/fixtures/test.yar
+# fixture (Suspicious_Shell_Reverse_Shell_String, needed by the
+# malicious round-trip section below). The fixture is deliberately NOT
+# part of rules/ anymore (it never ships to production - see
+# tests/fixtures/test.yar), so stage it here rather than pointing avd
+# at rules/ directly. Covered by the existing rm -rf "$TEST_TMP_DIR"
+# in cleanup().
+TEST_RULES_DIR="$TEST_TMP_DIR/rules"
 TEST_SOCK_PATH="$TEST_TMP_DIR/control.sock"
 CLEAN_PATH="$TEST_TMP_DIR/clean.sh"
 MALICIOUS_PATH="$TEST_TMP_DIR/shell.sh"
@@ -340,11 +348,13 @@ DAEMON_X_PID=""
 DAEMON_Y_PID=""
 
 section "start avd (throwaway quarantine dir + control socket)"
-mkdir -p "$TEST_QUARANTINE_DIR"
+mkdir -p "$TEST_QUARANTINE_DIR" "$TEST_RULES_DIR"
+cp "$REPO_ROOT"/rules/*.yar "$TEST_RULES_DIR"/
+cp "$REPO_ROOT"/tests/fixtures/test.yar "$TEST_RULES_DIR"/
 dmesg -C
 (
     cd "$REPO_ROOT" || exit 1
-    exec "$AVD_DIR/avd" rules corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
+    exec "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
         corpus/tlsh_hashes.txt "$TEST_SOCK_PATH" >"$AVD_LOG" 2>&1
 ) &
 AVD_PID=$!
@@ -400,7 +410,7 @@ else
 fi
 
 section "scan-request round trip end to end (malicious, YARA-only - no sigtable entry)"
-# Matches rules/test.yar's Suspicious_Shell_Reverse_Shell_String rule
+# Matches tests/fixtures/test.yar's Suspicious_Shell_Reverse_Shell_String rule
 # ("/bin/sh -i") - deliberately inert (just echoes the string, never
 # actually execs a shell) so this test can't accidentally open a real
 # shell if detection fails for some other reason. This has no sigtable

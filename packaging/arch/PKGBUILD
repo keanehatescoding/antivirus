@@ -152,7 +152,6 @@ package_hyprav() {
   backup=('etc/hyprav/rules/heuristics.yar'
           'etc/hyprav/rules/elf_analysis.yar'
           'etc/hyprav/rules/entropy.yar'
-          'etc/hyprav/rules/test.yar'
           'etc/hyprav/fuzzy_hashes.txt'
           'etc/hyprav/tlsh_hashes.txt')
 

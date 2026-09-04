@@ -39,6 +39,12 @@ AVCTL="$AVCTL_DIR/avctl"
 TEST_QUARANTINE_DIR="/tmp/av_test_quarantine_$$"
 TEST_SOCK_PATH="/tmp/av_test_control_$$.sock"
 TEST_FILE="/tmp/av_test_socket_sample_$$.bin"
+# Staged rules dir: production rules plus the tests/fixtures/test.yar
+# fixture (EICAR_Test_String, needed by the SCAN-malicious section
+# below). The fixture is deliberately NOT part of rules/ anymore (it
+# never ships to production - see tests/fixtures/test.yar), so stage
+# it here rather than pointing avd at rules/ directly.
+TEST_RULES_DIR="$(mktemp -d "${TMPDIR:-/tmp}/av_test_rules.XXXXXX")" || exit 1
 AVD_PID=""
 
 # mktemp, not a fixed /tmp/av_socket_*.log path - this script runs as
@@ -78,7 +84,7 @@ cleanup() {
         echo "  avd stopped"
     fi
     rmmod av 2>/dev/null && echo "  module unloaded" || echo "  module already unloaded"
-    rm -rf "$TEST_QUARANTINE_DIR"
+    rm -rf "$TEST_QUARANTINE_DIR" "$TEST_RULES_DIR"
     rm -f "$TEST_SOCK_PATH" "$TEST_FILE"
     rm -f "$BUILD_LOG" "$INSMOD_LOG" "$AVD_LOG" "$SOCAT_LOG" "$AVCTL_LOG" "$RMMOD_LOG"
 }
@@ -107,9 +113,11 @@ sleep 1
 
 section "start avd (throwaway quarantine dir + control socket)"
 mkdir -p "$TEST_QUARANTINE_DIR"
+cp "$REPO_ROOT"/rules/*.yar "$TEST_RULES_DIR"/
+cp "$REPO_ROOT"/tests/fixtures/test.yar "$TEST_RULES_DIR"/
 (
     cd "$REPO_ROOT" || exit 1
-    exec "$AVD_DIR/avd" rules corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
+    exec "$AVD_DIR/avd" "$TEST_RULES_DIR" corpus/fuzzy_hashes.txt "$TEST_QUARANTINE_DIR" \
         corpus/tlsh_hashes.txt "$TEST_SOCK_PATH" >"$AVD_LOG" 2>&1
 ) &
 AVD_PID=$!
