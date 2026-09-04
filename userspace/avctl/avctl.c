@@ -511,6 +511,28 @@ static int do_load(const char *path)
         const char *rest;
         int ret;
 
+        /* A line longer than sizeof(line)-1 is split by fgets() across
+         * two reads. The second half would then be parsed as its own
+         * command (wrong prefix -> confusing error, or worse a
+         * truncated "protect /very/long/path..." accepted as a
+         * different, shorter path). Detect the split by the missing
+         * trailing newline: if the next char isn't EOF the line was
+         * truncated, so drain the remainder and reject the whole line
+         * rather than parsing either half. A final line with no
+         * trailing newline reads the same way but hits EOF, which is
+         * accepted as a complete line. */
+        if (len > 0 && line[len - 1] != '\n') {
+            int c = fgetc(f);
+            if (c != EOF) {
+                fprintf(stderr,
+                        "avctl: load: line too long, rejected\n");
+                errors++;
+                while (c != '\n' && c != EOF)
+                    c = fgetc(f);
+                continue;
+            }
+        }
+
         if (len > 0 && line[len - 1] == '\n')
             line[--len] = '\0';
         if (line[0] == '\0' || line[0] == '#')
@@ -807,9 +829,21 @@ static int control_request(const char *cmd, char **out)
 
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", control_sock_path());
+    /* Reject rather than let snprintf() silently truncate: a truncated
+     * socket path would connect to the wrong socket with no error.
+     * SUN_LEN (not sizeof(addr)) sizes the address to the actual path
+     * length - AF_UNIX callers must pass the used length, and
+     * sizeof(struct sockaddr_un) overstates it whenever sun_path is
+     * shorter than the buffer (abstract-namespace NUL handling aside,
+     * our path is always a plain NUL-terminated pathname). */
+    if (snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", control_sock_path()) >= (int)sizeof(addr.sun_path)) {
+        fprintf(stderr, "avctl: control socket path too long: %s\n",
+                control_sock_path());
+        close(fd);
+        return -1;
+    }
 
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    if (connect(fd, (struct sockaddr *)&addr, SUN_LEN(&addr)) != 0) {
         fprintf(stderr,
                 "avctl: could not connect to avd control socket %s: %s\n"
                 "(is avd running? try: systemctl status avd)\n",
@@ -972,8 +1006,16 @@ static int do_scan(const char *path)
         char verdict[16] = "", rule[128] = "", sha[128] = "";
         int score = 0;
 
-        sscanf(line, "%15[^\t]\t%127[^\t]\t%d\t%127[^\t\n]", verdict, rule,
-               &score, sha);
+        /* All four fields are required: on a short match verdict/rule/
+         * sha keep their "" initializers and score stays 0, which
+         * would otherwise print a plausible-looking but wrong
+         * "CLEAN ... sha256: " line for a malformed response. */
+        if (sscanf(line, "%15[^\t]\t%127[^\t]\t%d\t%127[^\t\n]", verdict, rule,
+                   &score, sha) != 4) {
+            fprintf(stderr, "avctl: malformed scan response from avd\n");
+            free(resp);
+            return 1;
+        }
         if (!strcmp(verdict, "MALICIOUS"))
             printf("MALICIOUS: %s%s%s (score=%d)\nsha256: %s\n", path,
                    rule[0] ? " - " : "", rule, score, sha);
@@ -1026,7 +1068,15 @@ static int do_quarantine_list(void)
         if (fmt_len < 0 || (size_t)fmt_len >= sizeof(fmt))
             continue; /* shouldn't happen - fmt is generously sized */
 
-        sscanf(line, fmt, id, path, &ts, rule, sha);
+        /* Same class as do_scan()'s check above: a short match would
+         * otherwise print a row of empty/zero fields indistinguishable
+         * from a real entry. Skip the malformed row with a warning
+         * rather than rendering it. */
+        if (sscanf(line, fmt, id, path, &ts, rule, sha) != 5) {
+            fprintf(stderr,
+                    "avctl: warning: skipping malformed quarantine row\n");
+            continue;
+        }
         (void)sha; /* not shown in the table - avctl quarantine list is a
                    * human-facing summary; the GUI reads the same
                    * response and shows the full sha256 itself */
