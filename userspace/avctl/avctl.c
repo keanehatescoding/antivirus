@@ -968,7 +968,7 @@ static int do_scan(const char *path)
 {
     char cmd[PATH_MAX + 8];
     char *resp, *cursor;
-    const char *line;
+    char *line;
     int n;
 
     if (path[0] != '/') {
@@ -1004,14 +1004,49 @@ static int do_scan(const char *path)
     line = next_line(&cursor);
     if (line) {
         char verdict[16] = "", rule[128] = "", sha[128] = "";
+        char *tab1, *tab2, *tab3, *end;
+        long score_l;
         int score = 0;
 
-        /* All four fields are required: on a short match verdict/rule/
-         * sha keep their "" initializers and score stays 0, which
-         * would otherwise print a plausible-looking but wrong
-         * "CLEAN ... sha256: " line for a malformed response. */
-        if (sscanf(line, "%15[^\t]\t%127[^\t]\t%d\t%127[^\t\n]", verdict, rule,
-                   &score, sha) != 4) {
+        /* Tab-split instead of sscanf("%[\t]"): cmd_scan()
+         * (userspace/avd/avd.c) emits "CLEAN\t\t0\t<sha>" on clean
+         * paths, i.e. an empty rule field, which %[^\t] can never
+         * match (it requires at least one char). Splitting keeps the
+         * empty-rule case working while still requiring exactly four
+         * fields - a short/long row keeps its ""/0 initializers
+         * out of the output by erroring below instead of printing a
+         * plausible-looking but wrong line. */
+        tab1 = strchr(line, '\t');
+        tab2 = tab1 ? strchr(tab1 + 1, '\t') : NULL;
+        tab3 = tab2 ? strchr(tab2 + 1, '\t') : NULL;
+        if (!tab1 || !tab2 || !tab3 || strchr(tab3 + 1, '\t')) {
+            fprintf(stderr, "avctl: malformed scan response from avd\n");
+            free(resp);
+            return 1;
+        }
+        *tab1 = '\0';
+        *tab2 = '\0';
+        *tab3 = '\0';
+        if (strlen(line) == 0 || strlen(line) >= sizeof(verdict) ||
+            strlen(tab1 + 1) >= sizeof(rule) ||
+            strlen(tab3 + 1) == 0 || strlen(tab3 + 1) >= sizeof(sha)) {
+            fprintf(stderr, "avctl: malformed scan response from avd\n");
+            free(resp);
+            return 1;
+        }
+        errno = 0;
+        score_l = strtol(tab2 + 1, &end, 10);
+        if (errno != 0 || end == tab2 + 1 || *end != '\0' ||
+            score_l < INT_MIN || score_l > INT_MAX) {
+            fprintf(stderr, "avctl: malformed scan response from avd\n");
+            free(resp);
+            return 1;
+        }
+        score = (int)score_l;
+        strcpy(verdict, line);
+        strcpy(rule, tab1 + 1);
+        strcpy(sha, tab3 + 1);
+        if (strcmp(verdict, "MALICIOUS") && strcmp(verdict, "CLEAN")) {
             fprintf(stderr, "avctl: malformed scan response from avd\n");
             free(resp);
             return 1;
