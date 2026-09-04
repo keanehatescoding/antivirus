@@ -45,6 +45,14 @@ def run_privileged(args, on_done):
     stderr/stdout).
     """
     avctl = avctl_path.resolve_privileged_avctl_path()
+    if avctl is None:
+        on_done(
+            False, "",
+            "avctl not found at a trusted system path "
+            "(/usr/local/bin/avctl, /usr/bin/avctl) - "
+            "reinstall avctl before retrying privileged actions",
+        )
+        return
     argv = host_exec.host_argv(["pkexec", avctl] + list(args))
     try:
         proc = Gio.Subprocess.new(

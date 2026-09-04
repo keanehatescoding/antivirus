@@ -5,7 +5,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk
 
-from .. import avd_client, pkexec_helper
+from .. import avd_client, path_validation, pkexec_helper
 from ..widgets import build_table, clear_box
 
 
@@ -33,7 +33,9 @@ class Page:
         try:
             entries = avd_client.quarantine_list()
         except avd_client.AvdError as exc:
-            self._error_label.set_label(f"avd: {exc}")
+            self._error_label.set_label(
+                path_validation.for_display(f"avd: {exc}")
+            )
             return
 
         if not entries:
@@ -43,7 +45,7 @@ class Page:
         for e in entries:
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             for text in (e.get("original_path", "?"), e.get("rule_name") or "-", e.get("sha256") or "-"):
-                lbl = Gtk.Label(label=text, xalign=0)
+                lbl = Gtk.Label(label=path_validation.for_display(text), xalign=0)
                 lbl.set_hexpand(True)
                 lbl.set_ellipsize(3)  # Pango.EllipsizeMode.END
                 row.append(lbl)

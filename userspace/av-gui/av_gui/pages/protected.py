@@ -44,7 +44,9 @@ class Page:
         try:
             state = procfs_client.read_state()
         except procfs_client.ProcfsError as exc:
-            self._error_label.set_label(f"avctl: {exc}")
+            self._error_label.set_label(
+                path_validation.for_display(f"avctl: {exc}")
+            )
             return
 
         paths = state["protected"]
@@ -54,7 +56,9 @@ class Page:
 
         for p in paths:
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-            lbl = Gtk.Label(label=p, xalign=0)
+            # Display value is escaped for Gtk; the removal button below
+            # keeps the original byte-safe path for the avctl call.
+            lbl = Gtk.Label(label=path_validation.for_display(p), xalign=0)
             lbl.set_hexpand(True)
             lbl.set_ellipsize(3)  # Pango.EllipsizeMode.END
             row.append(lbl)

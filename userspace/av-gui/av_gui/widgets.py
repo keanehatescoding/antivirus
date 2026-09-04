@@ -5,6 +5,8 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Pango", "1.0")
 from gi.repository import Gtk, Pango
 
+from .path_validation import for_display
+
 
 def build_table(headers):
     """Returns (scrolled_window, rows_box). Callers append row widgets
@@ -40,10 +42,14 @@ def build_table(headers):
 
 def make_row(values):
     """A single table row: one Gtk.Label per value, evenly expanded
-    and ellipsized so long paths/hashes don't blow out the layout."""
+    and ellipsized so long paths/hashes don't blow out the layout.
+
+    Values come from avd/avctl and may carry surrogate escapes for
+    non-UTF-8 filenames, which Gtk.Label cannot encode - for_display()
+    maps those to visible escapes first, leaving normal values unchanged."""
     row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
     for v in values:
-        lbl = Gtk.Label(label=str(v), xalign=0)
+        lbl = Gtk.Label(label=for_display(v), xalign=0)
         lbl.set_hexpand(True)
         lbl.set_ellipsize(Pango.EllipsizeMode.END)
         row.append(lbl)

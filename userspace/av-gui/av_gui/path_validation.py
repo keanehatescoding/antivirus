@@ -49,6 +49,29 @@ def validate_absolute_path(path):
         raise ValueError("Path must be absolute.")
     if "\0" in canonical or "\n" in canonical or "\r" in canonical:
         raise ValueError("Path contains an invalid character.")
-    if len(canonical) == 0 or len(canonical) > _PATH_MAX:
+    # PATH_MAX counts pathname *bytes*, not Unicode code points - a path
+    # of multibyte characters could pass a len() check while exceeding
+    # the kernel/avd byte limit downstream, so measure the encoded form.
+    if not canonical or len(os.fsencode(canonical)) > _PATH_MAX:
         raise ValueError("Path is too long.")
     return canonical
+
+
+def for_display(text):
+    """Renders `text` safe for Gtk.Label and other UTF-8-only consumers.
+
+    avd/avctl output is decoded with errors="surrogateescape" (see
+    avd_client._request), so a non-UTF-8 filename arrives with lone
+    surrogates that Gtk.Label cannot encode (UnicodeEncodeError) and would
+    crash the refresh. This maps such bytes to visible \\xNN escapes via
+    backslashreplace - lossless and distinguishable, unlike "replace"'s
+    single U+FFFD - while leaving normal strings byte-identical.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    try:
+        return text.encode("utf-8", "surrogateescape").decode(
+            "utf-8", "backslashreplace"
+        )
+    except (UnicodeEncodeError, UnicodeDecodeError, ValueError):
+        return text.encode("utf-8", "replace").decode("utf-8")

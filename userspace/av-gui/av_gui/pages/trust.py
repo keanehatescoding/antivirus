@@ -5,7 +5,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk
 
-from .. import procfs_client, pkexec_helper
+from .. import path_validation, procfs_client, pkexec_helper
 from ..widgets import build_table, clear_box
 
 
@@ -47,7 +47,9 @@ class Page:
         try:
             state = procfs_client.read_state()
         except procfs_client.ProcfsError as exc:
-            self._error_label.set_label(f"avctl: {exc}")
+            self._error_label.set_label(
+                path_validation.for_display(f"avctl: {exc}")
+            )
             return
 
         entries = state["trust"]
@@ -58,7 +60,7 @@ class Page:
         for t in entries:
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             for text in (t["hash"], t["name"]):
-                lbl = Gtk.Label(label=text, xalign=0)
+                lbl = Gtk.Label(label=path_validation.for_display(text), xalign=0)
                 lbl.set_hexpand(True)
                 lbl.set_ellipsize(3)  # Pango.EllipsizeMode.END
                 row.append(lbl)
