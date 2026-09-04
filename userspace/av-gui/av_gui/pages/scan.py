@@ -4,7 +4,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, GLib
 
-from .. import pkexec_helper
+from .. import path_validation, pkexec_helper
 
 
 class Page:
@@ -54,9 +54,12 @@ class Page:
                 self._path_entry.set_text(path)
 
     def _on_scan(self, _button):
-        path = self._path_entry.get_text().strip()
-        if not path.startswith("/"):
-            self._result_label.set_label("Path must be absolute.")
+        try:
+            path = path_validation.validate_absolute_path(
+                self._path_entry.get_text()
+            )
+        except ValueError as exc:
+            self._result_label.set_label(str(exc))
             return
         self._result_label.set_label("Scanning…")
 

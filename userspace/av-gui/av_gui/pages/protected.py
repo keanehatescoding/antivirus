@@ -5,7 +5,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk
 
-from .. import procfs_client, pkexec_helper
+from .. import path_validation, procfs_client, pkexec_helper
 from ..widgets import build_table, clear_box
 
 
@@ -65,9 +65,12 @@ class Page:
             self._rows_box.append(row)
 
     def _on_add(self, _button):
-        path = self._path_entry.get_text().strip()
-        if not path.startswith("/"):
-            self._toast("Path must be absolute")
+        try:
+            path = path_validation.validate_absolute_path(
+                self._path_entry.get_text()
+            )
+        except ValueError as exc:
+            self._toast(str(exc))
             return
 
         def done(ok, stdout, stderr):

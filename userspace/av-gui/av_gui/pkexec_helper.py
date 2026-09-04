@@ -10,14 +10,12 @@ itself be a second always-on privileged surface to secure, worse than
 a stateless call whose entire trust boundary is pkexec plus the one
 policy file.
 """
-import os
-
 import gi
 
 gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib
 
-from . import host_exec
+from . import avctl_path, host_exec
 
 # pkexec only authorizes against avctl's INSTALLED path (see
 # org.freedesktop.policykit.exec.path in packaging/org.hyprav.avctl.policy,
@@ -26,9 +24,14 @@ from . import host_exec
 # happens to be run from. bin/av-gui's launcher shim sets AVCTL_PATH
 # for real installs, derived from the same PREFIX avctl itself was
 # installed to (see that script's @BINDIR@ comment) - the
-# /usr/local/bin/avctl literal below is only a fallback for a
+# /usr/local/bin/avctl literal in avctl_path.py is only a fallback for a
 # from-source/dev run where that substitution never happened.
-AVCTL_PATH = os.environ.get("AVCTL_PATH", "/usr/local/bin/avctl")
+#
+# $AVCTL_PATH is never trusted blindly here (issue #97): it is resolved
+# through avctl_path.resolve_privileged_avctl_path(), which requires a
+# root-owned, non-group/other-writable executable named avctl and falls
+# back to the system default otherwise, so an attacker-controlled
+# environment cannot redirect the pkexec'd binary.
 
 
 def run_privileged(args, on_done):
@@ -41,7 +44,8 @@ def run_privileged(args, on_done):
     other error", both show up the same way (an error message from
     stderr/stdout).
     """
-    argv = host_exec.host_argv(["pkexec", AVCTL_PATH] + list(args))
+    avctl = avctl_path.resolve_privileged_avctl_path()
+    argv = host_exec.host_argv(["pkexec", avctl] + list(args))
     try:
         proc = Gio.Subprocess.new(
             argv,

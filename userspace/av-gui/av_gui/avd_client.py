@@ -55,7 +55,14 @@ def _request(cmd):
             f"could not connect to avd control socket {path}: {exc} "
             "(is avd running?)"
         ) from exc
-    return b"".join(chunks).decode("utf-8", errors="replace")
+    # surrogateescape (the same codec os.fsdecode uses for filenames), not
+    # "replace": a non-UTF-8 filename - including one deliberately crafted
+    # to be unrepresentable - must surface accurately instead of having
+    # every distinct invalid byte sequence collapse into the same U+FFFD,
+    # which would hide the true name of a quarantined/flagged file (issue
+    # #97). surrogates round-trip losslessly and never raise, so one bad
+    # name still can't fail the whole list the way strict decoding would.
+    return b"".join(chunks).decode("utf-8", errors="surrogateescape")
 
 
 def _parse_rows(resp):
