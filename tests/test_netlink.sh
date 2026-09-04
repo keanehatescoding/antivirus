@@ -273,21 +273,40 @@ coproc DAEMON_X { "$HELPER" batch 2>&1; }
 # without printing a reply line, an untimed `read -u` would block this
 # whole script (and therefore run_all.sh/the pre-push hook) forever
 # instead of failing loudly. A timeout just leaves the target variable
-# empty, which the existing pass/fail greps below already treat as a
+# empty, which the existing pass/fail checks below already treat as a
 # failure - no separate handling needed.
+# Every register/verdict below is preceded by a `drain` (see the `drain`
+# verb in netlink_test_helper.c): while a fake daemon is pinned, *every*
+# exec on the system - including this script's own external commands -
+# makes the kernel unicast an async SCAN_REQUEST at that portid, and a
+# queued upcall makes the next synchronous nl_send_sync() fail with
+# "Message sequence number mismatch" (plus stale replies corrupting
+# later reads). Draining first, with builtins only ([[ ]], never grep)
+# between the drain and its reply, keeps each exchange exact.
+# drain_batch takes the coproc's write/read fds as plain numbers -
+# `>&"$wfd"` / `-u "$rfd"` resolve them exactly like the literal
+# >&"${DAEMON_X[1]}" forms below (all builtins - no exec, no poison).
+drain_batch() {
+    local wfd="$1" rfd="$2" reply=""
+    printf 'drain\n' >&"$wfd"
+    read -r -t 10 -u "$rfd" reply
+    [[ $reply == OK ]]
+}
 DAEMON_X_REG=""
+drain_batch "${DAEMON_X[1]}" "${DAEMON_X[0]}" || fail "drain of X before register failed"
 printf 'register\n' >&"${DAEMON_X[1]}"
 read -r -t 10 -u "${DAEMON_X[0]}" DAEMON_X_REG
-if echo "$DAEMON_X_REG" | grep -q '^OK'; then
+if [[ $DAEMON_X_REG == OK ]]; then
     pass "daemon X's AV_C_REGISTER accepted"
 else
     fail "daemon X's AV_C_REGISTER unexpectedly rejected: $DAEMON_X_REG"
 fi
 
 DAEMON_X_VERDICT_BEFORE=""
+drain_batch "${DAEMON_X[1]}" "${DAEMON_X[0]}" || fail "drain of X before verdict failed"
 printf 'verdict 1 0\n' >&"${DAEMON_X[1]}"
 read -r -t 10 -u "${DAEMON_X[0]}" DAEMON_X_VERDICT_BEFORE
-if echo "$DAEMON_X_VERDICT_BEFORE" | grep -q '^OK'; then
+if [[ $DAEMON_X_VERDICT_BEFORE == OK ]]; then
     pass "AV_C_VERDICT from X accepted while X is still the pinned daemon"
 else
     fail "AV_C_VERDICT from X unexpectedly rejected while X should be pinned: $DAEMON_X_VERDICT_BEFORE"
@@ -296,9 +315,10 @@ fi
 coproc DAEMON_Y { "$HELPER" batch 2>&1; }
 
 DAEMON_Y_REG=""
+drain_batch "${DAEMON_Y[1]}" "${DAEMON_Y[0]}" || fail "drain of Y before register failed"
 printf 'register\n' >&"${DAEMON_Y[1]}"
 read -r -t 10 -u "${DAEMON_Y[0]}" DAEMON_Y_REG
-if echo "$DAEMON_Y_REG" | grep -q '^OK'; then
+if [[ $DAEMON_Y_REG == OK ]]; then
     pass "daemon Y's AV_C_REGISTER (second registration) accepted"
 else
     fail "daemon Y's AV_C_REGISTER unexpectedly rejected: $DAEMON_Y_REG"
@@ -307,18 +327,20 @@ fi
 # The actual proof of replacement: X's portid, which was just accepted
 # above, must now be rejected, and Y's must now be accepted.
 DAEMON_X_VERDICT_AFTER=""
+drain_batch "${DAEMON_X[1]}" "${DAEMON_X[0]}" || fail "drain of X before re-verdict failed"
 printf 'verdict 1 0\n' >&"${DAEMON_X[1]}"
 read -r -t 10 -u "${DAEMON_X[0]}" DAEMON_X_VERDICT_AFTER
-if echo "$DAEMON_X_VERDICT_AFTER" | grep -qi 'permitted'; then
+if [[ ${DAEMON_X_VERDICT_AFTER,,} == *permitted* ]]; then
     pass "AV_C_VERDICT from X (old daemon) rejected after Y registered - portid was replaced, not just added"
 else
     fail "AV_C_VERDICT from X still accepted after Y registered - portid was NOT replaced: $DAEMON_X_VERDICT_AFTER"
 fi
 
 DAEMON_Y_VERDICT=""
+drain_batch "${DAEMON_Y[1]}" "${DAEMON_Y[0]}" || fail "drain of Y before verdict failed"
 printf 'verdict 1 0\n' >&"${DAEMON_Y[1]}"
 read -r -t 10 -u "${DAEMON_Y[0]}" DAEMON_Y_VERDICT
-if echo "$DAEMON_Y_VERDICT" | grep -q '^OK'; then
+if [[ $DAEMON_Y_VERDICT == OK ]]; then
     pass "AV_C_VERDICT from Y (new daemon) accepted"
 else
     fail "AV_C_VERDICT from Y unexpectedly rejected: $DAEMON_Y_VERDICT"
