@@ -22,8 +22,12 @@ LIBNL_CFLAGS := $(shell $(PKG_CONFIG) --cflags libnl-genl-3.0 2>/dev/null)
 LIBNL_LIBS   := $(shell $(PKG_CONFIG) --libs libnl-genl-3.0 2>/dev/null)
 YARA_CFLAGS  := $(shell $(PKG_CONFIG) --cflags yara 2>/dev/null)
 YARA_LIBS    := $(shell $(PKG_CONFIG) --libs yara 2>/dev/null)
-# libfuzzy (ssdeep) doesn't ship a pkg-config file - link manually.
-FUZZY_LIBS   := -lfuzzy
+# libfuzzy (ssdeep) ships no pkg-config file upstream, so probe for a
+# downstream-provided one first and fall back to a plain -lfuzzy link.
+# `?=` (not `:=`) so packagers can override without editing this file
+# (e.g. `make FUZZY_LIBS="-l:libfuzzy.a"`). Recursive, so the probe
+# runs when FUZZY_LIBS is used, not at Makefile-parse time.
+FUZZY_LIBS   ?= $(shell $(PKG_CONFIG) --libs fuzzy 2>/dev/null || echo "-lfuzzy")
 # TLSH fuzzy hashing (tlsh_core.c/tlsh_shim.c) is vendored pure C -
 # no libtlsh/-ltlsh, no header search path, no C++ compiler. See
 # tlsh_core.h and the top-level README's "Testing TLSH fuzzy hashing"

@@ -13,8 +13,10 @@
 # Usage:
 #   sudo scripts/av-reload.sh [state-file]
 #
-# state-file defaults to /etc/kernel-av/state.txt (same default used in
-# the README). Safe to run on a first-ever load: if the module isn't
+# state-file defaults to /etc/hyprav/state.txt (SYSCONFDIR in
+# userspace/avd/Makefile - the daemon's config lives under /etc/hyprav,
+# not the stale /etc/kernel-av this script previously defaulted to).
+# Safe to run on a first-ever load: if the module isn't
 # currently loaded, the save step is skipped; if state-file doesn't
 # exist yet, the load step is skipped and only the module's own
 # auto-seeded EICAR signature will be present.
@@ -28,7 +30,7 @@ fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AVCTL="$REPO_ROOT/userspace/avctl/avctl"
 KO="$REPO_ROOT/av/av.ko"
-STATE_FILE="${1:-/etc/kernel-av/state.txt}"
+STATE_FILE="${1:-/etc/hyprav/state.txt}"
 
 if [ ! -x "$AVCTL" ]; then
     echo "av-reload.sh: $AVCTL not built - run 'make' in userspace/avctl first" >&2

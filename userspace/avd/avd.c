@@ -134,6 +134,11 @@
  * av_policy's maxlen fields below: nothing legitimate needs more than
  * this, so reject rather than silently truncate. */
 #define AVD_SOCK_LINE_MAX (PATH_MAX + 256)
+/* Bounds one QUARANTINE LIST / VERDICTS row: two PATH_MAX-sized fields at
+ * most (id + original_path) plus the small fixed fields alongside them
+ * (timestamps, 64-char sha256, rule name, tabs/NUL). Named so the
+ * PATH_MAX*2 headroom is a documented bound, not a magic buffer size. */
+#define AVD_ROW_MAX (PATH_MAX * 2 + 256)
 /* Caps how many control-socket connections avd will service at once -
  * the socket is 0666 (see start_control_socket()'s comment), so
  * without this any local user could open connections without limit,
@@ -2315,7 +2320,7 @@ static void cmd_quarantine_list(int fd, uid_t peer_uid, bool is_root) {
     char id[PATH_MAX];
     char meta_path[PATH_MAX + 72]; /* see cmd_quarantine_restore()'s comment */
     struct quarantine_meta meta;
-    char row[PATH_MAX * 2 + 256];
+    char row[AVD_ROW_MAX];
 
     if (!visible[i]) {
       free(namelist[i]);
@@ -3081,8 +3086,24 @@ int main(int argc, char **argv) {
 
   start_time = time(NULL);
 
-  signal(SIGINT, handle_sigint);
-  signal(SIGTERM, handle_sigint);
+  /* sigaction(), not signal(): signal()'s semantics vary across libc
+   * versions (restart vs EINTR, handler persistence), while sigaction()
+   * pins exactly what we need - persistent handler, no SA_RESTART so a
+   * blocking accept()/recv() EINTRs out promptly and the shutdown path
+   * observes `running == 0` instead of hanging past it. */
+  {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_sigint;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    if (sigaction(SIGINT, &sa, NULL) != 0 ||
+        sigaction(SIGTERM, &sa, NULL) != 0) {
+      fprintf(stderr, "avd: failed to install SIGINT/SIGTERM handler: %s\n",
+              strerror(errno));
+      return 1;
+    }
+  }
   /* Without this, any write()/send() into a control-socket connection
    * whose peer already closed (a killed avctl, the GUI navigating
    * away mid-request, a network hiccup on a remote mount of the
@@ -3096,7 +3117,14 @@ int main(int argc, char **argv) {
    * SIGPIPE here is sufficient - write()/send() then simply return -1
    * with errno EPIPE instead of raising the signal, and existing error
    * handling takes it from there. */
-  signal(SIGPIPE, SIG_IGN);
+  {
+    struct sigaction sa_ign;
+    memset(&sa_ign, 0, sizeof(sa_ign));
+    sa_ign.sa_handler = SIG_IGN;
+    sigemptyset(&sa_ign.sa_mask);
+    sa_ign.sa_flags = 0;
+    sigaction(SIGPIPE, &sa_ign, NULL);
+  }
 
   if (av_tlsh_selftest() != 0) {
     fprintf(stderr, "avd: TLSH self-test failed - aborting\n");
