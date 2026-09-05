@@ -77,11 +77,15 @@ static void *worker_main(void *arg) {
   (void)arg;
 
   /* Regression check on the first half of avd's fix: the worker must
-   * inherit the target signal blocked. If it didn't, the kernel could
-   * deliver a process-directed kill here instead of to the main thread. */
+   * inherit both signals blocked (avd blocks SIGINT and SIGTERM together
+   * before pthread_create()), not just the one under test - otherwise a
+   * test run selecting only one signal could pass an implementation that
+   * blocks just that signal instead of the pair. If either isn't blocked,
+   * the kernel could deliver a process-directed kill here instead of to
+   * the main thread. */
   pthread_sigmask(SIG_BLOCK, NULL, &cur);
-  if (!sigismember(&cur, target_sig)) {
-    fprintf(stderr, "FAIL: worker thread inherited %s unblocked\n", target_name);
+  if (!sigismember(&cur, SIGINT) || !sigismember(&cur, SIGTERM)) {
+    fprintf(stderr, "FAIL: worker thread inherited SIGINT/SIGTERM unblocked\n");
     _exit(3);
   }
 
@@ -185,7 +189,7 @@ int main(int argc, char **argv) {
 
   alarm(0);
   pthread_join(worker, NULL);
-  printf("PASS: %d/%d process-directed %ss handled on main thread\n",
+  printf("PASS: %d/%d process-directed %s signals handled on main thread\n",
          ROUNDS, ROUNDS, target_name);
   return 0;
 }
