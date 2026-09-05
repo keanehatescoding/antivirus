@@ -19,7 +19,18 @@ fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AV_DIR="$REPO_ROOT/av"
-EICAR_PATH="/tmp/av_test_eicar.com"
+# Private mktemp -d, not a fixed /tmp/av_test_eicar.com path: this script
+# runs as root and writes the EICAR file plus build/insmod/rmmod logs,
+# so a predictable world-writable-directory path lets a local attacker
+# pre-plant a symlink (e.g. to /etc/...) that the root redirect/write
+# would then follow. mktemp -d's random suffix plus its 0700 mode close
+# both the guessable-name and the anyone-can-write angles at once -
+# same pattern as tests/test_netlink.sh and tests/benchmark.sh.
+TEST_TMP_DIR="$(mktemp -d -- /tmp/av_test_detection.XXXXXX)" || exit 1
+EICAR_PATH="$TEST_TMP_DIR/eicar.com"
+BUILD_LOG="$TEST_TMP_DIR/build.log"
+INSMOD_LOG="$TEST_TMP_DIR/insmod.log"
+RMMOD_LOG="$TEST_TMP_DIR/rmmod.log"
 EICAR_HASH="275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f"
 
 PASS=0
@@ -60,25 +71,25 @@ fi
 cleanup() {
     section "cleanup"
     rmmod av 2>/dev/null && echo "  module unloaded" || echo "  module already unloaded"
-    rm -f "$EICAR_PATH"
+    rm -rf "$TEST_TMP_DIR"
 }
 trap cleanup EXIT
 
 section "build"
-if make -C "$AV_DIR" "${MAKE_ARGS[@]}" clean >/tmp/build.log 2>&1 && \
-   make -C "$AV_DIR" "${MAKE_ARGS[@]}" >>/tmp/build.log 2>&1; then
+if make -C "$AV_DIR" "${MAKE_ARGS[@]}" clean >"$BUILD_LOG" 2>&1 && \
+   make -C "$AV_DIR" "${MAKE_ARGS[@]}" >>"$BUILD_LOG" 2>&1; then
     pass "module built"
 else
-    fail "build failed - see /tmp/build.log"
-    cat /tmp/build.log
+    fail "build failed - see $BUILD_LOG"
+    cat "$BUILD_LOG"
     exit 1
 fi
 
 section "load"
-if insmod "$AV_DIR/av.ko" 2>/tmp/insmod.log; then
+if insmod "$AV_DIR/av.ko" 2>"$INSMOD_LOG"; then
     pass "module loaded"
 else
-    fail "insmod failed: $(cat /tmp/insmod.log)"
+    fail "insmod failed: $(cat "$INSMOD_LOG")"
     exit 1
 fi
 sleep 1
@@ -123,10 +134,10 @@ else
 fi
 
 section "unload"
-if rmmod av 2>/tmp/rmmod.log; then
+if rmmod av 2>"$RMMOD_LOG"; then
     pass "module unloaded cleanly"
 else
-    fail "rmmod failed: $(cat /tmp/rmmod.log)"
+    fail "rmmod failed: $(cat "$RMMOD_LOG")"
 fi
 
 echo

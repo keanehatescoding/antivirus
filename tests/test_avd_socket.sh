@@ -36,9 +36,17 @@ AVD_DIR="$REPO_ROOT/userspace/avd"
 AVCTL_DIR="$REPO_ROOT/userspace/avctl"
 AVCTL="$AVCTL_DIR/avctl"
 
-TEST_QUARANTINE_DIR="/tmp/av_test_quarantine_$$"
-TEST_SOCK_PATH="/tmp/av_test_control_$$.sock"
-TEST_FILE="/tmp/av_test_socket_sample_$$.bin"
+# One private mktemp -d holding quarantine dir, socket, and sample file -
+# not PID-derived /tmp/av_test_*_$$ paths: $$ is guessable and reusable,
+# so a local attacker could pre-create any of these as a symlink and have
+# the root-run test write through it (classic /tmp race). A random-suffix
+# 0700 directory closes that off - same pattern as TEST_RULES_DIR below
+# and tests/test_netlink.sh. The socket path stays under 108 bytes for
+# AF_UNIX sun_path either way (mktemp suffix is only 6 random chars).
+TEST_TMP_DIR="$(mktemp -d -- /tmp/av_test_socket.XXXXXX)" || exit 1
+TEST_QUARANTINE_DIR="$TEST_TMP_DIR/quarantine"
+TEST_SOCK_PATH="$TEST_TMP_DIR/control.sock"
+TEST_FILE="$TEST_TMP_DIR/sample.bin"
 # Staged rules dir: production rules plus the tests/fixtures/test.yar
 # fixture (EICAR_Test_String, needed by the SCAN-malicious section
 # below). The fixture is deliberately NOT part of rules/ anymore (it
@@ -84,8 +92,7 @@ cleanup() {
         echo "  avd stopped"
     fi
     rmmod av 2>/dev/null && echo "  module unloaded" || echo "  module already unloaded"
-    rm -rf "$TEST_QUARANTINE_DIR" "$TEST_RULES_DIR"
-    rm -f "$TEST_SOCK_PATH" "$TEST_FILE"
+    rm -rf "$TEST_TMP_DIR" "$TEST_RULES_DIR"
     rm -f "$BUILD_LOG" "$INSMOD_LOG" "$AVD_LOG" "$SOCAT_LOG" "$AVCTL_LOG" "$RMMOD_LOG"
 }
 trap cleanup EXIT

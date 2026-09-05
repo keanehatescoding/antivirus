@@ -19,13 +19,19 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 echo "=== Evasion test: entropy dilution (padding a packed binary) ==="
 
-if [ ! -f /tmp/ptrace_test ]; then
-    cat > /tmp/ptrace_test.c << 'EOF'
+# Private mktemp -d, not fixed /tmp/ptrace_test* paths (see
+# test_dynamic_symbol_evasion.sh for why predictable /tmp names are a
+# symlink-planting target).
+EVASION_TMP_DIR="$(mktemp -d -- /tmp/entropy_evasion.XXXXXX)" || exit 1
+trap 'rm -rf "$EVASION_TMP_DIR"' EXIT
+
+if [ ! -f "$EVASION_TMP_DIR/ptrace_test" ]; then
+    cat > "$EVASION_TMP_DIR/ptrace_test.c" << 'EOF'
 #include <sys/ptrace.h>
 #include <stddef.h>
 int main(void) { ptrace(PTRACE_ATTACH, 1234, NULL, NULL); return 0; }
 EOF
-    gcc -o /tmp/ptrace_test /tmp/ptrace_test.c
+    gcc -o "$EVASION_TMP_DIR/ptrace_test" "$EVASION_TMP_DIR/ptrace_test.c"
 fi
 
 if ! command -v upx >/dev/null 2>&1; then
@@ -33,19 +39,19 @@ if ! command -v upx >/dev/null 2>&1; then
     exit 1
 fi
 
-upx --best -o /tmp/upx_packed_evasion /tmp/ptrace_test >/dev/null 2>&1
+upx --best -o "$EVASION_TMP_DIR/upx_packed_evasion" "$EVASION_TMP_DIR/ptrace_test" >/dev/null 2>&1
 
 echo
 echo "--- baseline: packed binary, unmodified ---"
-yara "$REPO_ROOT/rules/entropy.yar" /tmp/upx_packed_evasion
+yara "$REPO_ROOT/rules/entropy.yar" "$EVASION_TMP_DIR/upx_packed_evasion"
 echo "(expect: High_Overall_Entropy)"
 
 echo
 echo "--- evasion attempt: pad with 500KB of zero bytes ---"
-cp /tmp/upx_packed_evasion /tmp/entropy_evasion
-head -c 500000 /dev/zero >> /tmp/entropy_evasion
+cp "$EVASION_TMP_DIR/upx_packed_evasion" "$EVASION_TMP_DIR/entropy_evasion"
+head -c 500000 /dev/zero >> "$EVASION_TMP_DIR/entropy_evasion"
 
-ENTROPY_RESULT="$(yara "$REPO_ROOT/rules/entropy.yar" /tmp/entropy_evasion || true)"
+ENTROPY_RESULT="$(yara "$REPO_ROOT/rules/entropy.yar" "$EVASION_TMP_DIR/entropy_evasion" || true)"
 if echo "$ENTROPY_RESULT" | grep -q High_Overall_Entropy; then
     echo "entropy.yar: still fired - entropy evasion FAILED"
     ENTROPY_EVADED=0
@@ -56,7 +62,7 @@ fi
 
 echo
 echo "--- but does the STRUCTURAL check (elf_analysis.yar) still catch it? ---"
-STRUCT_RESULT="$(yara "$REPO_ROOT/rules/elf_analysis.yar" /tmp/entropy_evasion || true)"
+STRUCT_RESULT="$(yara "$REPO_ROOT/rules/elf_analysis.yar" "$EVASION_TMP_DIR/entropy_evasion" || true)"
 echo "$STRUCT_RESULT"
 
 echo

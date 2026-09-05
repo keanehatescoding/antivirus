@@ -14,30 +14,36 @@ set -euo pipefail
 
 echo "=== Evasion test: fuzzy hash evasion via substantial modification ==="
 
-if [ ! -f /tmp/ptrace_test ]; then
-    cat > /tmp/ptrace_test.c << 'EOF'
+# Private mktemp -d, not fixed /tmp/ptrace_test* paths (see
+# test_dynamic_symbol_evasion.sh for why predictable /tmp names are a
+# symlink-planting target).
+EVASION_TMP_DIR="$(mktemp -d -- /tmp/fuzzy_evasion.XXXXXX)" || exit 1
+trap 'rm -rf "$EVASION_TMP_DIR"' EXIT
+
+if [ ! -f "$EVASION_TMP_DIR/ptrace_test" ]; then
+    cat > "$EVASION_TMP_DIR/ptrace_test.c" << 'EOF'
 #include <sys/ptrace.h>
 #include <stddef.h>
 int main(void) { ptrace(PTRACE_ATTACH, 1234, NULL, NULL); return 0; }
 EOF
-    gcc -o /tmp/ptrace_test /tmp/ptrace_test.c
+    gcc -o "$EVASION_TMP_DIR/ptrace_test" "$EVASION_TMP_DIR/ptrace_test.c"
 fi
 
-ssdeep -b /tmp/ptrace_test > /tmp/corpus_seed.txt
+ssdeep -b "$EVASION_TMP_DIR/ptrace_test" > "$EVASION_TMP_DIR/corpus_seed.txt"
 
 echo
 echo "--- baseline: minor modification (few bytes appended) ---"
-cp /tmp/ptrace_test /tmp/minor_variant
-echo "small change" >> /tmp/minor_variant
-ssdeep -m /tmp/corpus_seed.txt /tmp/minor_variant || echo "(no match - unexpected for a minor variant)"
+cp "$EVASION_TMP_DIR/ptrace_test" "$EVASION_TMP_DIR/minor_variant"
+echo "small change" >> "$EVASION_TMP_DIR/minor_variant"
+ssdeep -m "$EVASION_TMP_DIR/corpus_seed.txt" "$EVASION_TMP_DIR/minor_variant" || echo "(no match - unexpected for a minor variant)"
 
 echo
 echo "--- evasion attempt: substantial modification (+50KB random data," \
      "original file is ~16KB) ---"
-cp /tmp/ptrace_test /tmp/heavy_variant
-head -c 50000 /dev/urandom >> /tmp/heavy_variant
+cp "$EVASION_TMP_DIR/ptrace_test" "$EVASION_TMP_DIR/heavy_variant"
+head -c 50000 /dev/urandom >> "$EVASION_TMP_DIR/heavy_variant"
 
-RESULT="$(ssdeep -m /tmp/corpus_seed.txt /tmp/heavy_variant || true)"
+RESULT="$(ssdeep -m "$EVASION_TMP_DIR/corpus_seed.txt" "$EVASION_TMP_DIR/heavy_variant" || true)"
 if [ -n "$RESULT" ]; then
     echo "$RESULT"
     echo
@@ -50,7 +56,7 @@ fi
 
 echo
 echo "--- exact similarity score (via libfuzzy C API, same as avd.c uses) ---"
-cat > /tmp/fuzzy_score_check.c << 'EOF'
+cat > "$EVASION_TMP_DIR/fuzzy_score_check.c" << 'EOF'
 #include <stdio.h>
 #include <fuzzy.h>
 int main(int argc, char **argv) {
@@ -61,5 +67,5 @@ int main(int argc, char **argv) {
     return 0;
 }
 EOF
-gcc -o /tmp/fuzzy_score_check /tmp/fuzzy_score_check.c -lfuzzy
-/tmp/fuzzy_score_check /tmp/ptrace_test /tmp/heavy_variant
+gcc -o "$EVASION_TMP_DIR/fuzzy_score_check" "$EVASION_TMP_DIR/fuzzy_score_check.c" -lfuzzy
+"$EVASION_TMP_DIR/fuzzy_score_check" "$EVASION_TMP_DIR/ptrace_test" "$EVASION_TMP_DIR/heavy_variant"

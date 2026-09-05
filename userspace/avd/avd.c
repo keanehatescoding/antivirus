@@ -1191,11 +1191,31 @@ static int write_quarantine_meta(const char *dest, const struct stat *orig_st,
    * avctl.c's do_save() uses for its own "%s.tmp" append). */
   char meta_path[PATH_MAX + 8];
   FILE *f;
+  int mfd;
+  int mn;
 
-  snprintf(meta_path, sizeof(meta_path), "%s.meta", dest);
-  f = fopen(meta_path, "w");
-  if (!f)
+  /* Fail closed on truncation: a silently-truncated meta path would
+   * attach the sidecar to the wrong file (or a different directory)
+   * with no error, leaving a quarantine entry unrestorable. */
+  mn = snprintf(meta_path, sizeof(meta_path), "%s.meta", dest);
+  if (mn < 0 || (size_t)mn >= sizeof(meta_path))
     return -1;
+  /* O_EXCL|O_NOFOLLOW, not fopen("w"): dest itself is an
+   * unpredictable pid+nanotime name (see quarantine_file()), so a
+   * planted symlink here is impractical - but fopen() would still
+   * follow one if it ever existed, and O_EXCL also turns a
+   * same-nanosecond collision into a loud failure instead of a
+   * silent clobber. Best-effort either way (caller logs, quarantine
+   * itself still stands). */
+  mfd = open(meta_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+  if (mfd < 0)
+    return -1;
+  f = fdopen(mfd, "w");
+  if (!f) {
+    close(mfd);
+    unlink(meta_path);
+    return -1;
+  }
 
   fprintf(f, "ORIGINAL_MODE=%o\n", orig_st ? (orig_st->st_mode & 07777) : 0600);
   fprintf(f, "ORIGINAL_UID=%d\n", orig_st ? (int)orig_st->st_uid : 0);
@@ -1213,13 +1233,39 @@ static int write_quarantine_meta(const char *dest, const struct stat *orig_st,
 }
 
 static int ensure_quarantine_dir(void) {
+  struct stat st;
+
   if (mkdir(quarantine_dir, 0700) == 0)
     return 0;
-  if (errno == EEXIST)
-    return 0;
-  fprintf(stderr, "avd: could not create quarantine dir \"%s\": %s\n",
-          quarantine_dir, strerror(errno));
-  return -1;
+  if (errno != EEXIST) {
+    fprintf(stderr, "avd: could not create quarantine dir \"%s\": %s\n",
+            quarantine_dir, strerror(errno));
+    return -1;
+  }
+  /* mkdir() tolerating EEXIST must not treat "a symlink to /etc"
+   * the same as "the directory already exists": an attacker who
+   * pre-creates a symlink at quarantine_dir before avd starts would
+   * otherwise redirect every quarantine write through it. lstat()
+   * (not stat(), which follows the link) distinguishes the two -
+   * a symlink, a regular file, or a missing path all fail closed
+   * here instead of being followed. */
+  if (lstat(quarantine_dir, &st) != 0) {
+    fprintf(stderr, "avd: quarantine dir \"%s\" vanished after EEXIST: %s\n",
+            quarantine_dir, strerror(errno));
+    return -1;
+  }
+  if (S_ISLNK(st.st_mode)) {
+    fprintf(stderr,
+            "avd: quarantine dir \"%s\" is a symlink - refusing to follow it\n",
+            quarantine_dir);
+    return -1;
+  }
+  if (!S_ISDIR(st.st_mode)) {
+    fprintf(stderr, "avd: quarantine path \"%s\" exists but is not a directory\n",
+            quarantine_dir);
+    return -1;
+  }
+  return 0;
 }
 
 /* Fallback for quarantine_file()'s linkat() failing - see that
@@ -1356,8 +1402,18 @@ static void quarantine_file(int fd, const char *path, const char *rule_name,
    * monotonic-clock nanosecond reading is unique per call even if
    * two quarantines land in the same second. */
   clock_gettime(CLOCK_MONOTONIC, &ts);
-  snprintf(dest, sizeof(dest), "%s/%d_%ld%09ld_%s.quarantined", quarantine_dir,
-           (int)getpid(), (long)ts.tv_sec, ts.tv_nsec, base);
+  /* Fail closed on truncation: a silently-truncated dest would quarantine
+   * into the wrong directory entry (potentially outside quarantine_dir
+   * for a long attacker-influenced basename) with no error. */
+  {
+    int dn = snprintf(dest, sizeof(dest), "%s/%d_%ld%09ld_%s.quarantined",
+                        quarantine_dir, (int)getpid(), (long)ts.tv_sec,
+                        ts.tv_nsec, base);
+    if (dn < 0 || (size_t)dn >= sizeof(dest)) {
+      fprintf(stderr, "avd: quarantine destination path would truncate - refusing\n");
+      return;
+    }
+  }
 
   linked = (linkat(fd, "", AT_FDCWD, dest, AT_EMPTY_PATH) == 0);
   if (!linked) {
@@ -2206,8 +2262,24 @@ static void cmd_quarantine_restore(int fd, const char *id) {
     return;
   }
 
-  snprintf(dest, sizeof(dest), "%s/%s.quarantined", quarantine_dir, id);
-  snprintf(meta_path, sizeof(meta_path), "%s.meta", dest);
+  /* Fail closed on truncation: a silently-truncated dest would open,
+   * chmod, or rename the wrong quarantine entry with no error. The
+   * PATH_MAX*2 buffer above already gives gcc room to prove this
+   * can't happen for valid ids, so any failure here is a real logic
+   * error worth refusing rather than proceeding with a wrong path. */
+  {
+    int dn = snprintf(dest, sizeof(dest), "%s/%s.quarantined", quarantine_dir, id);
+    int mn;
+    if (dn < 0 || (size_t)dn >= sizeof(dest)) {
+      send_err(fd, "internal path error");
+      return;
+    }
+    mn = snprintf(meta_path, sizeof(meta_path), "%s.meta", dest);
+    if (mn < 0 || (size_t)mn >= sizeof(meta_path)) {
+      send_err(fd, "internal path error");
+      return;
+    }
+  }
 
   if (read_quarantine_meta(meta_path, &meta) != 0) {
     send_err(fd, "no metadata for this id (quarantined before this feature "
@@ -2222,7 +2294,10 @@ static void cmd_quarantine_restore(int fd, const char *id) {
    * final mode/owner and there is no later path-based operation left
    * for anything to race against it. */
   {
-    int qfd = open(dest, O_RDONLY);
+    /* O_NOFOLLOW: dest must be the regular quarantine file this daemon
+     * created, never a symlink planted at a predicted id. The fstat() +
+     * S_ISREG check below is the second half of the same guard. */
+    int qfd = open(dest, O_RDONLY | O_NOFOLLOW);
 
     if (qfd < 0) {
       send_err(fd, "quarantined file not found");
@@ -2295,8 +2370,20 @@ static void cmd_quarantine_delete(int fd, const char *id) {
     return;
   }
 
-  snprintf(dest, sizeof(dest), "%s/%s.quarantined", quarantine_dir, id);
-  snprintf(meta_path, sizeof(meta_path), "%s.meta", dest);
+  /* Same truncation-fail-closed reasoning as cmd_quarantine_restore(). */
+  {
+    int dn = snprintf(dest, sizeof(dest), "%s/%s.quarantined", quarantine_dir, id);
+    int mn;
+    if (dn < 0 || (size_t)dn >= sizeof(dest)) {
+      send_err(fd, "internal path error");
+      return;
+    }
+    mn = snprintf(meta_path, sizeof(meta_path), "%s.meta", dest);
+    if (mn < 0 || (size_t)mn >= sizeof(meta_path)) {
+      send_err(fd, "internal path error");
+      return;
+    }
+  }
 
   if (unlink(dest) != 0 && errno != ENOENT) {
     send_err(fd, "delete failed");
@@ -2524,18 +2611,61 @@ static void *control_conn_main(void *arg) {
 static int ensure_parent_dir(const char *path, mode_t mode) {
   char buf[PATH_MAX];
   char *dir;
+  struct stat st;
+  int sn;
 
-  snprintf(buf, sizeof(buf), "%s", path);
+  /* Fail closed on truncation: a truncated parent would mkdir/chmod
+   * the wrong directory with no error. */
+  sn = snprintf(buf, sizeof(buf), "%s", path);
+  if (sn < 0 || (size_t)sn >= sizeof(buf)) {
+    fprintf(stderr, "avd: path too long: \"%s\"\n", path);
+    return -1;
+  }
   dir = dirname(buf);
-  if (mkdir(dir, mode) == 0 || errno == EEXIST)
+  if (mkdir(dir, mode) == 0)
     return 0;
-  fprintf(stderr, "avd: could not create directory \"%s\": %s\n", dir,
-          strerror(errno));
-  return -1;
+  if (errno != EEXIST) {
+    fprintf(stderr, "avd: could not create directory \"%s\": %s\n", dir,
+            strerror(errno));
+    return -1;
+  }
+  /* Same symlink-vs-directory distinction as ensure_quarantine_dir():
+   * a pre-existing symlink at the socket's parent must not be silently
+   * accepted as "directory already exists". */
+  if (lstat(dir, &st) != 0) {
+    fprintf(stderr, "avd: directory \"%s\" vanished after EEXIST: %s\n", dir,
+            strerror(errno));
+    return -1;
+  }
+  if (S_ISLNK(st.st_mode)) {
+    fprintf(stderr,
+            "avd: socket parent \"%s\" is a symlink - refusing to follow it\n",
+            dir);
+    return -1;
+  }
+  if (!S_ISDIR(st.st_mode)) {
+    fprintf(stderr, "avd: socket parent \"%s\" exists but is not a directory\n",
+            dir);
+    return -1;
+  }
+  return 0;
 }
 
 static int start_control_socket(void) {
   struct sockaddr_un addr;
+  struct stat st;
+  int sn;
+
+  /* Quarantine and socket paths come from argv/env (see main()), so a
+   * relative value or a bare filename would silently resolve against
+   * avd's cwd - fail closed on anything that isn't an absolute path
+   * rather than binding/ writing somewhere the operator didn't mean. */
+  if (control_sock_path[0] != '/') {
+    fprintf(stderr,
+            "avd: control socket path must be absolute, got \"%s\"\n",
+            control_sock_path);
+    return -1;
+  }
 
   if (ensure_parent_dir(control_sock_path, 0755) != 0)
     return -1;
@@ -2548,8 +2678,33 @@ static int start_control_socket(void) {
 
   /* A stale socket file from a previous unclean shutdown (kill -9,
    * crash) would otherwise make bind() fail with EADDRINUSE even
-   * though nothing is listening on it any more. */
-  unlink(control_sock_path);
+   * though nothing is listening on it any more. lstat() (not stat())
+   * first so a planted symlink here is refused rather than unlinked-
+   * then-replaced: unlink() on a symlink only removes the link
+   * itself, but refusing outright keeps an attacker-planted path from
+   * ever becoming the live control socket, and a live symlink points
+   * at a target the subsequent bind() must not silently shadow. A
+   * stale real socket file (S_ISSOCK) or nothing at all are the only
+   * two states that proceed. */
+  if (lstat(control_sock_path, &st) == 0) {
+    if (S_ISLNK(st.st_mode)) {
+      fprintf(stderr,
+              "avd: control socket path \"%s\" is a symlink - refusing to replace it\n",
+              control_sock_path);
+      return -1;
+    }
+    if (!S_ISSOCK(st.st_mode)) {
+      fprintf(stderr,
+              "avd: control socket path \"%s\" exists and is not a socket - refusing to replace it\n",
+              control_sock_path);
+      return -1;
+    }
+    unlink(control_sock_path);
+  } else if (errno != ENOENT) {
+    fprintf(stderr, "avd: could not stat control socket path \"%s\": %s\n",
+            control_sock_path, strerror(errno));
+    return -1;
+  }
 
   control_sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (control_sock_fd < 0) {
@@ -2559,11 +2714,38 @@ static int start_control_socket(void) {
 
   memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
-  snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", control_sock_path);
+  /* Fail closed on truncation: a truncated socket path would bind (and
+   * chmod 0666) the wrong path with no error. Length already checked
+   * above, so this is defense in depth. */
+  sn = snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", control_sock_path);
+  if (sn < 0 || (size_t)sn >= sizeof(addr.sun_path)) {
+    fprintf(stderr, "avd: control socket path \"%s\" too long\n",
+            control_sock_path);
+    close(control_sock_fd);
+    control_sock_fd = -1;
+    return -1;
+  }
 
-  if (bind(control_sock_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+  /* SUN_LEN (used length), not sizeof(addr): AF_UNIX callers must pass
+   * the length covering sun_family plus the actual path bytes, and
+   * sizeof(struct sockaddr_un) overstates it whenever sun_path is
+   * shorter than the buffer. */
+  if (bind(control_sock_fd, (struct sockaddr *)&addr, SUN_LEN(&addr)) != 0) {
     fprintf(stderr, "avd: could not bind control socket \"%s\": %s\n",
             control_sock_path, strerror(errno));
+    close(control_sock_fd);
+    control_sock_fd = -1;
+    return -1;
+  }
+
+  /* Post-bind identity check: the path must now be the socket just
+   * bound, not something swapped in during the lstat/unlink/bind
+   * window. lstat() (not stat()) so a symlink swapped in at the last
+   * moment is seen as a symlink rather than followed to its target. */
+  if (lstat(control_sock_path, &st) != 0 || !S_ISSOCK(st.st_mode)) {
+    fprintf(stderr,
+            "avd: control socket path \"%s\" is not a socket after bind - refusing to serve it\n",
+            control_sock_path);
     close(control_sock_fd);
     control_sock_fd = -1;
     return -1;
@@ -2722,6 +2904,26 @@ int main(int argc, char **argv) {
     control_sock_path = argv[5];
   else if (getenv("AVD_SOCK_PATH"))
     control_sock_path = getenv("AVD_SOCK_PATH");
+
+  /* Fail closed on relative/empty daemon paths: both are argv/env
+   * controlled, and a relative quarantine/socket path would silently
+   * resolve against whatever cwd avd was started from - quarantine
+   * writes or the world-visible control socket landing somewhere the
+   * operator didn't mean. Absolute-path-only, same stance as
+   * start_control_socket()'s own check (which re-checks the socket
+   * path) and cmd_scan()'s absolute-path requirement. */
+  if (!quarantine_dir[0] || quarantine_dir[0] != '/') {
+    fprintf(stderr,
+            "avd: quarantine directory must be an absolute path, got \"%s\"\n",
+            quarantine_dir);
+    return 1;
+  }
+  if (!control_sock_path[0] || control_sock_path[0] != '/') {
+    fprintf(stderr,
+            "avd: control socket path must be an absolute path, got \"%s\"\n",
+            control_sock_path);
+    return 1;
+  }
 
   /* Env vars only, no positional argv slot - unlike rules_dir/
    * corpus_file/etc. above, these two aren't paths a packaging script

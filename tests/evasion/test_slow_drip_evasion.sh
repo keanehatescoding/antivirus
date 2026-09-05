@@ -33,7 +33,13 @@ if [ "$(id -u)" -ne 0 ]; then
     echo "check 'dmesg | tail' yourself."
 fi
 
-TESTDIR=/tmp/slow_drip_test
+# Private mktemp -d, not a fixed /tmp/slow_drip_test path: predictable
+# world-writable-directory names let another local user pre-plant a symlink
+# or a pre-created directory with attacker-controlled permissions that this
+# root-run script would then write through. Same pattern as
+# tests/test_netlink.sh.
+TESTDIR="$(mktemp -d -- /tmp/slow_drip_test.XXXXXX)" || exit 1
+trap 'rm -rf "$TESTDIR"' EXIT
 mkdir -p "$TESTDIR"
 cd "$TESTDIR"
 

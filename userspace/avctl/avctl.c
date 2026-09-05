@@ -302,6 +302,10 @@ static int write_command(const char *cmd)
  * leftover-corrupt-file failure mode to protect against. The summary
  * line goes to stderr instead of stdout in this mode, so stdout stays
  * pure, directly-parseable data for the caller. */
+/* save_abort() only runs after do_save() successfully created tmp_path
+ * via O_CREAT|O_EXCL|O_NOFOLLOW above, so the unlink() here removes a
+ * path this process itself created - never a pre-existing symlink it
+ * merely opened through. */
 static void save_abort(FILE *out, const char *tmp_path, int to_stdout)
 {
     if (!to_stdout) {
@@ -323,16 +327,56 @@ static int do_save(const char *path)
     if (to_stdout) {
         out = stdout;
     } else {
+        int tmp_n;
+        int tmp_fd;
+
         if (strlen(path) >= PATH_MAX) {
             fprintf(stderr, "avctl: path too long (max %d bytes)\n", PATH_MAX - 1);
             return 1;
         }
-        snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+        /* Reject rather than let snprintf() silently truncate: a
+         * truncated tmp_path would write the dump to a DIFFERENT
+         * file than the one rename()'d into place below, with no
+         * error either side. */
+        tmp_n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+        if (tmp_n < 0 || (size_t)tmp_n >= sizeof(tmp_path)) {
+            fprintf(stderr, "avctl: path too long to format\n");
+            return 1;
+        }
 
-        out = fopen(tmp_path, "w");
+        /* O_CREAT|O_EXCL|O_NOFOLLOW, not plain fopen(path, "w"): a
+         * predictable "<path>.tmp" name in an attacker-writable
+         * directory lets a local attacker pre-plant a symlink there
+         * (e.g. /tmp/state.tmp -> /etc/shadow), and fopen() would
+         * follow it and clobber the target as root. O_NOFOLLOW
+         * refuses to open through a symlink and O_EXCL refuses to
+         * open a pre-existing path at all, so either attack shape
+         * fails closed here instead. A stale regular .tmp from a
+         * previous crashed save is the only legitimate EEXIST case,
+         * and refusing to silently overwrite it is the safe default
+         * - the operator removes it and re-runs. Mode 0600: the dump
+         * replays into kernel state, so it inherits save's own
+         * umask-independent restrictiveness rather than the
+         * directory default. */
+        tmp_fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
+                      0600);
+        if (tmp_fd < 0) {
+            if (errno == EEXIST)
+                fprintf(stderr,
+                        "avctl: refusing to overwrite existing %s "
+                        "(remove it first, or check for a planted symlink): %s\n",
+                        tmp_path, strerror(errno));
+            else
+                fprintf(stderr, "avctl: could not open %s for writing: %s\n",
+                        tmp_path, strerror(errno));
+            return 1;
+        }
+        out = fdopen(tmp_fd, "w");
         if (!out) {
             fprintf(stderr, "avctl: could not open %s for writing: %s\n",
                     tmp_path, strerror(errno));
+            close(tmp_fd);
+            unlink(tmp_path);
             return 1;
         }
 
@@ -428,6 +472,14 @@ static int do_save(const char *path)
         return 0;
     }
 
+    /* fsync before rename so a crash between close and rename can't
+     * leave a zero-length .tmp that a later save would then refuse to
+     * overwrite via O_EXCL - durability of the temp file itself, not
+     * just error detection. */
+    if (fflush(out) != 0)
+        werr = 1;
+    if (fsync(fileno(out)) != 0)
+        werr = 1;
     if (fclose(out) != 0)
         werr = 1;
 
