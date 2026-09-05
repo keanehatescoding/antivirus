@@ -1191,11 +1191,31 @@ static int write_quarantine_meta(const char *dest, const struct stat *orig_st,
    * avctl.c's do_save() uses for its own "%s.tmp" append). */
   char meta_path[PATH_MAX + 8];
   FILE *f;
+  int mfd;
+  int mn;
 
-  snprintf(meta_path, sizeof(meta_path), "%s.meta", dest);
-  f = fopen(meta_path, "w");
-  if (!f)
+  /* Fail closed on truncation: a silently-truncated meta path would
+   * attach the sidecar to the wrong file (or a different directory)
+   * with no error, leaving a quarantine entry unrestorable. */
+  mn = snprintf(meta_path, sizeof(meta_path), "%s.meta", dest);
+  if (mn < 0 || (size_t)mn >= sizeof(meta_path))
     return -1;
+  /* O_EXCL|O_NOFOLLOW, not fopen("w"): dest itself is an
+   * unpredictable pid+nanotime name (see quarantine_file()), so a
+   * planted symlink here is impractical - but fopen() would still
+   * follow one if it ever existed, and O_EXCL also turns a
+   * same-nanosecond collision into a loud failure instead of a
+   * silent clobber. Best-effort either way (caller logs, quarantine
+   * itself still stands). */
+  mfd = open(meta_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+  if (mfd < 0)
+    return -1;
+  f = fdopen(mfd, "w");
+  if (!f) {
+    close(mfd);
+    unlink(meta_path);
+    return -1;
+  }
 
   fprintf(f, "ORIGINAL_MODE=%o\n", orig_st ? (orig_st->st_mode & 07777) : 0600);
   fprintf(f, "ORIGINAL_UID=%d\n", orig_st ? (int)orig_st->st_uid : 0);
@@ -1212,14 +1232,153 @@ static int write_quarantine_meta(const char *dest, const struct stat *orig_st,
   return 0;
 }
 
+/* Trust policy for one existing path component: lstat (never stat, so
+ * a symlink is seen rather than followed), must be a real directory
+ * owned by the daemon's own euid (avd runs as root, so in practice uid
+ * 0) or by root, with no group/other write access unless the sticky
+ * bit excuses it when allow_sticky_ww is set - see
+ * dir_hierarchy_trusted() for how the flag differs between final and
+ * ancestor components). Returns 0 if trusted, -1 (error printed)
+ * otherwise. */
+static int trust_one_component(const char *label, const char *comp,
+                               bool allow_sticky_ww) {
+  struct stat st;
+  uid_t euid = geteuid();
+
+  if (lstat(comp, &st) != 0) {
+    fprintf(stderr, "avd: %s \"%s\" vanished: %s\n", label, comp,
+            strerror(errno));
+    return -1;
+  }
+  if (S_ISLNK(st.st_mode)) {
+    fprintf(stderr, "avd: %s \"%s\" is a symlink - refusing to follow it\n",
+            label, comp);
+    return -1;
+  }
+  if (!S_ISDIR(st.st_mode)) {
+    fprintf(stderr, "avd: %s \"%s\" exists but is not a directory\n", label,
+            comp);
+    return -1;
+  }
+  if (st.st_uid != euid && st.st_uid != 0) {
+    fprintf(stderr,
+            "avd: %s \"%s\" is owned by uid %d - refusing to use a directory an unprivileged user controls\n",
+            label, comp, (int)st.st_uid);
+    return -1;
+  }
+  if ((st.st_mode & (S_IWGRP | S_IWOTH)) &&
+      (!allow_sticky_ww || !(st.st_mode & S_ISVTX))) {
+    fprintf(stderr,
+            "avd: %s \"%s\" is writable by other users%s - refusing to use a directory other users can modify\n",
+            label, comp,
+            allow_sticky_ww ? " without the sticky bit" : "");
+    return -1;
+  }
+  return 0;
+}
+
+/* Full-hierarchy version of the trust gate: validating only the final
+ * component leaves a gap - a writable non-sticky ancestor lets an
+ * unprivileged user rename a root-owned mode-0755 directory after the
+ * check (e.g. attacker-owned /tmp/attacker replaced wholesale, taking
+ * /tmp/attacker/socket-parent with it), and every later path-based op
+ * (bind/chmod by path, quarantine renames) re-resolves through the
+ * swapped ancestor. So every ancestor from / down is checked with the
+ * same ownership/symlink rules, shallow to deep: a symlinked ancestor
+ * fails before anything beneath it is even examined (deeper prefixes
+ * are never resolved through it), and an attacker-owned or
+ * attacker-writable one fails on its own terms. Ancestors allow the
+ * sticky exception unconditionally: a sticky ancestor (like /tmp
+ * itself) cannot be renamed by non-owners, and without the exception
+ * no chain beneath /tmp could ever validate - including the test
+ * suite's throwaway dirs. The FINAL component uses allow_sticky_ww:
+ * false keeps it strictly unshared (the quarantine dir - no group or
+ * other write at all, so nobody else can even plant fake entries
+ * there), true additionally permits a sticky-shared final dir (the
+ * socket parent - a sticky socket dir is safe because only the entry
+ * owner can touch the socket, and every socket op re-verifies it).
+ * (".." and "." segments need no special handling: neither can be a
+ * symlink, and each literal prefix is still lstat'd for
+ * ownership/mode.) Applied on every path - including after a
+ * successful mkdir(), whose fresh directory is ours but whose
+ * ancestors merely allowed its creation (root can mkdir inside an
+ * attacker-owned tree just as easily as anywhere else). Once the
+ * whole chain is trusted, no unprivileged user can modify any of it -
+ * which is also what closes the check-then-use gap without pinned fds
+ * for every later operation: the window remains in theory, but there
+ * is nobody left who is both unprivileged and able to write through
+ * it. Returns 0 if the whole chain is trusted, -1 otherwise. */
+static int dir_hierarchy_trusted(const char *label, const char *dir,
+                                 bool allow_sticky_ww) {
+  char buf[PATH_MAX];
+  size_t len, i;
+  int sn;
+
+  if (!dir[0] || dir[0] != '/') {
+    fprintf(stderr, "avd: %s \"%s\" must be an absolute path\n", label,
+            dir);
+    return -1;
+  }
+  sn = snprintf(buf, sizeof(buf), "%s", dir);
+  if (sn < 0 || (size_t)sn >= sizeof(buf)) {
+    fprintf(stderr, "avd: %s path too long: \"%s\"\n", label, dir);
+    return -1;
+  }
+  /* Strip trailing slashes so "/a/b/" checks "/a/b" (root "/" keeps
+   * its own slash). */
+  len = strlen(buf);
+  while (len > 1 && buf[len - 1] == '/')
+    buf[--len] = '\0';
+  /* "/" itself is an ancestor of everything: sticky-tolerant, like
+   * all non-final components. (In practice root-owned 555/755.) */
+  if (trust_one_component(label, "/", true) != 0)
+    return -1;
+  /* Every deeper prefix ending at a component boundary, shallow
+   * first. Consecutive slashes yield empty segments, skipped. The
+   * boundary at i == len is the final component and gets the
+   * caller's allow_sticky_ww; anything before it is an ancestor. */
+  for (i = 1; i <= len; i++) {
+    if (buf[i] == '/' || buf[i] == '\0') {
+      char saved;
+      bool is_final = (i == len);
+      int r;
+
+      if (i == 1 || buf[i - 1] == '/')
+        continue; /* leading or doubled slash: no new component */
+      saved = buf[i];
+      buf[i] = '\0';
+      r = trust_one_component(label, buf,
+                              is_final ? allow_sticky_ww : true);
+      buf[i] = saved;
+      if (r != 0)
+        return -1;
+    }
+  }
+  return 0;
+}
+
 static int ensure_quarantine_dir(void) {
-  if (mkdir(quarantine_dir, 0700) == 0)
-    return 0;
-  if (errno == EEXIST)
-    return 0;
-  fprintf(stderr, "avd: could not create quarantine dir \"%s\": %s\n",
-          quarantine_dir, strerror(errno));
-  return -1;
+  if (mkdir(quarantine_dir, 0700) != 0 && errno != EEXIST) {
+    fprintf(stderr, "avd: could not create quarantine dir \"%s\": %s\n",
+            quarantine_dir, strerror(errno));
+    return -1;
+  }
+  /* mkdir() tolerating EEXIST must not treat "a symlink to /etc"
+   * the same as "the directory already exists": an attacker who
+   * pre-creates a symlink at quarantine_dir before avd starts would
+   * otherwise redirect every quarantine write through it. And the
+   * check runs after a successful mkdir() too: a fresh directory is
+   * ours, but the ancestors that allowed its creation may still be
+   * attacker-controlled (root can mkdir inside an attacker-owned tree
+   * just as easily as anywhere else - an attacker-owned ancestor can
+   * rename our new directory away afterwards). The full chain - not
+   * just the final component - is validated, so no unprivileged user
+   * can modify any of it; that is also what closes the check-then-use
+   * gap without pinned fds for every later operation. No *at()/dir-FD
+   * pinning on top: once unprivileged users cannot modify the
+   * directory or any ancestor, there is nothing left for a retained
+   * FD to defend against. */
+  return dir_hierarchy_trusted("quarantine dir", quarantine_dir, false);
 }
 
 /* Fallback for quarantine_file()'s linkat() failing - see that
@@ -1356,8 +1515,18 @@ static void quarantine_file(int fd, const char *path, const char *rule_name,
    * monotonic-clock nanosecond reading is unique per call even if
    * two quarantines land in the same second. */
   clock_gettime(CLOCK_MONOTONIC, &ts);
-  snprintf(dest, sizeof(dest), "%s/%d_%ld%09ld_%s.quarantined", quarantine_dir,
-           (int)getpid(), (long)ts.tv_sec, ts.tv_nsec, base);
+  /* Fail closed on truncation: a silently-truncated dest would quarantine
+   * into the wrong directory entry (potentially outside quarantine_dir
+   * for a long attacker-influenced basename) with no error. */
+  {
+    int dn = snprintf(dest, sizeof(dest), "%s/%d_%ld%09ld_%s.quarantined",
+                        quarantine_dir, (int)getpid(), (long)ts.tv_sec,
+                        ts.tv_nsec, base);
+    if (dn < 0 || (size_t)dn >= sizeof(dest)) {
+      fprintf(stderr, "avd: quarantine destination path would truncate - refusing\n");
+      return;
+    }
+  }
 
   linked = (linkat(fd, "", AT_FDCWD, dest, AT_EMPTY_PATH) == 0);
   if (!linked) {
@@ -2206,8 +2375,24 @@ static void cmd_quarantine_restore(int fd, const char *id) {
     return;
   }
 
-  snprintf(dest, sizeof(dest), "%s/%s.quarantined", quarantine_dir, id);
-  snprintf(meta_path, sizeof(meta_path), "%s.meta", dest);
+  /* Fail closed on truncation: a silently-truncated dest would open,
+   * chmod, or rename the wrong quarantine entry with no error. The
+   * PATH_MAX*2 buffer above already gives gcc room to prove this
+   * can't happen for valid ids, so any failure here is a real logic
+   * error worth refusing rather than proceeding with a wrong path. */
+  {
+    int dn = snprintf(dest, sizeof(dest), "%s/%s.quarantined", quarantine_dir, id);
+    int mn;
+    if (dn < 0 || (size_t)dn >= sizeof(dest)) {
+      send_err(fd, "internal path error");
+      return;
+    }
+    mn = snprintf(meta_path, sizeof(meta_path), "%s.meta", dest);
+    if (mn < 0 || (size_t)mn >= sizeof(meta_path)) {
+      send_err(fd, "internal path error");
+      return;
+    }
+  }
 
   if (read_quarantine_meta(meta_path, &meta) != 0) {
     send_err(fd, "no metadata for this id (quarantined before this feature "
@@ -2222,7 +2407,10 @@ static void cmd_quarantine_restore(int fd, const char *id) {
    * final mode/owner and there is no later path-based operation left
    * for anything to race against it. */
   {
-    int qfd = open(dest, O_RDONLY);
+    /* O_NOFOLLOW: dest must be the regular quarantine file this daemon
+     * created, never a symlink planted at a predicted id. The fstat() +
+     * S_ISREG check below is the second half of the same guard. */
+    int qfd = open(dest, O_RDONLY | O_NOFOLLOW);
 
     if (qfd < 0) {
       send_err(fd, "quarantined file not found");
@@ -2295,8 +2483,20 @@ static void cmd_quarantine_delete(int fd, const char *id) {
     return;
   }
 
-  snprintf(dest, sizeof(dest), "%s/%s.quarantined", quarantine_dir, id);
-  snprintf(meta_path, sizeof(meta_path), "%s.meta", dest);
+  /* Same truncation-fail-closed reasoning as cmd_quarantine_restore(). */
+  {
+    int dn = snprintf(dest, sizeof(dest), "%s/%s.quarantined", quarantine_dir, id);
+    int mn;
+    if (dn < 0 || (size_t)dn >= sizeof(dest)) {
+      send_err(fd, "internal path error");
+      return;
+    }
+    mn = snprintf(meta_path, sizeof(meta_path), "%s.meta", dest);
+    if (mn < 0 || (size_t)mn >= sizeof(meta_path)) {
+      send_err(fd, "internal path error");
+      return;
+    }
+  }
 
   if (unlink(dest) != 0 && errno != ENOENT) {
     send_err(fd, "delete failed");
@@ -2524,18 +2724,49 @@ static void *control_conn_main(void *arg) {
 static int ensure_parent_dir(const char *path, mode_t mode) {
   char buf[PATH_MAX];
   char *dir;
+  int sn;
 
-  snprintf(buf, sizeof(buf), "%s", path);
+  /* Fail closed on truncation: a truncated parent would mkdir/chmod
+   * the wrong directory with no error. */
+  sn = snprintf(buf, sizeof(buf), "%s", path);
+  if (sn < 0 || (size_t)sn >= sizeof(buf)) {
+    fprintf(stderr, "avd: path too long: \"%s\"\n", path);
+    return -1;
+  }
   dir = dirname(buf);
-  if (mkdir(dir, mode) == 0 || errno == EEXIST)
-    return 0;
-  fprintf(stderr, "avd: could not create directory \"%s\": %s\n", dir,
-          strerror(errno));
-  return -1;
+  if (mkdir(dir, mode) != 0 && errno != EEXIST) {
+    fprintf(stderr, "avd: could not create directory \"%s\": %s\n", dir,
+            strerror(errno));
+    return -1;
+  }
+  /* Same gate as ensure_quarantine_dir(), over the whole ancestor
+   * chain: a pre-existing parent that an unprivileged user can modify
+   * must not be silently accepted as "directory already exists" -
+   * they could replace the socket between the bind() below and its
+   * chmod(). Checked after a successful mkdir() as well, for the same
+   * attacker-owned-ancestor reason. A freshly mkdir()'d parent is ours
+   * by construction, so only pre-existing paths needed the old check;
+   * the chain check covers both uniformly. Sticky world-writable
+   * parents stay supported (safe: only the entry owner can
+   * rename/remove entries there). */
+  return dir_hierarchy_trusted("socket parent", dir, true);
 }
 
 static int start_control_socket(void) {
   struct sockaddr_un addr;
+  struct stat st;
+  int sn;
+
+  /* Quarantine and socket paths come from argv/env (see main()), so a
+   * relative value or a bare filename would silently resolve against
+   * avd's cwd - fail closed on anything that isn't an absolute path
+   * rather than binding/ writing somewhere the operator didn't mean. */
+  if (control_sock_path[0] != '/') {
+    fprintf(stderr,
+            "avd: control socket path must be absolute, got \"%s\"\n",
+            control_sock_path);
+    return -1;
+  }
 
   if (ensure_parent_dir(control_sock_path, 0755) != 0)
     return -1;
@@ -2548,8 +2779,33 @@ static int start_control_socket(void) {
 
   /* A stale socket file from a previous unclean shutdown (kill -9,
    * crash) would otherwise make bind() fail with EADDRINUSE even
-   * though nothing is listening on it any more. */
-  unlink(control_sock_path);
+   * though nothing is listening on it any more. lstat() (not stat())
+   * first so a planted symlink here is refused rather than unlinked-
+   * then-replaced: unlink() on a symlink only removes the link
+   * itself, but refusing outright keeps an attacker-planted path from
+   * ever becoming the live control socket, and a live symlink points
+   * at a target the subsequent bind() must not silently shadow. A
+   * stale real socket file (S_ISSOCK) or nothing at all are the only
+   * two states that proceed. */
+  if (lstat(control_sock_path, &st) == 0) {
+    if (S_ISLNK(st.st_mode)) {
+      fprintf(stderr,
+              "avd: control socket path \"%s\" is a symlink - refusing to replace it\n",
+              control_sock_path);
+      return -1;
+    }
+    if (!S_ISSOCK(st.st_mode)) {
+      fprintf(stderr,
+              "avd: control socket path \"%s\" exists and is not a socket - refusing to replace it\n",
+              control_sock_path);
+      return -1;
+    }
+    unlink(control_sock_path);
+  } else if (errno != ENOENT) {
+    fprintf(stderr, "avd: could not stat control socket path \"%s\": %s\n",
+            control_sock_path, strerror(errno));
+    return -1;
+  }
 
   control_sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (control_sock_fd < 0) {
@@ -2559,11 +2815,38 @@ static int start_control_socket(void) {
 
   memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
-  snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", control_sock_path);
+  /* Fail closed on truncation: a truncated socket path would bind (and
+   * chmod 0666) the wrong path with no error. Length already checked
+   * above, so this is defense in depth. */
+  sn = snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", control_sock_path);
+  if (sn < 0 || (size_t)sn >= sizeof(addr.sun_path)) {
+    fprintf(stderr, "avd: control socket path \"%s\" too long\n",
+            control_sock_path);
+    close(control_sock_fd);
+    control_sock_fd = -1;
+    return -1;
+  }
 
-  if (bind(control_sock_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+  /* SUN_LEN (used length), not sizeof(addr): AF_UNIX callers must pass
+   * the length covering sun_family plus the actual path bytes, and
+   * sizeof(struct sockaddr_un) overstates it whenever sun_path is
+   * shorter than the buffer. */
+  if (bind(control_sock_fd, (struct sockaddr *)&addr, SUN_LEN(&addr)) != 0) {
     fprintf(stderr, "avd: could not bind control socket \"%s\": %s\n",
             control_sock_path, strerror(errno));
+    close(control_sock_fd);
+    control_sock_fd = -1;
+    return -1;
+  }
+
+  /* Post-bind identity check: the path must now be the socket just
+   * bound, not something swapped in during the lstat/unlink/bind
+   * window. lstat() (not stat()) so a symlink swapped in at the last
+   * moment is seen as a symlink rather than followed to its target. */
+  if (lstat(control_sock_path, &st) != 0 || !S_ISSOCK(st.st_mode)) {
+    fprintf(stderr,
+            "avd: control socket path \"%s\" is not a socket after bind - refusing to serve it\n",
+            control_sock_path);
     close(control_sock_fd);
     control_sock_fd = -1;
     return -1;
@@ -2574,12 +2857,40 @@ static int start_control_socket(void) {
    * control_conn_main()/handle_control_line() above, so this mode is
    * what actually lets an unprivileged GUI process reach the read-only
    * verbs at all - same "gate specific commands, not the whole
-   * channel" pattern as GENL_ADMIN_PERM in av/netlink_chan.c. */
-  if (chmod(control_sock_path, 0666) != 0)
+   * channel" pattern as GENL_ADMIN_PERM in av/netlink_chan.c.
+   *
+   * Path-based chmod() is the only primitive that works here:
+   * fchmod() on an AF_UNIX socket fd returns 0 but silently leaves the
+   * mode unchanged (verified empirically), so "fixing" this to fchmod
+   * would quietly ship a 0755 socket and lock the GUI out. The
+   * check-then-chmod TOCTOU this implies (swap between the post-bind
+   * lstat() above and this chmod, redirecting a root chmod onto an
+   * attacker target) is closed by the parent-trust gate in
+   * ensure_parent_dir(): nobody unprivileged can modify the parent,
+   * so there is no one left who could stage the swap. The re-verify
+   * below is the backstop - if the path is not our 0666 socket after
+   * chmod, refuse to serve it rather than listen on a compromised
+   * path. On mismatch nothing is unlinked: the path may now name
+   * someone else's entry, and deleting that would be its own
+   * vulnerability. */
+  if (chmod(control_sock_path, 0666) != 0) {
     fprintf(stderr,
             "avd: chmod of control socket \"%s\" failed: %s - unprivileged "
             "clients (e.g. the GUI) may not be able to connect\n",
             control_sock_path, strerror(errno));
+    close(control_sock_fd);
+    control_sock_fd = -1;
+    return -1;
+  }
+  if (lstat(control_sock_path, &st) != 0 || !S_ISSOCK(st.st_mode) ||
+      (st.st_mode & 0777) != 0666) {
+    fprintf(stderr,
+            "avd: control socket path \"%s\" is not our 0666 socket after chmod - refusing to serve it\n",
+            control_sock_path);
+    close(control_sock_fd);
+    control_sock_fd = -1;
+    return -1;
+  }
 
   if (listen(control_sock_fd, 16) != 0) {
     fprintf(stderr, "avd: control socket listen() failed: %s\n",
@@ -2722,6 +3033,33 @@ int main(int argc, char **argv) {
     control_sock_path = argv[5];
   else if (getenv("AVD_SOCK_PATH"))
     control_sock_path = getenv("AVD_SOCK_PATH");
+
+  /* Fail closed on relative/empty daemon paths: both are argv/env
+   * controlled, and a relative quarantine/socket path would silently
+   * resolve against whatever cwd avd was started from - quarantine
+   * writes or the world-visible control socket landing somewhere the
+   * operator didn't mean. Absolute-path-only, same stance as
+   * start_control_socket()'s own check (which re-checks the socket
+   * path) and cmd_scan()'s absolute-path requirement. Deliberately no
+   * expected-prefix allowlist (e.g. quarantine-must-be-under-/var/lib):
+   * argv/env overrides legitimately point outside the production
+   * prefixes - the test suite's throwaway dirs live under /tmp - so
+   * the trusted-directory gate (ownership + no unprivileged write in
+   * ensure_quarantine_dir()/ensure_parent_dir()) is what constrains
+   * attacker influence instead of a prefix list that would break those
+   * supported overrides. */
+  if (!quarantine_dir[0] || quarantine_dir[0] != '/') {
+    fprintf(stderr,
+            "avd: quarantine directory must be an absolute path, got \"%s\"\n",
+            quarantine_dir);
+    return 1;
+  }
+  if (!control_sock_path[0] || control_sock_path[0] != '/') {
+    fprintf(stderr,
+            "avd: control socket path must be an absolute path, got \"%s\"\n",
+            control_sock_path);
+    return 1;
+  }
 
   /* Env vars only, no positional argv slot - unlike rules_dir/
    * corpus_file/etc. above, these two aren't paths a packaging script

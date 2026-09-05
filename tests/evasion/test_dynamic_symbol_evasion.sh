@@ -16,7 +16,14 @@ RULES="$REPO_ROOT/rules/heuristics.yar"
 
 echo "=== Evasion test: dynamic symbol resolution (dlopen/dlsym) ==="
 
-cat > /tmp/dynsym_evasion.c << 'EOF'
+# Private mktemp -d, not fixed /tmp/dynsym_evasion.* paths: predictable
+# world-writable-directory names let another local user pre-plant a symlink
+# that this script's compiler output would then follow. Same pattern as
+# tests/test_netlink.sh.
+EVASION_TMP_DIR="$(mktemp -d -- /tmp/dynsym_evasion.XXXXXX)" || exit 1
+trap 'rm -rf "$EVASION_TMP_DIR"' EXIT
+
+cat > "$EVASION_TMP_DIR/dynsym_evasion.c" << 'EOF'
 #include <dlfcn.h>
 #include <stdio.h>
 #include <sys/types.h>
@@ -38,17 +45,17 @@ int main(void) {
     return 0;
 }
 EOF
-gcc -o /tmp/dynsym_evasion /tmp/dynsym_evasion.c -ldl
+gcc -o "$EVASION_TMP_DIR/dynsym_evasion" "$EVASION_TMP_DIR/dynsym_evasion.c" -ldl
 
 echo
 echo "--- dynamic symbol table (confirming ptrace is NOT a direct import) ---"
-objdump -T /tmp/dynsym_evasion | grep -i ptrace && \
+objdump -T "$EVASION_TMP_DIR/dynsym_evasion" | grep -i ptrace && \
     echo "UNEXPECTED: ptrace found as a direct import - evasion technique failed to build correctly" || \
     echo "confirmed: no direct ptrace import (as intended)"
 
 echo
 echo "--- running heuristics.yar ---"
-MATCHES="$(yara "$RULES" /tmp/dynsym_evasion || true)"
+MATCHES="$(yara "$RULES" "$EVASION_TMP_DIR/dynsym_evasion" || true)"
 echo "$MATCHES"
 
 echo

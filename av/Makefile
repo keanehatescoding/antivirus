@@ -15,7 +15,10 @@ LLVM ?=
 
 MAKE_ARGS := -C $(KDIR) M=$(PWD)
 ifneq ($(CC),)
-  MAKE_ARGS += CC=$(CC)
+  # Quoted: a multi-word CC (e.g. CC="ccache clang") would otherwise
+  # word-split into CC=ccache plus a stray `clang` goal that the
+  # recursive make treats as a build target instead of part of CC.
+  MAKE_ARGS += CC="$(CC)"
 endif
 ifneq ($(LLVM),)
   MAKE_ARGS += LLVM=$(LLVM)
