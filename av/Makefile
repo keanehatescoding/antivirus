@@ -1,8 +1,15 @@
 obj-m += av.o
 av-y := main.o sigtable.o netlink_chan.o behavior.o
 
-KDIR ?= /lib/modules/$(shell uname -r)/build
-PWD  := $(shell pwd)
+# UNAME_R/KDIR are recursive (=/?=, not :=) so `uname -r` runs when KDIR
+# is USED, not when this file is parsed - a `:=` would freeze the running
+# kernel's version at parse time. Override for another tree with
+# `make KDIR=/path/to/kernel/build` (cross-kernel builds).
+UNAME_R ?= $(shell uname -r)
+KDIR ?= /lib/modules/$(UNAME_R)/build
+# $(CURDIR) builtin, not $(shell pwd): no fork, no parse-time subshell,
+# immune to PWD-env skew.
+PWD  := $(CURDIR)
 
 # Toolchain override for Clang-built kernels (e.g. CachyOS's -clang
 # variant). A kernel module generally must be built with the same

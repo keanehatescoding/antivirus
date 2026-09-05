@@ -134,6 +134,11 @@
  * av_policy's maxlen fields below: nothing legitimate needs more than
  * this, so reject rather than silently truncate. */
 #define AVD_SOCK_LINE_MAX (PATH_MAX + 256)
+/* Bounds one QUARANTINE LIST / VERDICTS row: two PATH_MAX-sized fields at
+ * most (id + original_path) plus the small fixed fields alongside them
+ * (timestamps, 64-char sha256, rule name, tabs/NUL). Named so the
+ * PATH_MAX*2 headroom is a documented bound, not a magic buffer size. */
+#define AVD_ROW_MAX (PATH_MAX * 2 + 256)
 /* Caps how many control-socket connections avd will service at once -
  * the socket is 0666 (see start_control_socket()'s comment), so
  * without this any local user could open connections without limit,
@@ -2315,7 +2320,7 @@ static void cmd_quarantine_list(int fd, uid_t peer_uid, bool is_root) {
     char id[PATH_MAX];
     char meta_path[PATH_MAX + 72]; /* see cmd_quarantine_restore()'s comment */
     struct quarantine_meta meta;
-    char row[PATH_MAX * 2 + 256];
+    char row[AVD_ROW_MAX];
 
     if (!visible[i]) {
       free(namelist[i]);
@@ -3081,8 +3086,47 @@ int main(int argc, char **argv) {
 
   start_time = time(NULL);
 
-  signal(SIGINT, handle_sigint);
-  signal(SIGTERM, handle_sigint);
+  /* sigaction(), not signal(): signal()'s semantics vary across libc
+   * versions (restart vs EINTR, handler persistence), while sigaction()
+   * pins exactly what we need - persistent handler, no SA_RESTART so a
+   * blocking accept()/recv() EINTRs out promptly and the shutdown path
+   * observes `running == 0` instead of hanging past it. */
+  {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_sigint;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    if (sigaction(SIGINT, &sa, NULL) != 0 ||
+        sigaction(SIGTERM, &sa, NULL) != 0) {
+      fprintf(stderr, "avd: failed to install SIGINT/SIGTERM handler: %s\n",
+              strerror(errno));
+      return 1;
+    }
+  }
+  /* Route SIGINT/SIGTERM to the main thread's nl_recvmsgs_default()
+   * loop below. All threads inherit their creator's signal mask, so a
+   * process-directed SIGINT/SIGTERM arriving with the mask unblocked
+   * could run handle_sigint() on a worker or control thread instead:
+   * `running` would go to 0 there while the main thread stayed blocked
+   * in nl_recvmsgs_default() with nothing to EINTR it out, hanging
+   * shutdown. Blocking both signals here (before any pthread_create())
+   * makes every subsequently spawned thread inherit them blocked; the
+   * main thread unblocks them again just before entering the receive
+   * loop, so termination is always delivered to the one thread whose
+   * blocking call EINTRs out (sa_flags = 0, no SA_RESTART) and drives
+   * the shutdown sequence. */
+  {
+    sigset_t block;
+    sigemptyset(&block);
+    sigaddset(&block, SIGINT);
+    sigaddset(&block, SIGTERM);
+    if (pthread_sigmask(SIG_BLOCK, &block, NULL) != 0) {
+      fprintf(stderr, "avd: failed to block SIGINT/SIGTERM: %s\n",
+              strerror(errno));
+      return 1;
+    }
+  }
   /* Without this, any write()/send() into a control-socket connection
    * whose peer already closed (a killed avctl, the GUI navigating
    * away mid-request, a network hiccup on a remote mount of the
@@ -3096,7 +3140,14 @@ int main(int argc, char **argv) {
    * SIGPIPE here is sufficient - write()/send() then simply return -1
    * with errno EPIPE instead of raising the signal, and existing error
    * handling takes it from there. */
-  signal(SIGPIPE, SIG_IGN);
+  {
+    struct sigaction sa_ign;
+    memset(&sa_ign, 0, sizeof(sa_ign));
+    sa_ign.sa_handler = SIG_IGN;
+    sigemptyset(&sa_ign.sa_mask);
+    sa_ign.sa_flags = 0;
+    sigaction(SIGPIPE, &sa_ign, NULL);
+  }
 
   if (av_tlsh_selftest() != 0) {
     fprintf(stderr, "avd: TLSH self-test failed - aborting\n");
@@ -3211,6 +3262,57 @@ int main(int argc, char **argv) {
               "avd: control socket unavailable - avctl/GUI management "
               "commands will not work, kernel-triggered scanning is "
               "unaffected\n");
+    }
+
+    /* Main thread only: unblock the termination signals blocked above
+     * so they are delivered here - the one thread parked in the
+     * EINTR-able nl_recvmsgs_default() loop - rather than on a worker
+     * or control thread that could never wake that loop up. Workers and
+     * the control accept thread (plus every per-connection thread it
+     * spawns) keep the inherited blocked mask for the life of the
+     * process. On the unlikely pthread_sigmask() failure, abort startup
+     * rather than run with undeliverable termination signals. */
+    {
+      sigset_t unblock;
+      sigemptyset(&unblock);
+      sigaddset(&unblock, SIGINT);
+      sigaddset(&unblock, SIGTERM);
+      if (pthread_sigmask(SIG_UNBLOCK, &unblock, NULL) != 0) {
+        int unblock_err = errno;
+        fprintf(stderr, "avd: failed to unblock SIGINT/SIGTERM in main: %s\n",
+                strerror(unblock_err));
+        pthread_mutex_lock(&queue_lock);
+        shutting_down = true;
+        pthread_cond_broadcast(&queue_not_empty);
+        pthread_cond_broadcast(&queue_not_full);
+        pthread_mutex_unlock(&queue_lock);
+        for (i = 0; i < spawned; i++)
+          pthread_join(workers[i], NULL);
+        if (control_started) {
+          /* Same self-connect wake-up as the normal shutdown path
+           * below: joining the accept thread without it hangs. */
+          int wake_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+
+          if (wake_fd >= 0) {
+            struct sockaddr_un wake_addr;
+
+            memset(&wake_addr, 0, sizeof(wake_addr));
+            wake_addr.sun_family = AF_UNIX;
+            snprintf(wake_addr.sun_path, sizeof(wake_addr.sun_path), "%s",
+                     control_sock_path);
+            connect(wake_fd, (struct sockaddr *)&wake_addr,
+                    sizeof(wake_addr));
+            close(wake_fd);
+          }
+          pthread_join(control_thread, NULL);
+          close(control_sock_fd);
+          control_sock_fd = -1;
+          unlink(control_sock_path);
+        }
+        free(workers);
+        nl_socket_free(sock);
+        return 1;
+      }
     }
 
     while (running) {
