@@ -3104,6 +3104,29 @@ int main(int argc, char **argv) {
       return 1;
     }
   }
+  /* Route SIGINT/SIGTERM to the main thread's nl_recvmsgs_default()
+   * loop below. All threads inherit their creator's signal mask, so a
+   * process-directed SIGINT/SIGTERM arriving with the mask unblocked
+   * could run handle_sigint() on a worker or control thread instead:
+   * `running` would go to 0 there while the main thread stayed blocked
+   * in nl_recvmsgs_default() with nothing to EINTR it out, hanging
+   * shutdown. Blocking both signals here (before any pthread_create())
+   * makes every subsequently spawned thread inherit them blocked; the
+   * main thread unblocks them again just before entering the receive
+   * loop, so termination is always delivered to the one thread whose
+   * blocking call EINTRs out (sa_flags = 0, no SA_RESTART) and drives
+   * the shutdown sequence. */
+  {
+    sigset_t block;
+    sigemptyset(&block);
+    sigaddset(&block, SIGINT);
+    sigaddset(&block, SIGTERM);
+    if (pthread_sigmask(SIG_BLOCK, &block, NULL) != 0) {
+      fprintf(stderr, "avd: failed to block SIGINT/SIGTERM: %s\n",
+              strerror(errno));
+      return 1;
+    }
+  }
   /* Without this, any write()/send() into a control-socket connection
    * whose peer already closed (a killed avctl, the GUI navigating
    * away mid-request, a network hiccup on a remote mount of the
@@ -3239,6 +3262,57 @@ int main(int argc, char **argv) {
               "avd: control socket unavailable - avctl/GUI management "
               "commands will not work, kernel-triggered scanning is "
               "unaffected\n");
+    }
+
+    /* Main thread only: unblock the termination signals blocked above
+     * so they are delivered here - the one thread parked in the
+     * EINTR-able nl_recvmsgs_default() loop - rather than on a worker
+     * or control thread that could never wake that loop up. Workers and
+     * the control accept thread (plus every per-connection thread it
+     * spawns) keep the inherited blocked mask for the life of the
+     * process. On the unlikely pthread_sigmask() failure, abort startup
+     * rather than run with undeliverable termination signals. */
+    {
+      sigset_t unblock;
+      sigemptyset(&unblock);
+      sigaddset(&unblock, SIGINT);
+      sigaddset(&unblock, SIGTERM);
+      if (pthread_sigmask(SIG_UNBLOCK, &unblock, NULL) != 0) {
+        int unblock_err = errno;
+        fprintf(stderr, "avd: failed to unblock SIGINT/SIGTERM in main: %s\n",
+                strerror(unblock_err));
+        pthread_mutex_lock(&queue_lock);
+        shutting_down = true;
+        pthread_cond_broadcast(&queue_not_empty);
+        pthread_cond_broadcast(&queue_not_full);
+        pthread_mutex_unlock(&queue_lock);
+        for (i = 0; i < spawned; i++)
+          pthread_join(workers[i], NULL);
+        if (control_started) {
+          /* Same self-connect wake-up as the normal shutdown path
+           * below: joining the accept thread without it hangs. */
+          int wake_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+
+          if (wake_fd >= 0) {
+            struct sockaddr_un wake_addr;
+
+            memset(&wake_addr, 0, sizeof(wake_addr));
+            wake_addr.sun_family = AF_UNIX;
+            snprintf(wake_addr.sun_path, sizeof(wake_addr.sun_path), "%s",
+                     control_sock_path);
+            connect(wake_fd, (struct sockaddr *)&wake_addr,
+                    sizeof(wake_addr));
+            close(wake_fd);
+          }
+          pthread_join(control_thread, NULL);
+          close(control_sock_fd);
+          control_sock_fd = -1;
+          unlink(control_sock_path);
+        }
+        free(workers);
+        nl_socket_free(sock);
+        return 1;
+      }
     }
 
     while (running) {

@@ -12,6 +12,13 @@
 #
 set -euo pipefail
 
+# Same libfuzzy link flags as userspace/avd/Makefile's FUZZY_LIBS:
+# honor a packager-provided override (e.g. FUZZY_LIBS="-l:libfuzzy.a"
+# ./tests/evasion/test_fuzzy_evasion.sh) so environments where plain
+# -lfuzzy doesn't link still work here, and otherwise probe pkg-config
+# with the same plain -lfuzzy fallback the daemon build uses.
+FUZZY_LIBS="${FUZZY_LIBS:-$(pkg-config --libs fuzzy 2>/dev/null || echo "-lfuzzy")}"
+
 echo "=== Evasion test: fuzzy hash evasion via substantial modification ==="
 
 # Private mktemp -d, not fixed /tmp/ptrace_test* paths (see
@@ -67,5 +74,8 @@ int main(int argc, char **argv) {
     return 0;
 }
 EOF
-gcc -o "$EVASION_TMP_DIR/fuzzy_score_check" "$EVASION_TMP_DIR/fuzzy_score_check.c" -lfuzzy
+# Word-split FUZZY_LIBS deliberately: it may hold several flags
+# (e.g. "-L/opt/ssdeep/lib -l:libfuzzy.a").
+# shellcheck disable=SC2086
+gcc -o "$EVASION_TMP_DIR/fuzzy_score_check" "$EVASION_TMP_DIR/fuzzy_score_check.c" $FUZZY_LIBS
 "$EVASION_TMP_DIR/fuzzy_score_check" "$EVASION_TMP_DIR/ptrace_test" "$EVASION_TMP_DIR/heavy_variant"
