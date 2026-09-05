@@ -7,7 +7,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk
 
-from .. import avd_client
+from .. import avd_client, path_validation
 from ..widgets import build_table, make_row, clear_box
 
 
@@ -35,7 +35,9 @@ class Page:
         try:
             verdicts = avd_client.verdicts_recent(200)
         except avd_client.AvdError as exc:
-            self._error_label.set_label(f"avd: {exc}")
+            self._error_label.set_label(
+                path_validation.for_display(f"avd: {exc}")
+            )
             return
 
         if not verdicts:
@@ -46,7 +48,7 @@ class Page:
             try:
                 ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(v["timestamp"])))
             except (KeyError, ValueError):
-                ts = v.get("timestamp", "?")
+                ts = path_validation.for_display(v.get("timestamp", "?"))
             row = make_row([
                 ts,
                 v.get("verdict", "?"),

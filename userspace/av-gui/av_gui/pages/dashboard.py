@@ -5,7 +5,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk
 
-from .. import avd_client, procfs_client
+from .. import avd_client, path_validation, procfs_client
 
 _ROWS = [
     "avd status", "uptime", "rules loaded", "fuzzy corpus entries",
@@ -60,17 +60,20 @@ class Page:
             self._set("avd status", "unreachable")
             for key in _ROWS[1:7]:
                 self._set(key, "-")
-            errors.append(f"avd: {exc}")
+            errors.append(path_validation.for_display(f"avd: {exc}"))
 
         try:
             state = procfs_client.read_state()
             self._set("signatures", len(state["signatures"]))
             self._set("trusted binaries", len(state["trust"]))
             self._set("protected paths", len(state["protected"]))
-            self._set("daemon-unavailable policy", state["policy"] or "-")
+            self._set(
+                "daemon-unavailable policy",
+                path_validation.for_display(state["policy"] or "-"),
+            )
         except procfs_client.ProcfsError as exc:
             for key in _ROWS[7:]:
                 self._set(key, "-")
-            errors.append(f"avctl: {exc}")
+            errors.append(path_validation.for_display(f"avctl: {exc}"))
 
         self._error_label.set_label("\n".join(errors))

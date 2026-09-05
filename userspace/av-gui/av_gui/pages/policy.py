@@ -6,7 +6,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk
 
-from .. import procfs_client, pkexec_helper
+from .. import path_validation, procfs_client, pkexec_helper
 
 
 class Page:
@@ -56,7 +56,9 @@ class Page:
         try:
             state = procfs_client.read_state()
         except procfs_client.ProcfsError as exc:
-            self._error_label.set_label(f"avctl: {exc}")
+            self._error_label.set_label(
+                path_validation.for_display(f"avctl: {exc}")
+            )
             self._set_controls_sensitive(False)
             return
 

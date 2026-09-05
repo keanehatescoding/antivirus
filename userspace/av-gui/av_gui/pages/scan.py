@@ -4,7 +4,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, GLib
 
-from .. import pkexec_helper
+from .. import path_validation, pkexec_helper
 
 
 class Page:
@@ -54,19 +54,29 @@ class Page:
                 self._path_entry.set_text(path)
 
     def _on_scan(self, _button):
-        path = self._path_entry.get_text().strip()
-        if not path.startswith("/"):
-            self._result_label.set_label("Path must be absolute.")
+        try:
+            path = path_validation.validate_absolute_path(
+                self._path_entry.get_text()
+            )
+        except ValueError as exc:
+            self._result_label.set_label(str(exc))
             return
         self._result_label.set_label("Scanning…")
 
         def done(ok, stdout, stderr):
             """Callback invoked after the scan command completes."""
             if ok:
-                self._result_label.set_label(stdout.strip() or "(no output)")
+                # Scan output echoes the scanned path, which may carry
+                # surrogate escapes for a non-UTF-8 filename - sanitize
+                # before handing it to Gtk.Label (see show_toast()).
+                self._result_label.set_label(
+                    path_validation.for_display(stdout.strip() or "(no output)")
+                )
                 self._toast("Scan complete")
             else:
                 self._result_label.set_label(
-                    f"Scan failed: {(stderr or stdout).strip() or 'unknown error'}"
+                    path_validation.for_display(
+                        f"Scan failed: {(stderr or stdout).strip() or 'unknown error'}"
+                    )
                 )
         pkexec_helper.run_privileged(["scan", path], done)

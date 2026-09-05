@@ -15,6 +15,7 @@ gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, Gio, GLib, Gtk
 
 from .pages import dashboard, detections, policy, protected, quarantine, scan, signatures, trust
+from .path_validation import for_display
 
 REFRESH_INTERVAL_SECS = 4
 APP_ID = "org.hyprav.avgui"
@@ -106,8 +107,15 @@ class AvGuiWindow(Gtk.ApplicationWindow):
         self._stack.add_titled(page.widget, name, title)
 
     def show_toast(self, message):
-        """Shows a temporary notification message at the bottom of the window."""
-        self._toast_label.set_label(message)
+        """Shows a temporary notification message at the bottom of the window.
+
+        Shared funnel for every page's toast, including privileged-action
+        failure callbacks that interpolate raw avctl stderr/stdout and ids
+        read back from avd - any of which may carry surrogate escapes for
+        non-UTF-8 filenames. for_display() maps those to visible escapes
+        first (identity for normal text), since Gtk.Label cannot encode
+        lone surrogates and would raise UnicodeEncodeError."""
+        self._toast_label.set_label(for_display(message))
         self._toast_revealer.set_reveal_child(True)
         GLib.timeout_add_seconds(4, self._hide_toast)
 

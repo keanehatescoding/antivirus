@@ -6,12 +6,9 @@ works fully unprivileged (avctl save only reads those /proc files, it
 never writes). See docs/avd-socket-protocol.md's note on why the GUI
 reuses this format instead of adding a second read protocol.
 """
-import os
 import subprocess
 
-from . import host_exec
-
-AVCTL_PATH = os.environ.get("AVCTL_PATH", "/usr/local/bin/avctl")
+from . import avctl_path, host_exec
 
 
 class ProcfsError(Exception):
@@ -27,8 +24,14 @@ def read_state():
     (str, "fail-open"/"fail-closed", or None if unavailable)."""
     try:
         result = subprocess.run(
-            host_exec.host_argv([AVCTL_PATH, "save", "-"]),
+            host_exec.host_argv(
+                [avctl_path.resolve_unprivileged_avctl_path(), "save", "-"]
+            ),
             capture_output=True, text=True, timeout=10, check=False,
+            # os.fsdecode parity: never fail the whole read on a
+            # non-UTF-8 name, and never mangle distinct byte sequences
+            # into the same U+FFFD (see avd_client._request below).
+            errors="surrogateescape",
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ProcfsError(f"could not run avctl: {exc}") from exc
