@@ -303,53 +303,38 @@ static int write_command(const char *cmd)
  * leftover-corrupt-file failure mode to protect against. The summary
  * line goes to stderr instead of stdout in this mode, so stdout stays
  * pure, directly-parseable data for the caller. */
-/* Parent-directory trust gate for do_save()'s tmp-file+rename dance.
- * O_CREAT|O_EXCL|O_NOFOLLOW closes the pre-planted-symlink angle, but an
- * attacker who can modify the parent directory can still swap tmp_path
- * itself between our open() and the rename() below, and rename() would
- * then install their replacement at `path`. So refuse attacker-modifiable
- * parents up front. The parent (lstat, never stat, so a symlink is seen
- * rather than followed) must exist, must be a real directory, and must be
- * owned by our own euid or by root. Group write is rejected outright, and
- * other-write is rejected unless the sticky bit is also set: in a sticky
- * world-writable directory (/tmp-style) only the entry's owner (us - we
- * just created tmp_path), the directory owner, or root can
- * rename/remove entries, so nobody else can swap our tmp file out from
- * under us. Returns 0 if trusted, -1 (with an error already printed)
+/* Pinned save destination: the parent directory held open from a
+ * no-follow component walk, so an attacker-controlled intermediate
+ * symlink - and any post-validation swap of any ancestor - cannot
+ * redirect the tmp create, the identity rechecks, the cleanup, or the
+ * final rename. Every one of those goes through parent_fd + basename
+ * and never re-resolves a full path. (A path-based lstat(parent)
+ * check alone cannot do this: it follows intermediate symlinks while
+ * validating, then open()/rename() resolve them again, so swapping
+ * the link in between redirects both.) avctl is single-threaded, so
+ * nothing can fchdir us off the pinned fd mid-save. parent_fd is -1
+ * when unused (stdout mode). base/tmpbase never contain '/' (split at
+ * the last slash), so they cannot escape the pinned directory. */
+struct save_dest {
+    int parent_fd;
+    char base[PATH_MAX];
+    char tmpbase[PATH_MAX];
+};
+
+/* Trust policy for one directory we hold open: must be a real
+ * directory owned by our euid or root, with no group/other write
+ * access unless the sticky bit is set (in a sticky directory only an
+ * entry's owner, the directory owner, or root can rename/remove
+ * entries). Returns 0 if trusted, -1 (with an error already printed)
  * otherwise. */
-static int save_parent_trusted(const char *path)
+static int save_dir_trusted_fd(int fd, const char *path)
 {
-    char parent[PATH_MAX];
-    const char *slash = strrchr(path, '/');
     struct stat st;
     uid_t euid = geteuid();
 
-    if (!slash) {
-        /* Bare filename: the parent is the cwd. */
-        strcpy(parent, ".");
-    } else if (slash == path) {
-        /* "/foo": the parent is "/". */
-        strcpy(parent, "/");
-    } else {
-        size_t plen = (size_t)(slash - path);
-
-        if (plen >= sizeof(parent)) {
-            fprintf(stderr, "avctl: path too long to format\n");
-            return -1;
-        }
-        memcpy(parent, path, plen);
-        parent[plen] = '\0';
-    }
-
-    if (lstat(parent, &st) != 0) {
+    if (fstat(fd, &st) != 0) {
         fprintf(stderr, "avctl: cannot stat parent directory of %s: %s\n",
                 path, strerror(errno));
-        return -1;
-    }
-    if (S_ISLNK(st.st_mode)) {
-        fprintf(stderr,
-                "avctl: parent directory of %s is a symlink - refusing to save there\n",
-                path);
         return -1;
     }
     if (!S_ISDIR(st.st_mode)) {
@@ -364,13 +349,6 @@ static int save_parent_trusted(const char *path)
                 path, (int)st.st_uid);
         return -1;
     }
-    /* Any write access for group/other lets another user rename/remove
-     * entries - unless the sticky bit is also set. In a sticky
-     * directory (/tmp-style, including /tmp itself) only an entry's
-     * owner, the directory owner, or root can rename/remove it, so
-     * group/other write there cannot swap our tmp file: a pre-planted
-     * entry just makes our O_EXCL create fail closed, and a planted
-     * hardlink is caught by tmp_still_ours()'s nlink check. */
     if ((st.st_mode & (S_IWGRP | S_IWOTH)) && !(st.st_mode & S_ISVTX)) {
         fprintf(stderr,
                 "avctl: parent directory of %s is writable by other users without the sticky bit - refusing to save there\n",
@@ -380,73 +358,171 @@ static int save_parent_trusted(const char *path)
     return 0;
 }
 
-/* Re-verifies that tmp_path still names the exact file our open FILE
- * stream is writing to: same device+inode, still a regular file, still
- * owned by us, single link (a second hardlink would let someone else
- * hold - or repoint - the name). Defense in depth behind
- * save_parent_trusted() above, which is what actually removes an
- * attacker's ability to swap the entry: this catches a swap that
- * happened anyway (stale mount games, a trusted-but-confused admin)
- * before rename() can install it at `path`. Returns 0 if tmp_path is
- * still ours, -1 otherwise. */
-static int tmp_still_ours(FILE *out, const char *tmp_path)
+/* Identity a tmp name must have to still be ours: a regular file owned
+ * by us with a single link (a second hardlink would let someone else
+ * hold - or repoint - the name). Compared dev+ino at the call sites.
+ * Returns 0 if ours, -1 otherwise. */
+static int save_stat_is_ours(const struct stat *st)
 {
-    struct stat fst, lst;
-
-    if (fstat(fileno(out), &fst) != 0)
+    if (!S_ISREG(st->st_mode))
         return -1;
-    if (lstat(tmp_path, &lst) != 0)
+    if (st->st_uid != geteuid())
         return -1;
-    if (fst.st_dev != lst.st_dev || fst.st_ino != lst.st_ino)
-        return -1;
-    if (!S_ISREG(lst.st_mode))
-        return -1;
-    if (lst.st_uid != geteuid())
-        return -1;
-    if (lst.st_nlink != 1)
+    if (st->st_nlink != 1)
         return -1;
     return 0;
 }
 
-/* Post-close half of tmp_still_ours(): once the stream is fclose()'d
- * there is no fd left to fstat, so checkpoints after close compare
- * lstat(tmp_path) against the identity captured while the stream was
- * still open. Same fail-closed stance. */
-static int path_still_names(const char *tmp_path, const struct stat *expect)
+/* Reads one tmpbase identity through the pinned parent without
+ * following a trailing symlink (there shouldn't be one -
+ * O_CREAT|O_EXCL|O_NOFOLLOW refuses to create through it - but the
+ * rechecks below must see a symlink rather than its target if one
+ * ever appears). Returns 0 on success with *st filled, -1 otherwise. */
+static int save_tmp_lstat(int parent_fd, const char *tmpbase, struct stat *st)
 {
-    struct stat lst;
-
-    if (lstat(tmp_path, &lst) != 0)
-        return -1;
-    if (lst.st_dev != expect->st_dev || lst.st_ino != expect->st_ino)
-        return -1;
-    if (!S_ISREG(lst.st_mode))
-        return -1;
-    if (lst.st_uid != geteuid())
-        return -1;
-    if (lst.st_nlink != 1)
-        return -1;
-    return 0;
+    return fstatat(parent_fd, tmpbase, st, AT_SYMLINK_NOFOLLOW);
 }
 
-/* save_abort() only runs after do_save() successfully created tmp_path
- * via O_CREAT|O_EXCL|O_NOFOLLOW above, so the unlink() here removes a
- * path this process itself created - never a pre-existing symlink it
- * merely opened through. Re-checked (not just assumed): if tmp_path no
- * longer names our own just-written file, it is left alone rather than
- * deleted, since it is someone else's entry by then. */
-static void save_abort(FILE *out, const char *tmp_path, int to_stdout)
+/* Walks the parent portion of path component by component from a
+ * pinned start ("/" for absolute paths, "." otherwise), opening each
+ * with O_DIRECTORY|O_NOFOLLOW so a symlinked ancestor fails closed
+ * (ELOOP) instead of redirecting the walk, and trust-checking every
+ * level - including the start - so an attacker-owned or
+ * attacker-writable ancestor is rejected, not just a bad final
+ * parent. Each openat() both validates and pins that level: once
+ * held, the fd is immune to later namespace swaps, so there is no
+ * check-then-use gap for intermediate components at all. ".."
+ * components are safe to pass through: under pinning they resolve to
+ * the real parent without ever traversing a symlink (none is ever
+ * followed). Fills d (parent_fd + base + tmpbase) and returns 0,
+ * or -1 (error printed, nothing held) on any failure. */
+static int pin_save_parent(const char *path, struct save_dest *d)
+{
+    const char *slash = strrchr(path, '/');
+    const char *parent_part;
+    size_t parent_len, base_len;
+    const char *p;
+    size_t rem;
+    int cur;
+
+    d->parent_fd = -1;
+    if (!slash) {
+        parent_part = NULL;
+        parent_len = 0;
+        base_len = strlen(path);
+        if (base_len >= sizeof(d->base))
+            goto too_long;
+        memcpy(d->base, path, base_len + 1);
+    } else {
+        parent_part = path;
+        parent_len = (size_t)(slash - path);
+        base_len = strlen(slash + 1);
+        if (base_len >= sizeof(d->base))
+            goto too_long;
+        memcpy(d->base, slash + 1, base_len + 1);
+    }
+    if (base_len + 4 >= sizeof(d->tmpbase))
+        goto too_long;
+    memcpy(d->tmpbase, d->base, base_len);
+    memcpy(d->tmpbase + base_len, ".tmp", 5);
+
+    cur = open(path[0] == '/' ? "/" : ".",
+               O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (cur < 0) {
+        fprintf(stderr, "avctl: cannot open parent directory of %s: %s\n",
+                path, strerror(errno));
+        return -1;
+    }
+    if (save_dir_trusted_fd(cur, path)) {
+        close(cur);
+        return -1;
+    }
+
+    p = parent_part;
+    rem = parent_len;
+    if (path[0] == '/' && rem > 0) {
+        p++;
+        rem--; /* skip the leading '/' - start fd already is root */
+    }
+    while (rem > 0) {
+        char comp[PATH_MAX];
+        size_t seglen = 0;
+        int next;
+
+        while (rem > 0 && *p == '/') { /* collapse "//" */
+            p++;
+            rem--;
+        }
+        if (rem == 0)
+            break; /* trailing slashes: parent is cur */
+        while (seglen < rem && p[seglen] != '/')
+            seglen++;
+        if (seglen == 0 || seglen >= sizeof(comp)) {
+            fprintf(stderr, "avctl: path too long to format\n");
+            close(cur);
+            return -1;
+        }
+        memcpy(comp, p, seglen);
+        comp[seglen] = '\0';
+        p += seglen;
+        rem -= seglen;
+        if (!strcmp(comp, "."))
+            continue; /* benign - stays on the pinned fd */
+        next = openat(cur, comp, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+        if (next < 0) {
+            if (errno == ELOOP || errno == ENOTDIR)
+                fprintf(stderr,
+                        "avctl: parent directory of %s goes through a symlink - refusing to save there\n",
+                        path);
+            else
+                fprintf(stderr,
+                        "avctl: cannot open parent directory of %s: %s\n",
+                        path, strerror(errno));
+            close(cur);
+            return -1;
+        }
+        if (save_dir_trusted_fd(next, path)) {
+            close(next);
+            close(cur);
+            return -1;
+        }
+        close(cur);
+        cur = next;
+    }
+
+    d->parent_fd = cur;
+    return 0;
+
+too_long:
+    fprintf(stderr, "avctl: path too long to format\n");
+    return -1;
+}
+
+/* save_abort() only runs after do_save() created tmpbase through the
+ * pinned parent, so the unlinkat() here removes an entry of a directory
+ * this process holds open - never a path re-resolved through a
+ * possibly-swapped namespace. Re-checked (not just assumed): if the
+ * name no longer refers to our own just-written file, it is left alone
+ * rather than deleted, since it is someone else's entry by then. */
+static void save_abort(FILE *out, struct save_dest *d, const char *tmp_path,
+                       int to_stdout)
 {
     if (!to_stdout) {
-        int ours = tmp_still_ours(out, tmp_path);
+        struct stat fst, lst;
+        int ours = fstat(fileno(out), &fst) == 0 &&
+                   save_tmp_lstat(d->parent_fd, d->tmpbase, &lst) == 0 &&
+                   fst.st_dev == lst.st_dev && fst.st_ino == lst.st_ino &&
+                   save_stat_is_ours(&lst) == 0;
 
         fclose(out);
-        if (ours == 0)
-            unlink(tmp_path);
+        if (ours)
+            unlinkat(d->parent_fd, d->tmpbase, 0);
         else
             fprintf(stderr,
                     "avctl: %s was replaced during save - leaving it in place\n",
                     tmp_path);
+        close(d->parent_fd);
+        d->parent_fd = -1;
     }
 }
 
@@ -461,10 +537,13 @@ static int do_save(const char *path)
     int to_stdout = !strcmp(path, "-");
     /* Identity of the tmp file captured while its stream is still open
      * (see the fsync block below): post-close checkpoints compare
-     * lstat(tmp_path) against this. have_written == 0 fails every such
-     * checkpoint closed. */
+     * fstatat() through the pinned parent against this. have_written
+     * == 0 fails every such checkpoint closed. dest holds the pinned
+     * parent fd plus basenames for every descriptor-relative operation
+     * (rechecks, cleanup, rename); parent_fd is -1 in stdout mode. */
     struct stat written_st;
     int have_written = 0;
+    struct save_dest dest;
 
     if (to_stdout) {
         out = stdout;
@@ -472,43 +551,46 @@ static int do_save(const char *path)
         int tmp_n;
         int tmp_fd;
 
+        dest.parent_fd = -1;
         if (strlen(path) >= PATH_MAX) {
             fprintf(stderr, "avctl: path too long (max %d bytes)\n", PATH_MAX - 1);
             return 1;
         }
-        /* Reject rather than let snprintf() silently truncate: a
-         * truncated tmp_path would write the dump to a DIFFERENT
-         * file than the one rename()'d into place below, with no
-         * error either side. */
+        /* Display-only: every real operation below goes through the
+         * pinned dest (parent_fd + tmpbase) and never resolves this
+         * string, so even a hostile value here can only garble a
+         * message, never redirect a syscall. Truncation still
+         * rejected so the message names the real file. */
         tmp_n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
         if (tmp_n < 0 || (size_t)tmp_n >= sizeof(tmp_path)) {
             fprintf(stderr, "avctl: path too long to format\n");
             return 1;
         }
 
-        /* Parent trust before anything is created: O_EXCL|O_NOFOLLOW
-         * below stops a pre-planted entry, but only a non-attacker-
-         * modifiable parent stops tmp_path being swapped between
-         * open() and rename(). */
-        if (save_parent_trusted(path))
+        /* Pin the parent before anything is created: the walk refuses
+         * symlinked or untrusted ancestors and hands back a held-open
+         * fd, so the create below cannot be redirected no matter what
+         * happens to the namespace afterwards. */
+        if (pin_save_parent(path, &dest))
             return 1;
 
-        /* O_CREAT|O_EXCL|O_NOFOLLOW, not plain fopen(path, "w"): a
-         * predictable "<path>.tmp" name in an attacker-writable
-         * directory lets a local attacker pre-plant a symlink there
-         * (e.g. /tmp/state.tmp -> /etc/shadow), and fopen() would
-         * follow it and clobber the target as root. O_NOFOLLOW
-         * refuses to open through a symlink and O_EXCL refuses to
-         * open a pre-existing path at all, so either attack shape
-         * fails closed here instead. A stale regular .tmp from a
-         * previous crashed save is the only legitimate EEXIST case,
-         * and refusing to silently overwrite it is the safe default
-         * - the operator removes it and re-runs. Mode 0600: the dump
-         * replays into kernel state, so it inherits save's own
-         * umask-independent restrictiveness rather than the
-         * directory default. */
-        tmp_fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
-                      0600);
+        /* O_CREAT|O_EXCL|O_NOFOLLOW through the pinned parent, not
+         * plain fopen(path, "w"): a predictable "<path>.tmp" name in
+         * an attacker-visible directory lets a local attacker
+         * pre-plant a symlink there (e.g. /tmp/state.tmp ->
+         * /etc/shadow), and fopen() would follow it and clobber the
+         * target as root. Relative to the pinned fd the name cannot
+         * escape the validated directory at all (it contains no '/'),
+         * O_NOFOLLOW refuses a trailing symlink, and O_EXCL refuses a
+         * pre-existing entry - every attack shape fails closed here
+         * instead. A stale regular .tmp from a previous crashed save
+         * is the only legitimate EEXIST case, and refusing to silently
+         * overwrite it is the safe default - the operator removes it
+         * and re-runs. Mode 0600: the dump replays into kernel state,
+         * so it inherits save's own umask-independent restrictiveness
+         * rather than the directory default. */
+        tmp_fd = openat(dest.parent_fd, dest.tmpbase,
+                        O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
         if (tmp_fd < 0) {
             if (errno == EEXIST)
                 fprintf(stderr,
@@ -518,6 +600,7 @@ static int do_save(const char *path)
             else
                 fprintf(stderr, "avctl: could not open %s for writing: %s\n",
                         tmp_path, strerror(errno));
+            close(dest.parent_fd);
             return 1;
         }
         out = fdopen(tmp_fd, "w");
@@ -525,7 +608,8 @@ static int do_save(const char *path)
             fprintf(stderr, "avctl: could not open %s for writing: %s\n",
                     tmp_path, strerror(errno));
             close(tmp_fd);
-            unlink(tmp_path);
+            unlinkat(dest.parent_fd, dest.tmpbase, 0);
+            close(dest.parent_fd);
             return 1;
         }
 
@@ -537,7 +621,7 @@ static int do_save(const char *path)
         fprintf(stderr, "avctl: could not open %s: %s\n"
                          "(is the av module loaded? try: sudo insmod av.ko)\n",
                 PROC_PATH, strerror(errno));
-        save_abort(out, tmp_path, to_stdout);
+        save_abort(out, &dest, tmp_path, to_stdout);
         return 1;
     }
     while (fgets(line, sizeof(line), in)) {
@@ -555,7 +639,7 @@ static int do_save(const char *path)
         fprintf(stderr, "avctl: could not open %s: %s\n"
                          "(is the av module loaded? try: sudo insmod av.ko)\n",
                 TRUST_PROC_PATH, strerror(errno));
-        save_abort(out, tmp_path, to_stdout);
+        save_abort(out, &dest, tmp_path, to_stdout);
         return 1;
     }
     while (fgets(line, sizeof(line), in)) {
@@ -573,7 +657,7 @@ static int do_save(const char *path)
         fprintf(stderr, "avctl: could not open %s: %s\n"
                          "(is the av module loaded? try: sudo insmod av.ko)\n",
                 PROTECTED_PROC_PATH, strerror(errno));
-        save_abort(out, tmp_path, to_stdout);
+        save_abort(out, &dest, tmp_path, to_stdout);
         return 1;
     }
     while (fgets(line, sizeof(line), in)) {
@@ -593,7 +677,7 @@ static int do_save(const char *path)
         fprintf(stderr, "avctl: could not open %s: %s\n"
                          "(is the av module loaded? try: sudo insmod av.ko)\n",
                 POLICY_PROC_PATH, strerror(errno));
-        save_abort(out, tmp_path, to_stdout);
+        save_abort(out, &dest, tmp_path, to_stdout);
         return 1;
     }
     if (fgets(line, sizeof(line), in)) {
@@ -626,73 +710,106 @@ static int do_save(const char *path)
      * overwrite via O_EXCL - durability of the temp file itself, not
      * just error detection. Identity is captured while the stream is
      * still open so the checkpoints below can tell our file apart from
-     * a replacement after close. */
+     * a replacement after close. All rechecks go through the pinned
+     * parent (fstatat), never a re-resolved path. */
     if (fflush(out) != 0)
         werr = 1;
     if (fsync(fileno(out)) != 0)
         werr = 1;
-    if (tmp_still_ours(out, tmp_path) != 0) {
-        fprintf(stderr,
-                "avctl: %s was replaced during save - refusing to install it\n",
-                tmp_path);
-        werr = 1;
+    {
+        struct stat fst, lst;
+
+        if (fstat(fileno(out), &fst) != 0 ||
+            save_tmp_lstat(dest.parent_fd, dest.tmpbase, &lst) != 0 ||
+            fst.st_dev != lst.st_dev || fst.st_ino != lst.st_ino ||
+            save_stat_is_ours(&lst) != 0) {
+            fprintf(stderr,
+                    "avctl: %s was replaced during save - refusing to install it\n",
+                    tmp_path);
+            werr = 1;
+        }
     }
     if (fstat(fileno(out), &written_st) == 0)
         have_written = 1;
     if (fclose(out) != 0)
         werr = 1;
 
-    if (werr) {
-        fprintf(stderr, "avctl: write error while saving to %s\n", tmp_path);
-        /* Only clean up our own file (same reasoning as save_abort):
-         * after a replacement, tmp_path is someone else's entry. */
-        if (have_written && path_still_names(tmp_path, &written_st) == 0)
-            unlink(tmp_path);
-        else if (have_written)
-            fprintf(stderr,
-                    "avctl: %s was replaced during save - leaving it in place\n",
-                    tmp_path);
-        else
-            unlink(tmp_path);
-        return 1;
-    }
-
-    /* Final recheck immediately before rename: narrows the residual
-     * swap window (parent trust above is what removes the capability;
-     * this catches a swap that happened anyway before it can be
-     * installed at `path`). */
+    /* Rechecks tmpbase against the captured identity through the pinned
+     * parent. Returns true if it is still ours. */
     {
+        struct stat lst;
         int still_ours = have_written &&
-                         path_still_names(tmp_path, &written_st) == 0;
+                         save_tmp_lstat(dest.parent_fd, dest.tmpbase, &lst) == 0 &&
+                         lst.st_dev == written_st.st_dev &&
+                         lst.st_ino == written_st.st_ino &&
+                         save_stat_is_ours(&lst) == 0;
 
+        if (werr) {
+            fprintf(stderr, "avctl: write error while saving to %s\n", tmp_path);
+            /* Only clean up our own file (same reasoning as save_abort):
+             * after a replacement, the name is someone else's entry. */
+            if (still_ours)
+                unlinkat(dest.parent_fd, dest.tmpbase, 0);
+            else if (have_written)
+                fprintf(stderr,
+                        "avctl: %s was replaced during save - leaving it in place\n",
+                        tmp_path);
+            else
+                unlinkat(dest.parent_fd, dest.tmpbase, 0);
+            close(dest.parent_fd);
+            return 1;
+        }
+
+        /* Final recheck immediately before rename: descriptor-relative,
+         * so there is no re-resolution window at all - the pinned fd
+         * cannot be redirected by namespace swaps. */
         if (!still_ours) {
             fprintf(stderr,
                     "avctl: %s was replaced during save - refusing to rename it into place\n",
                     tmp_path);
-            /* Verified-replaced means tmp_path is someone else's entry:
+            /* Verified-replaced means the name is someone else's entry:
              * leave it. Unverifiable (!have_written) means the fstat on
              * our own stream failed - the file is still the one we
-             * created in a trusted parent, so remove it like any other
+             * created in the pinned parent, so remove it like any other
              * failed save. */
             if (have_written)
                 fprintf(stderr,
                         "avctl: leaving %s in place\n", tmp_path);
             else
-                unlink(tmp_path);
+                unlinkat(dest.parent_fd, dest.tmpbase, 0);
+            close(dest.parent_fd);
             return 1;
         }
     }
 
-    if (rename(tmp_path, path) != 0) {
+    if (renameat(dest.parent_fd, dest.tmpbase, dest.parent_fd, dest.base) != 0) {
         fprintf(stderr, "avctl: could not rename %s to %s: %s\n",
                 tmp_path, path, strerror(errno));
-        /* Same ownership guard as every other unlink here: rename() is
-         * the one step that re-resolves tmp_path after the pre-rename
-         * recheck, so re-verify before cleaning up. */
-        if (path_still_names(tmp_path, &written_st) == 0)
-            unlink(tmp_path);
+        /* Same ownership guard as every other unlinkat here. */
+        {
+            struct stat lst;
+
+            if (have_written &&
+                save_tmp_lstat(dest.parent_fd, dest.tmpbase, &lst) == 0 &&
+                lst.st_dev == written_st.st_dev &&
+                lst.st_ino == written_st.st_ino &&
+                save_stat_is_ours(&lst) == 0)
+                unlinkat(dest.parent_fd, dest.tmpbase, 0);
+        }
+        close(dest.parent_fd);
         return 1;
     }
+
+    /* Persist the rename itself: without a parent-dir fsync a crash
+     * right here can lose the directory entry, leaving the synced tmp
+     * behind (the next save then refuses with EEXIST and tells the
+     * operator to remove it - recoverable, but avoidable). Best
+     * effort: the data itself is already synced, so a dir-sync failure
+     * only warns rather than failing the save. */
+    if (fsync(dest.parent_fd) != 0)
+        fprintf(stderr, "avctl: warning: could not sync parent directory of %s: %s\n",
+                path, strerror(errno));
+    close(dest.parent_fd);
 
     printf("saved %d signature(s), %d trusted entr%s, %d protected path%s, "
            "and the daemon-unavailable policy to %s\n",

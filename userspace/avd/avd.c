@@ -1232,65 +1232,133 @@ static int write_quarantine_meta(const char *dest, const struct stat *orig_st,
   return 0;
 }
 
-/* Trusted-directory gate shared by ensure_quarantine_dir() and
- * ensure_parent_dir(): an existing directory that an unprivileged user
- * can modify lets them swap validated contents afterwards (quarantine
- * files/metadata the daemon later acts on by pathname; the control
- * socket the daemon chmod's by path), so mere existence is not enough.
- * The directory (lstat, never stat, so a symlink is seen rather than
- * followed) must be a real directory owned by the daemon's own euid
- * (avd runs as root, so in practice uid 0) or by root, and must not be
- * modifiable by unprivileged users: any group/other write access is
- * rejected unless the sticky bit is also set. In a sticky directory
- * (/tmp-style) only an entry's owner, the directory owner, or root can
- * rename/remove entries, so other users cannot swap the daemon's files
- * there - a pre-planted entry just makes the daemon's O_EXCL create
- * fail closed. Quarantine passes false (no reason a quarantine dir
- * needs to be shared at all, so any shared write is rejected); the
- * socket parent passes true (a sticky socket dir is a supported layout
- * and is safe for the same ownership reason). Returns 0 if trusted,
- * -1 (with an error already printed) otherwise. */
-static int dir_trusted_for_daemon(const char *label, const char *dir,
-                                  bool allow_sticky_ww) {
+/* Trust policy for one existing path component: lstat (never stat, so
+ * a symlink is seen rather than followed), must be a real directory
+ * owned by the daemon's own euid (avd runs as root, so in practice uid
+ * 0) or by root, with no group/other write access unless the sticky
+ * bit excuses it when allow_sticky_ww is set - see
+ * dir_hierarchy_trusted() for how the flag differs between final and
+ * ancestor components). Returns 0 if trusted, -1 (error printed)
+ * otherwise. */
+static int trust_one_component(const char *label, const char *comp,
+                               bool allow_sticky_ww) {
   struct stat st;
   uid_t euid = geteuid();
 
-  if (lstat(dir, &st) != 0) {
-    fprintf(stderr, "avd: %s \"%s\" vanished after EEXIST: %s\n", label,
-            dir, strerror(errno));
+  if (lstat(comp, &st) != 0) {
+    fprintf(stderr, "avd: %s \"%s\" vanished: %s\n", label, comp,
+            strerror(errno));
     return -1;
   }
   if (S_ISLNK(st.st_mode)) {
     fprintf(stderr, "avd: %s \"%s\" is a symlink - refusing to follow it\n",
-            label, dir);
+            label, comp);
     return -1;
   }
   if (!S_ISDIR(st.st_mode)) {
     fprintf(stderr, "avd: %s \"%s\" exists but is not a directory\n", label,
-            dir);
+            comp);
     return -1;
   }
   if (st.st_uid != euid && st.st_uid != 0) {
     fprintf(stderr,
             "avd: %s \"%s\" is owned by uid %d - refusing to use a directory an unprivileged user controls\n",
-            label, dir, (int)st.st_uid);
+            label, comp, (int)st.st_uid);
     return -1;
   }
   if ((st.st_mode & (S_IWGRP | S_IWOTH)) &&
       (!allow_sticky_ww || !(st.st_mode & S_ISVTX))) {
     fprintf(stderr,
             "avd: %s \"%s\" is writable by other users%s - refusing to use a directory other users can modify\n",
-            label, dir,
+            label, comp,
             allow_sticky_ww ? " without the sticky bit" : "");
     return -1;
   }
   return 0;
 }
 
+/* Full-hierarchy version of the trust gate: validating only the final
+ * component leaves a gap - a writable non-sticky ancestor lets an
+ * unprivileged user rename a root-owned mode-0755 directory after the
+ * check (e.g. attacker-owned /tmp/attacker replaced wholesale, taking
+ * /tmp/attacker/socket-parent with it), and every later path-based op
+ * (bind/chmod by path, quarantine renames) re-resolves through the
+ * swapped ancestor. So every ancestor from / down is checked with the
+ * same ownership/symlink rules, shallow to deep: a symlinked ancestor
+ * fails before anything beneath it is even examined (deeper prefixes
+ * are never resolved through it), and an attacker-owned or
+ * attacker-writable one fails on its own terms. Ancestors allow the
+ * sticky exception unconditionally: a sticky ancestor (like /tmp
+ * itself) cannot be renamed by non-owners, and without the exception
+ * no chain beneath /tmp could ever validate - including the test
+ * suite's throwaway dirs. The FINAL component uses allow_sticky_ww:
+ * false keeps it strictly unshared (the quarantine dir - no group or
+ * other write at all, so nobody else can even plant fake entries
+ * there), true additionally permits a sticky-shared final dir (the
+ * socket parent - a sticky socket dir is safe because only the entry
+ * owner can touch the socket, and every socket op re-verifies it).
+ * (".." and "." segments need no special handling: neither can be a
+ * symlink, and each literal prefix is still lstat'd for
+ * ownership/mode.) Applied on every path - including after a
+ * successful mkdir(), whose fresh directory is ours but whose
+ * ancestors merely allowed its creation (root can mkdir inside an
+ * attacker-owned tree just as easily as anywhere else). Once the
+ * whole chain is trusted, no unprivileged user can modify any of it -
+ * which is also what closes the check-then-use gap without pinned fds
+ * for every later operation: the window remains in theory, but there
+ * is nobody left who is both unprivileged and able to write through
+ * it. Returns 0 if the whole chain is trusted, -1 otherwise. */
+static int dir_hierarchy_trusted(const char *label, const char *dir,
+                                 bool allow_sticky_ww) {
+  char buf[PATH_MAX];
+  size_t len, i;
+  int sn;
+
+  if (!dir[0] || dir[0] != '/') {
+    fprintf(stderr, "avd: %s \"%s\" must be an absolute path\n", label,
+            dir);
+    return -1;
+  }
+  sn = snprintf(buf, sizeof(buf), "%s", dir);
+  if (sn < 0 || (size_t)sn >= sizeof(buf)) {
+    fprintf(stderr, "avd: %s path too long: \"%s\"\n", label, dir);
+    return -1;
+  }
+  /* Strip trailing slashes so "/a/b/" checks "/a/b" (root "/" keeps
+   * its own slash). */
+  len = strlen(buf);
+  while (len > 1 && buf[len - 1] == '/')
+    buf[--len] = '\0';
+  /* "/" itself is an ancestor of everything: sticky-tolerant, like
+   * all non-final components. (In practice root-owned 555/755.) */
+  if (trust_one_component(label, "/", true) != 0)
+    return -1;
+  /* Every deeper prefix ending at a component boundary, shallow
+   * first. Consecutive slashes yield empty segments, skipped. The
+   * boundary at i == len is the final component and gets the
+   * caller's allow_sticky_ww; anything before it is an ancestor. */
+  for (i = 1; i <= len; i++) {
+    if (buf[i] == '/' || buf[i] == '\0') {
+      char saved;
+      bool is_final = (i == len);
+      int r;
+
+      if (i == 1 || buf[i - 1] == '/')
+        continue; /* leading or doubled slash: no new component */
+      saved = buf[i];
+      buf[i] = '\0';
+      r = trust_one_component(label, buf,
+                              is_final ? allow_sticky_ww : true);
+      buf[i] = saved;
+      if (r != 0)
+        return -1;
+    }
+  }
+  return 0;
+}
+
 static int ensure_quarantine_dir(void) {
-  if (mkdir(quarantine_dir, 0700) == 0)
-    return 0;
-  if (errno != EEXIST) {
+  if (mkdir(quarantine_dir, 0700) != 0 && errno != EEXIST) {
     fprintf(stderr, "avd: could not create quarantine dir \"%s\": %s\n",
             quarantine_dir, strerror(errno));
     return -1;
@@ -1298,16 +1366,19 @@ static int ensure_quarantine_dir(void) {
   /* mkdir() tolerating EEXIST must not treat "a symlink to /etc"
    * the same as "the directory already exists": an attacker who
    * pre-creates a symlink at quarantine_dir before avd starts would
-   * otherwise redirect every quarantine write through it. Beyond the
-   * symlink check, the directory must be one no unprivileged user can
-   * modify (see dir_trusted_for_daemon()): otherwise quarantine files
-   * validated at one moment could be swapped before restore/rename
-   * acts on them by pathname. A freshly mkdir()'d dir above is ours
-   * by construction, so only this pre-existing path needs the gate.
-   * No *at()/dir-FD pinning is needed on top: once unprivileged users
-   * cannot modify the directory at all, there is nothing left for a
-   * retained FD to defend against. */
-  return dir_trusted_for_daemon("quarantine dir", quarantine_dir, false);
+   * otherwise redirect every quarantine write through it. And the
+   * check runs after a successful mkdir() too: a fresh directory is
+   * ours, but the ancestors that allowed its creation may still be
+   * attacker-controlled (root can mkdir inside an attacker-owned tree
+   * just as easily as anywhere else - an attacker-owned ancestor can
+   * rename our new directory away afterwards). The full chain - not
+   * just the final component - is validated, so no unprivileged user
+   * can modify any of it; that is also what closes the check-then-use
+   * gap without pinned fds for every later operation. No *at()/dir-FD
+   * pinning on top: once unprivileged users cannot modify the
+   * directory or any ancestor, there is nothing left for a retained
+   * FD to defend against. */
+  return dir_hierarchy_trusted("quarantine dir", quarantine_dir, false);
 }
 
 /* Fallback for quarantine_file()'s linkat() failing - see that
@@ -2663,21 +2734,22 @@ static int ensure_parent_dir(const char *path, mode_t mode) {
     return -1;
   }
   dir = dirname(buf);
-  if (mkdir(dir, mode) == 0)
-    return 0;
-  if (errno != EEXIST) {
+  if (mkdir(dir, mode) != 0 && errno != EEXIST) {
     fprintf(stderr, "avd: could not create directory \"%s\": %s\n", dir,
             strerror(errno));
     return -1;
   }
-  /* Same gate as ensure_quarantine_dir(): a pre-existing parent that an
-   * unprivileged user can modify must not be silently accepted as
-   * "directory already exists" - they could replace the socket between
-   * the bind() below and its chmod(). A freshly mkdir()'d parent is
-   * ours by construction, so only this path needs the check. Sticky
-   * world-writable parents stay supported (safe: only the entry owner
-   * can rename/remove entries there). */
-  return dir_trusted_for_daemon("socket parent", dir, true);
+  /* Same gate as ensure_quarantine_dir(), over the whole ancestor
+   * chain: a pre-existing parent that an unprivileged user can modify
+   * must not be silently accepted as "directory already exists" -
+   * they could replace the socket between the bind() below and its
+   * chmod(). Checked after a successful mkdir() as well, for the same
+   * attacker-owned-ancestor reason. A freshly mkdir()'d parent is ours
+   * by construction, so only pre-existing paths needed the old check;
+   * the chain check covers both uniformly. Sticky world-writable
+   * parents stay supported (safe: only the entry owner can
+   * rename/remove entries there). */
+  return dir_hierarchy_trusted("socket parent", dir, true);
 }
 
 static int start_control_socket(void) {
