@@ -43,6 +43,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 
 #define PROC_PATH "/proc/kernel_av_signatures"
@@ -302,15 +303,150 @@ static int write_command(const char *cmd)
  * leftover-corrupt-file failure mode to protect against. The summary
  * line goes to stderr instead of stdout in this mode, so stdout stays
  * pure, directly-parseable data for the caller. */
+/* Parent-directory trust gate for do_save()'s tmp-file+rename dance.
+ * O_CREAT|O_EXCL|O_NOFOLLOW closes the pre-planted-symlink angle, but an
+ * attacker who can modify the parent directory can still swap tmp_path
+ * itself between our open() and the rename() below, and rename() would
+ * then install their replacement at `path`. So refuse attacker-modifiable
+ * parents up front. The parent (lstat, never stat, so a symlink is seen
+ * rather than followed) must exist, must be a real directory, and must be
+ * owned by our own euid or by root. Group write is rejected outright, and
+ * other-write is rejected unless the sticky bit is also set: in a sticky
+ * world-writable directory (/tmp-style) only the entry's owner (us - we
+ * just created tmp_path), the directory owner, or root can
+ * rename/remove entries, so nobody else can swap our tmp file out from
+ * under us. Returns 0 if trusted, -1 (with an error already printed)
+ * otherwise. */
+static int save_parent_trusted(const char *path)
+{
+    char parent[PATH_MAX];
+    const char *slash = strrchr(path, '/');
+    struct stat st;
+    uid_t euid = geteuid();
+
+    if (!slash) {
+        /* Bare filename: the parent is the cwd. */
+        strcpy(parent, ".");
+    } else if (slash == path) {
+        /* "/foo": the parent is "/". */
+        strcpy(parent, "/");
+    } else {
+        size_t plen = (size_t)(slash - path);
+
+        if (plen >= sizeof(parent)) {
+            fprintf(stderr, "avctl: path too long to format\n");
+            return -1;
+        }
+        memcpy(parent, path, plen);
+        parent[plen] = '\0';
+    }
+
+    if (lstat(parent, &st) != 0) {
+        fprintf(stderr, "avctl: cannot stat parent directory of %s: %s\n",
+                path, strerror(errno));
+        return -1;
+    }
+    if (S_ISLNK(st.st_mode)) {
+        fprintf(stderr,
+                "avctl: parent directory of %s is a symlink - refusing to save there\n",
+                path);
+        return -1;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        fprintf(stderr,
+                "avctl: parent of %s is not a directory - refusing to save there\n",
+                path);
+        return -1;
+    }
+    if (st.st_uid != euid && st.st_uid != 0) {
+        fprintf(stderr,
+                "avctl: parent directory of %s is owned by uid %d - refusing to save there\n",
+                path, (int)st.st_uid);
+        return -1;
+    }
+    /* Any write access for group/other lets another user rename/remove
+     * entries - unless the sticky bit is also set. In a sticky
+     * directory (/tmp-style, including /tmp itself) only an entry's
+     * owner, the directory owner, or root can rename/remove it, so
+     * group/other write there cannot swap our tmp file: a pre-planted
+     * entry just makes our O_EXCL create fail closed, and a planted
+     * hardlink is caught by tmp_still_ours()'s nlink check. */
+    if ((st.st_mode & (S_IWGRP | S_IWOTH)) && !(st.st_mode & S_ISVTX)) {
+        fprintf(stderr,
+                "avctl: parent directory of %s is writable by other users without the sticky bit - refusing to save there\n",
+                path);
+        return -1;
+    }
+    return 0;
+}
+
+/* Re-verifies that tmp_path still names the exact file our open FILE
+ * stream is writing to: same device+inode, still a regular file, still
+ * owned by us, single link (a second hardlink would let someone else
+ * hold - or repoint - the name). Defense in depth behind
+ * save_parent_trusted() above, which is what actually removes an
+ * attacker's ability to swap the entry: this catches a swap that
+ * happened anyway (stale mount games, a trusted-but-confused admin)
+ * before rename() can install it at `path`. Returns 0 if tmp_path is
+ * still ours, -1 otherwise. */
+static int tmp_still_ours(FILE *out, const char *tmp_path)
+{
+    struct stat fst, lst;
+
+    if (fstat(fileno(out), &fst) != 0)
+        return -1;
+    if (lstat(tmp_path, &lst) != 0)
+        return -1;
+    if (fst.st_dev != lst.st_dev || fst.st_ino != lst.st_ino)
+        return -1;
+    if (!S_ISREG(lst.st_mode))
+        return -1;
+    if (lst.st_uid != geteuid())
+        return -1;
+    if (lst.st_nlink != 1)
+        return -1;
+    return 0;
+}
+
+/* Post-close half of tmp_still_ours(): once the stream is fclose()'d
+ * there is no fd left to fstat, so checkpoints after close compare
+ * lstat(tmp_path) against the identity captured while the stream was
+ * still open. Same fail-closed stance. */
+static int path_still_names(const char *tmp_path, const struct stat *expect)
+{
+    struct stat lst;
+
+    if (lstat(tmp_path, &lst) != 0)
+        return -1;
+    if (lst.st_dev != expect->st_dev || lst.st_ino != expect->st_ino)
+        return -1;
+    if (!S_ISREG(lst.st_mode))
+        return -1;
+    if (lst.st_uid != geteuid())
+        return -1;
+    if (lst.st_nlink != 1)
+        return -1;
+    return 0;
+}
+
 /* save_abort() only runs after do_save() successfully created tmp_path
  * via O_CREAT|O_EXCL|O_NOFOLLOW above, so the unlink() here removes a
  * path this process itself created - never a pre-existing symlink it
- * merely opened through. */
+ * merely opened through. Re-checked (not just assumed): if tmp_path no
+ * longer names our own just-written file, it is left alone rather than
+ * deleted, since it is someone else's entry by then. */
 static void save_abort(FILE *out, const char *tmp_path, int to_stdout)
 {
     if (!to_stdout) {
+        int ours = tmp_still_ours(out, tmp_path);
+
         fclose(out);
-        unlink(tmp_path);
+        if (ours == 0)
+            unlink(tmp_path);
+        else
+            fprintf(stderr,
+                    "avctl: %s was replaced during save - leaving it in place\n",
+                    tmp_path);
     }
 }
 
@@ -323,6 +459,12 @@ static int do_save(const char *path)
     int sig_count = 0, trust_count = 0, protect_count = 0;
     int werr = 0;
     int to_stdout = !strcmp(path, "-");
+    /* Identity of the tmp file captured while its stream is still open
+     * (see the fsync block below): post-close checkpoints compare
+     * lstat(tmp_path) against this. have_written == 0 fails every such
+     * checkpoint closed. */
+    struct stat written_st;
+    int have_written = 0;
 
     if (to_stdout) {
         out = stdout;
@@ -343,6 +485,13 @@ static int do_save(const char *path)
             fprintf(stderr, "avctl: path too long to format\n");
             return 1;
         }
+
+        /* Parent trust before anything is created: O_EXCL|O_NOFOLLOW
+         * below stops a pre-planted entry, but only a non-attacker-
+         * modifiable parent stops tmp_path being swapped between
+         * open() and rename(). */
+        if (save_parent_trusted(path))
+            return 1;
 
         /* O_CREAT|O_EXCL|O_NOFOLLOW, not plain fopen(path, "w"): a
          * predictable "<path>.tmp" name in an attacker-writable
@@ -475,24 +624,73 @@ static int do_save(const char *path)
     /* fsync before rename so a crash between close and rename can't
      * leave a zero-length .tmp that a later save would then refuse to
      * overwrite via O_EXCL - durability of the temp file itself, not
-     * just error detection. */
+     * just error detection. Identity is captured while the stream is
+     * still open so the checkpoints below can tell our file apart from
+     * a replacement after close. */
     if (fflush(out) != 0)
         werr = 1;
     if (fsync(fileno(out)) != 0)
         werr = 1;
+    if (tmp_still_ours(out, tmp_path) != 0) {
+        fprintf(stderr,
+                "avctl: %s was replaced during save - refusing to install it\n",
+                tmp_path);
+        werr = 1;
+    }
+    if (fstat(fileno(out), &written_st) == 0)
+        have_written = 1;
     if (fclose(out) != 0)
         werr = 1;
 
     if (werr) {
         fprintf(stderr, "avctl: write error while saving to %s\n", tmp_path);
-        unlink(tmp_path);
+        /* Only clean up our own file (same reasoning as save_abort):
+         * after a replacement, tmp_path is someone else's entry. */
+        if (have_written && path_still_names(tmp_path, &written_st) == 0)
+            unlink(tmp_path);
+        else if (have_written)
+            fprintf(stderr,
+                    "avctl: %s was replaced during save - leaving it in place\n",
+                    tmp_path);
+        else
+            unlink(tmp_path);
         return 1;
+    }
+
+    /* Final recheck immediately before rename: narrows the residual
+     * swap window (parent trust above is what removes the capability;
+     * this catches a swap that happened anyway before it can be
+     * installed at `path`). */
+    {
+        int still_ours = have_written &&
+                         path_still_names(tmp_path, &written_st) == 0;
+
+        if (!still_ours) {
+            fprintf(stderr,
+                    "avctl: %s was replaced during save - refusing to rename it into place\n",
+                    tmp_path);
+            /* Verified-replaced means tmp_path is someone else's entry:
+             * leave it. Unverifiable (!have_written) means the fstat on
+             * our own stream failed - the file is still the one we
+             * created in a trusted parent, so remove it like any other
+             * failed save. */
+            if (have_written)
+                fprintf(stderr,
+                        "avctl: leaving %s in place\n", tmp_path);
+            else
+                unlink(tmp_path);
+            return 1;
+        }
     }
 
     if (rename(tmp_path, path) != 0) {
         fprintf(stderr, "avctl: could not rename %s to %s: %s\n",
                 tmp_path, path, strerror(errno));
-        unlink(tmp_path);
+        /* Same ownership guard as every other unlink here: rename() is
+         * the one step that re-resolves tmp_path after the pre-rename
+         * recheck, so re-verify before cleaning up. */
+        if (path_still_names(tmp_path, &written_st) == 0)
+            unlink(tmp_path);
         return 1;
     }
 

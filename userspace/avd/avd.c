@@ -1232,9 +1232,62 @@ static int write_quarantine_meta(const char *dest, const struct stat *orig_st,
   return 0;
 }
 
-static int ensure_quarantine_dir(void) {
+/* Trusted-directory gate shared by ensure_quarantine_dir() and
+ * ensure_parent_dir(): an existing directory that an unprivileged user
+ * can modify lets them swap validated contents afterwards (quarantine
+ * files/metadata the daemon later acts on by pathname; the control
+ * socket the daemon chmod's by path), so mere existence is not enough.
+ * The directory (lstat, never stat, so a symlink is seen rather than
+ * followed) must be a real directory owned by the daemon's own euid
+ * (avd runs as root, so in practice uid 0) or by root, and must not be
+ * modifiable by unprivileged users: any group/other write access is
+ * rejected unless the sticky bit is also set. In a sticky directory
+ * (/tmp-style) only an entry's owner, the directory owner, or root can
+ * rename/remove entries, so other users cannot swap the daemon's files
+ * there - a pre-planted entry just makes the daemon's O_EXCL create
+ * fail closed. Quarantine passes false (no reason a quarantine dir
+ * needs to be shared at all, so any shared write is rejected); the
+ * socket parent passes true (a sticky socket dir is a supported layout
+ * and is safe for the same ownership reason). Returns 0 if trusted,
+ * -1 (with an error already printed) otherwise. */
+static int dir_trusted_for_daemon(const char *label, const char *dir,
+                                  bool allow_sticky_ww) {
   struct stat st;
+  uid_t euid = geteuid();
 
+  if (lstat(dir, &st) != 0) {
+    fprintf(stderr, "avd: %s \"%s\" vanished after EEXIST: %s\n", label,
+            dir, strerror(errno));
+    return -1;
+  }
+  if (S_ISLNK(st.st_mode)) {
+    fprintf(stderr, "avd: %s \"%s\" is a symlink - refusing to follow it\n",
+            label, dir);
+    return -1;
+  }
+  if (!S_ISDIR(st.st_mode)) {
+    fprintf(stderr, "avd: %s \"%s\" exists but is not a directory\n", label,
+            dir);
+    return -1;
+  }
+  if (st.st_uid != euid && st.st_uid != 0) {
+    fprintf(stderr,
+            "avd: %s \"%s\" is owned by uid %d - refusing to use a directory an unprivileged user controls\n",
+            label, dir, (int)st.st_uid);
+    return -1;
+  }
+  if ((st.st_mode & (S_IWGRP | S_IWOTH)) &&
+      (!allow_sticky_ww || !(st.st_mode & S_ISVTX))) {
+    fprintf(stderr,
+            "avd: %s \"%s\" is writable by other users%s - refusing to use a directory other users can modify\n",
+            label, dir,
+            allow_sticky_ww ? " without the sticky bit" : "");
+    return -1;
+  }
+  return 0;
+}
+
+static int ensure_quarantine_dir(void) {
   if (mkdir(quarantine_dir, 0700) == 0)
     return 0;
   if (errno != EEXIST) {
@@ -1245,27 +1298,16 @@ static int ensure_quarantine_dir(void) {
   /* mkdir() tolerating EEXIST must not treat "a symlink to /etc"
    * the same as "the directory already exists": an attacker who
    * pre-creates a symlink at quarantine_dir before avd starts would
-   * otherwise redirect every quarantine write through it. lstat()
-   * (not stat(), which follows the link) distinguishes the two -
-   * a symlink, a regular file, or a missing path all fail closed
-   * here instead of being followed. */
-  if (lstat(quarantine_dir, &st) != 0) {
-    fprintf(stderr, "avd: quarantine dir \"%s\" vanished after EEXIST: %s\n",
-            quarantine_dir, strerror(errno));
-    return -1;
-  }
-  if (S_ISLNK(st.st_mode)) {
-    fprintf(stderr,
-            "avd: quarantine dir \"%s\" is a symlink - refusing to follow it\n",
-            quarantine_dir);
-    return -1;
-  }
-  if (!S_ISDIR(st.st_mode)) {
-    fprintf(stderr, "avd: quarantine path \"%s\" exists but is not a directory\n",
-            quarantine_dir);
-    return -1;
-  }
-  return 0;
+   * otherwise redirect every quarantine write through it. Beyond the
+   * symlink check, the directory must be one no unprivileged user can
+   * modify (see dir_trusted_for_daemon()): otherwise quarantine files
+   * validated at one moment could be swapped before restore/rename
+   * acts on them by pathname. A freshly mkdir()'d dir above is ours
+   * by construction, so only this pre-existing path needs the gate.
+   * No *at()/dir-FD pinning is needed on top: once unprivileged users
+   * cannot modify the directory at all, there is nothing left for a
+   * retained FD to defend against. */
+  return dir_trusted_for_daemon("quarantine dir", quarantine_dir, false);
 }
 
 /* Fallback for quarantine_file()'s linkat() failing - see that
@@ -2611,7 +2653,6 @@ static void *control_conn_main(void *arg) {
 static int ensure_parent_dir(const char *path, mode_t mode) {
   char buf[PATH_MAX];
   char *dir;
-  struct stat st;
   int sn;
 
   /* Fail closed on truncation: a truncated parent would mkdir/chmod
@@ -2629,26 +2670,14 @@ static int ensure_parent_dir(const char *path, mode_t mode) {
             strerror(errno));
     return -1;
   }
-  /* Same symlink-vs-directory distinction as ensure_quarantine_dir():
-   * a pre-existing symlink at the socket's parent must not be silently
-   * accepted as "directory already exists". */
-  if (lstat(dir, &st) != 0) {
-    fprintf(stderr, "avd: directory \"%s\" vanished after EEXIST: %s\n", dir,
-            strerror(errno));
-    return -1;
-  }
-  if (S_ISLNK(st.st_mode)) {
-    fprintf(stderr,
-            "avd: socket parent \"%s\" is a symlink - refusing to follow it\n",
-            dir);
-    return -1;
-  }
-  if (!S_ISDIR(st.st_mode)) {
-    fprintf(stderr, "avd: socket parent \"%s\" exists but is not a directory\n",
-            dir);
-    return -1;
-  }
-  return 0;
+  /* Same gate as ensure_quarantine_dir(): a pre-existing parent that an
+   * unprivileged user can modify must not be silently accepted as
+   * "directory already exists" - they could replace the socket between
+   * the bind() below and its chmod(). A freshly mkdir()'d parent is
+   * ours by construction, so only this path needs the check. Sticky
+   * world-writable parents stay supported (safe: only the entry owner
+   * can rename/remove entries there). */
+  return dir_trusted_for_daemon("socket parent", dir, true);
 }
 
 static int start_control_socket(void) {
@@ -2756,12 +2785,40 @@ static int start_control_socket(void) {
    * control_conn_main()/handle_control_line() above, so this mode is
    * what actually lets an unprivileged GUI process reach the read-only
    * verbs at all - same "gate specific commands, not the whole
-   * channel" pattern as GENL_ADMIN_PERM in av/netlink_chan.c. */
-  if (chmod(control_sock_path, 0666) != 0)
+   * channel" pattern as GENL_ADMIN_PERM in av/netlink_chan.c.
+   *
+   * Path-based chmod() is the only primitive that works here:
+   * fchmod() on an AF_UNIX socket fd returns 0 but silently leaves the
+   * mode unchanged (verified empirically), so "fixing" this to fchmod
+   * would quietly ship a 0755 socket and lock the GUI out. The
+   * check-then-chmod TOCTOU this implies (swap between the post-bind
+   * lstat() above and this chmod, redirecting a root chmod onto an
+   * attacker target) is closed by the parent-trust gate in
+   * ensure_parent_dir(): nobody unprivileged can modify the parent,
+   * so there is no one left who could stage the swap. The re-verify
+   * below is the backstop - if the path is not our 0666 socket after
+   * chmod, refuse to serve it rather than listen on a compromised
+   * path. On mismatch nothing is unlinked: the path may now name
+   * someone else's entry, and deleting that would be its own
+   * vulnerability. */
+  if (chmod(control_sock_path, 0666) != 0) {
     fprintf(stderr,
             "avd: chmod of control socket \"%s\" failed: %s - unprivileged "
             "clients (e.g. the GUI) may not be able to connect\n",
             control_sock_path, strerror(errno));
+    close(control_sock_fd);
+    control_sock_fd = -1;
+    return -1;
+  }
+  if (lstat(control_sock_path, &st) != 0 || !S_ISSOCK(st.st_mode) ||
+      (st.st_mode & 0777) != 0666) {
+    fprintf(stderr,
+            "avd: control socket path \"%s\" is not our 0666 socket after chmod - refusing to serve it\n",
+            control_sock_path);
+    close(control_sock_fd);
+    control_sock_fd = -1;
+    return -1;
+  }
 
   if (listen(control_sock_fd, 16) != 0) {
     fprintf(stderr, "avd: control socket listen() failed: %s\n",
@@ -2911,7 +2968,14 @@ int main(int argc, char **argv) {
    * writes or the world-visible control socket landing somewhere the
    * operator didn't mean. Absolute-path-only, same stance as
    * start_control_socket()'s own check (which re-checks the socket
-   * path) and cmd_scan()'s absolute-path requirement. */
+   * path) and cmd_scan()'s absolute-path requirement. Deliberately no
+   * expected-prefix allowlist (e.g. quarantine-must-be-under-/var/lib):
+   * argv/env overrides legitimately point outside the production
+   * prefixes - the test suite's throwaway dirs live under /tmp - so
+   * the trusted-directory gate (ownership + no unprivileged write in
+   * ensure_quarantine_dir()/ensure_parent_dir()) is what constrains
+   * attacker influence instead of a prefix list that would break those
+   * supported overrides. */
   if (!quarantine_dir[0] || quarantine_dir[0] != '/') {
     fprintf(stderr,
             "avd: quarantine directory must be an absolute path, got \"%s\"\n",
