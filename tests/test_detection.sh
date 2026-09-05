@@ -28,6 +28,21 @@ pass() { echo "  PASS: $1"; PASS=$((PASS+1)); }
 fail() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 section() { echo; echo "== $1 =="; }
 
+# dmesg can lag the event being checked for (detection is async via the
+# workqueue), so retry a few times before treating a missing line as a
+# real failure - same pattern as tests/test_netlink.sh's clean round-trip
+# retry loop. $1 = grep -E pattern, $2 = attempts (default 5).
+wait_for_dmesg() {
+    local pattern="$1" attempts="${2:-5}"
+    for _ in $(seq 1 "$attempts"); do
+        if dmesg | grep -qiE "$pattern"; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
 # A module MUST be built with the same compiler family as the running
 # kernel (see the top-level README's toolchain section) - e.g. CachyOS
 # ships kernels built with Clang. We can't rely on inherited CC/LLVM
@@ -71,8 +86,7 @@ sleep 1
 section "clean-file sanity check (should NOT be killed, should log as clean)"
 dmesg -C  # clear dmesg so we only see events from this point on
 /bin/ls >/dev/null
-sleep 1
-if dmesg | grep -q 'event=clean.*path="/bin/ls"'; then
+if wait_for_dmesg 'event=clean.*path="/bin/ls"' 5; then
     pass "clean file logged as clean"
 else
     fail "expected clean-file log line not found in dmesg"
@@ -99,9 +113,9 @@ fi
 
 dmesg -C
 "$EICAR_PATH" >/dev/null 2>&1
-sleep 1   # detection is async (workqueue) - give it a moment
-
-if dmesg | grep -qi 'event=detected.*action=kill.*reason="signature:EICAR-Test-File"'; then
+# Detection is async (workqueue) and dmesg can lag the event - retry
+# rather than treating a single delayed poll as a real failure.
+if wait_for_dmesg 'event=detected.*action=kill.*reason="signature:EICAR-Test-File"' 5; then
     pass "EICAR execution was detected and killed"
 else
     fail "expected DETECTED/killing log line not found in dmesg"
