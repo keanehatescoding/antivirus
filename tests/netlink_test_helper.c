@@ -80,8 +80,12 @@ static int connect_and_resolve(void)
  * so nl_send_sync() actually blocks for and reports the kernel's real
  * verdict (0 on an ack, negative errno on an NLMSG_ERROR) instead of
  * just "did the local send() syscall succeed" like avd's own
- * fire-and-forget nl_send_auto() calls. */
-static int send_and_report(uint8_t cmd, void (*fill)(struct nl_msg *, void *),
+ * fire-and-forget nl_send_auto() calls. fill() returns 0 on success,
+ * negative on attribute-build failure - a failed build frees the
+ * partially-built message and reports without sending, rather than
+ * transmitting a truncated message the kernel would then have to
+ * interpret. */
+static int send_and_report(uint8_t cmd, int (*fill)(struct nl_msg *, void *),
                             void *ctx)
 {
     struct nl_msg *msg;
@@ -98,8 +102,10 @@ static int send_and_report(uint8_t cmd, void (*fill)(struct nl_msg *, void *),
         nlmsg_free(msg);
         return 1;
     }
-    if (fill)
-        fill(msg, ctx);
+    if (fill && fill(msg, ctx) < 0) {
+        nlmsg_free(msg);
+        return 1;
+    }
 
     ret = nl_send_sync(sock, msg); /* consumes msg regardless of result */
     if (ret < 0) {
@@ -118,29 +124,36 @@ struct verdict_args {
     size_t rule_len;  /* oversized-verdict: force an over-limit string */
 };
 
-static void fill_verdict(struct nl_msg *msg, void *ctx)
+static int fill_verdict(struct nl_msg *msg, void *ctx)
 {
     struct verdict_args *a = ctx;
-    char *big;
+    char *big = NULL;
+    int rc = 0;
 
     if (!a->skip_reqid)
         NLA_PUT_U64(msg, AV_A_REQID, a->reqid);
     NLA_PUT_U8(msg, AV_A_VERDICT, a->verdict);
     if (a->rule_len) {
         big = malloc(a->rule_len + 1);
-        if (!big)
-            return;
+        if (!big) {
+            fprintf(stderr, "ERR -1 malloc failed building verdict message\n");
+            rc = -1;
+            goto out;
+        }
         memset(big, 'A', a->rule_len);
         big[a->rule_len] = '\0';
         NLA_PUT_STRING(msg, AV_A_RULE_NAME, big);
-        free(big);
     } else if (a->rule_name && a->rule_name[0]) {
         NLA_PUT_STRING(msg, AV_A_RULE_NAME, a->rule_name);
     }
-    return;
+    goto out;
 
 nla_put_failure:
     fprintf(stderr, "ERR -1 NLA_PUT failed building verdict message\n");
+    rc = -1;
+out:
+    free(big);
+    return rc;
 }
 
 /* argv[0] is the verb itself here (no program name) - shared by

@@ -182,9 +182,12 @@ section "unprivileged peer rejected on SCAN/QUARANTINE RESTORE/QUARANTINE DELETE
 # also named "nobody"), but Debian/Ubuntu's nobody user's primary
 # group is "nogroup", not "nobody", so --regid=nobody would fail
 # there with no group by that name to resolve, silently breaking this
-# whole section. Skipped gracefully (like the STATUS/VERDICTS
-# raw-protocol checks above) if any of these are missing, rather than
-# failing the whole suite over it.
+# whole section. Unlike the STATUS/VERDICTS raw-protocol checks above
+# (which are best-effort coverage for GUI convenience verbs), this section
+# covers the SO_PEERCRED auth gate on security-relevant verbs - silently
+# skipping it when socat/setpriv/nobody is missing would let a real
+# auth-gate regression pass CI unnoticed, so missing tooling is a hard
+# failure here, not a SKIP.
 if command -v socat >/dev/null 2>&1 && command -v setpriv >/dev/null 2>&1 && \
    NOBODY_UID="$(id -u nobody 2>/dev/null)" && NOBODY_GID="$(id -g nobody 2>/dev/null)"; then
     unpriv_send() {
@@ -214,8 +217,7 @@ if command -v socat >/dev/null 2>&1 && command -v setpriv >/dev/null 2>&1 && \
         fail "unprivileged QUARANTINE DELETE not rejected as expected: $UNPRIV_DELETE_RESP"
     fi
 else
-    echo "  SKIP: socat/setpriv not installed, or the \"nobody\" user/group could"
-    echo "  not be resolved - skipping unprivileged-peer checks"
+    fail "socat/setpriv missing or \"nobody\" user/group unresolvable - cannot exercise unprivileged-peer auth gate"
     echo "  (Arch/CachyOS: sudo pacman -S socat util-linux / Debian/Ubuntu: sudo apt install socat util-linux)"
 fi
 

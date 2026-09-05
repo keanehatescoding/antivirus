@@ -197,11 +197,30 @@ int main(int argc, char *const argv[]) {
       die("open /av.ko");
     if (fstat(fd, &st) != 0)
       die("fstat /av.ko");
+    /* st_size is attacker-influenced only in the sense that /av.ko comes
+     * from the test initramfs we built ourselves, but validating it here
+     * costs nothing and keeps a truncated/corrupt image from turning into
+     * a huge malloc or a short read passed to init_module as if whole. */
+    if (!S_ISREG(st.st_mode))
+      die("/av.ko not a regular file");
+    if (st.st_size <= 0 || st.st_size > (off_t)(32 * 1024 * 1024))
+      die("/av.ko size out of bounds");
     image = malloc((size_t)st.st_size);
     if (!image)
       die("malloc for module image");
-    if (read(fd, image, (size_t)st.st_size) != st.st_size)
-      die("read /av.ko");
+    {
+      size_t remaining = (size_t)st.st_size;
+      char *p = image;
+      while (remaining > 0) {
+        ssize_t n = read(fd, p, remaining);
+        if (n < 0)
+          die("read /av.ko");
+        if (n == 0)
+          die("read /av.ko: short read");
+        p += n;
+        remaining -= (size_t)n;
+      }
+    }
     close(fd);
 
     if (syscall(SYS_init_module, image, (unsigned long)st.st_size, "") != 0)

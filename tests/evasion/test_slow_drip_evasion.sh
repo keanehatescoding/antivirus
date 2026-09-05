@@ -1,25 +1,27 @@
 #!/usr/bin/env bash
 #
-# test_slow_drip_evasion.sh - v0.9.0 evasion test 4.
+# test_slow_drip_evasion.sh - evasion test 4 (see docs/evasion-findings.md #4).
 #
-# Technique: behavior.c's rapid-write-open counter uses a FIXED window,
-# not a true sliding window - see av_behavior_check_openat():
+# Technique: pacing write bursts just beyond the rapid-write-open trailing
+# window so total volume over time never trips the per-window threshold.
 #
-#   if (e->window_start_jiffies == 0 || window_ms > WRITE_OPEN_WINDOW_MS) {
-#       e->window_start_jiffies = jiffies;  // window resets entirely
-#       e->write_open_count = 1;
-#   } else {
-#       e->write_open_count++;
-#       ...
-#   }
+# History: behavior.c's counter originally used a FIXED (discrete) window
+# that reset entirely on each boundary (v0.8.x and earlier) - that
+# implementation bug is fixed. sliding_window_note() now keeps a real
+# trailing window where each tracked write carries its own timestamp and
+# ages out individually after WRITE_OPEN_WINDOW_MS, so there is no longer
+# a boundary to pace around for free.
 #
-# This means a process can write up to WRITE_OPEN_THRESHOLD (50) files
-# within any single 2-second window, then pause briefly for the window
-# to reset, and repeat INDEFINITELY - modifying an arbitrary number of
-# files over time without ever exceeding the per-window threshold. This
-# is a real, structural limitation of fixed/discrete-window rate
-# limiting (as opposed to a true sliding window), not a tuning problem
-# fixable by adjusting the threshold number alone.
+# What this script demonstrates now is the narrower, inherent remainder:
+# bursts paced strictly beyond the window (here 40 files per burst, 2.1s
+# apart against a 2.0s window) still evade, because a finite windowed
+# counter legitimately forgets writes older than the window - that is what
+# makes it a rate counter rather than a lifetime counter. No finite
+# window/threshold pair closes this off, only shifts where the evasion
+# threshold sits; closing it would need a different mechanism (e.g. total
+# volume over a much longer horizon). See docs/evasion-findings.md #4 for
+# the re-verified live results distinguishing the fixed implementation bug
+# from this inherent limitation.
 #
 # NEEDS THE LIVE KERNEL MODULE - run this in your VM, not standalone.
 #
@@ -66,6 +68,7 @@ dmesg 2>/dev/null | tail -20 || echo "(run 'dmesg | tail -20' manually if not ro
 echo
 echo "EXPECTED RESULT: no 'rapid file modification' kill, despite modifying"
 echo "$TOTAL files total - each individual burst stayed under the 50-open"
-echo "threshold, and the fixed window reset between bursts. This is the"
-echo "real limitation: total volume over time isn't tracked, only volume"
-echo "within whichever single window is currently active."
+echo "threshold, and bursts were paced beyond (not merely at) the 2s trailing"
+echo "window so earlier bursts had aged out. This is the inherent remainder:"
+echo "total volume over time isn't tracked, only volume within the trailing"
+echo "window - see docs/evasion-findings.md #4."  

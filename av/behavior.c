@@ -1230,15 +1230,23 @@ static void kill_with_reason(struct pid *target_pid, const char *path,
  * exists only as, e.g., a distinct PID-namespace artifact). Either
  * NULL means "gone" - safe to reclaim.
  *
- * Note on PID reuse: if the pid number gets recycled by an unrelated
- * new process before this sweep runs, the stale entry looks "alive"
- * and survives one more interval. That's fine - av_behavior_record_exec
- * overwrites exec_path and explicitly clears the write-open/rename
- * window state on the new process's first execve, so it starts clean
- * rather than inheriting the previous occupant's activity. Worst case
- * is one GC_INTERVAL_MS of an entry outliving its original process. */
+ * PID reuse: if the pid number gets recycled by an unrelated new process
+ * before this sweep runs, the stale entry still looks "alive" by the
+ * pid-exists check alone. Compare the live task's start_time against the
+ * entry's recorded start_time (same discriminator av_behavior_record_exec()
+ * uses): a mismatch with a non-zero recorded start_time means this pid was
+ * recycled since the entry's last exec, so reset the sliding-window state
+ * and drop the stale exec_path/trust rather than letting the new occupant
+ * inherit the previous process's counters before its own first execve
+ * overwrites them. Entries that never recorded an exec (start_time == 0)
+ * are left alone - they may still belong to the same pre-exec process,
+ * and record_exec() will initialise them on its first exec. */
 static void behavior_gc_fn(struct work_struct *w) {
-  struct av_behavior_entry *e;
+  /* Initialized to NULL only to satisfy static analyzers that can't
+   * expand hash_for_each_safe() (same false-positive category as
+   * get_or_create_entry()'s hash_for_each_possible() NULL init below) -
+   * the macro always assigns e before the loop body runs. */
+  struct av_behavior_entry *e = NULL;
   struct hlist_node *tmp;
   int bkt;
   unsigned int removed = 0;
@@ -1246,17 +1254,32 @@ static void behavior_gc_fn(struct work_struct *w) {
   mutex_lock(&behavior_lock);
   hash_for_each_safe(behavior_table, bkt, tmp, e, node) {
     struct pid *p;
+    struct task_struct *task;
     bool alive;
+    u64 cur_start = 0;
 
     rcu_read_lock();
     p = find_vpid(e->pid);
-    alive = p && pid_task(p, PIDTYPE_TGID);
+    task = p ? pid_task(p, PIDTYPE_TGID) : NULL;
+    if (task)
+      cur_start = READ_ONCE(task->start_time);
+    alive = (task != NULL);
     rcu_read_unlock();
 
     if (!alive) {
       hash_del(&e->node);
       kfree(e);
       removed++;
+    } else if (e->start_time != 0 && e->start_time != cur_start) {
+      /* PID recycled since this entry's last exec - start clean so the
+       * new occupant is never judged on the previous process's activity. */
+      e->start_time = cur_start;
+      e->exec_path[0] = '\0';
+      e->trusted = false;
+      e->recent_path_next = 0;
+      e->recent_path_filled = 0;
+      e->recent_rename_next = 0;
+      e->recent_rename_filled = 0;
     }
   }
   behavior_table_count -= removed;

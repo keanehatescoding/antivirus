@@ -4,7 +4,7 @@
 # Used by .githooks/pre-push, and safe to run manually any time:
 #   sudo tests/run_all.sh
 #
-set -uo pipefail
+set -euo pipefail
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "run_all.sh needs root (insmod/rmmod). Re-run with sudo."
