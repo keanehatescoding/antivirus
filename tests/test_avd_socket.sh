@@ -44,6 +44,13 @@ AVCTL="$AVCTL_DIR/avctl"
 # and tests/test_netlink.sh. The socket path stays under 108 bytes for
 # AF_UNIX sun_path either way (mktemp suffix is only 6 random chars).
 TEST_TMP_DIR="$(mktemp -d -- /tmp/av_test_socket.XXXXXX)" || exit 1
+# 0711, not mktemp's default 0700: the unprivileged-peer section below
+# connects as "nobody" to exercise avd's SO_PEERCRED gate, and a 0700
+# root-owned dir would block that connect at path traversal (empty
+# response, not the expected ERR permission denied). 0711 lets nobody
+# traverse to the socket without listing the dir, and the random mktemp
+# suffix keeps the full paths unguessable to anyone else.
+chmod 0711 "$TEST_TMP_DIR"
 TEST_QUARANTINE_DIR="$TEST_TMP_DIR/quarantine"
 TEST_SOCK_PATH="$TEST_TMP_DIR/control.sock"
 TEST_FILE="$TEST_TMP_DIR/sample.bin"
