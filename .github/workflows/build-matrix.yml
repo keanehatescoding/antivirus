@@ -33,7 +33,7 @@ jobs:
     outputs:
       versions: ${{ steps.read.outputs.versions }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - id: read
         run: echo "versions=$(jq -c '.versions' .github/kernel-versions.json)" >> "$GITHUB_OUTPUT"
 
@@ -54,7 +54,7 @@ jobs:
         # with the same compiler on each leg of this matrix.
         toolchain: [gcc, clang]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
       - name: Install build dependencies (gcc)
         if: matrix.toolchain == 'gcc'
@@ -70,16 +70,19 @@ jobs:
 
       - name: Cache built kernel tree
         id: cache-kernel
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6
         with:
           path: linux-${{ matrix.kernel_version }}-${{ matrix.toolchain }}
-          # v7: bumped from v6 because caches built under v6 predate
-          # the CONFIG_FRAME_WARN=2048 pin below - without a key bump,
-          # a cache hit would keep serving trees still built with
-          # tinyconfig's stricter 1024 default, and the corrected
-          # config step below would silently never run to fix it (same
-          # reason v6 was bumped from v5, see below).
-          key: kernel-tree-v7-${{ matrix.kernel_version }}-${{ matrix.toolchain }}
+          # Includes a hash of this workflow file itself, not just a
+          # hand-bumped "v7" counter - the old kernel-tree-v7-... key
+          # needed a manual bump every time the config steps below
+          # changed (that's how v6->v7 happened, see the CONFIG_FRAME_WARN
+          # history in git blame), and forgetting the bump means a cache
+          # hit silently keeps serving a tree built under the old config
+          # with no error. qemu-boot-test.yml's equivalent cache key
+          # already does this (hashFiles('.github/workflows/qemu-boot-test.yml'))
+          # - this key drifted out of sync with that approach until now.
+          key: kernel-tree-${{ matrix.kernel_version }}-${{ matrix.toolchain }}-${{ hashFiles('.github/workflows/build-matrix.yml') }}
 
       - name: Download and build a minimal kernel
         if: steps.cache-kernel.outputs.cache-hit != 'true'
@@ -188,7 +191,7 @@ jobs:
 
       - name: Upload build artifacts
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
           name: modules-${{ matrix.kernel_version }}-${{ matrix.toolchain }}
           path: |
@@ -198,14 +201,14 @@ jobs:
   build-avctl:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - name: Build avctl
         # -Werror only in CI, not the Makefile's own default CFLAGS -
         # a contributor's local build shouldn't hard-fail on a warning
         # from a compiler/libc version CI doesn't use, but CI itself
         # should never let one merge silently.
         run: make -C userspace/avctl CFLAGS="-Wall -Wextra -O2 -Werror -D_FORTIFY_SOURCE=2 -fstack-protector-strong -Wformat -Wformat-security"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
           name: avctl
           path: userspace/avctl/avctl
@@ -214,7 +217,7 @@ jobs:
   build-avd:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - name: Install libnl-genl, libyara, and libfuzzy
         run: |
           sudo apt-get update
@@ -391,7 +394,7 @@ jobs:
               userspace/avd/tlsh_core.o userspace/avd/tlsh_shim.o
           /tmp/tlsh_shim_smoke
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
           name: avd
           path: userspace/avd/avd

@@ -42,7 +42,7 @@ jobs:
     outputs:
       versions: ${{ steps.read.outputs.versions }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - id: read
         run: echo "versions=$(jq -c '.versions' .github/kernel-versions.json)" >> "$GITHUB_OUTPUT"
 
@@ -57,7 +57,7 @@ jobs:
         # version; edits there won't survive the next scheduled run.
         kernel_version: ${{ fromJSON(needs.load-kernel-matrix.outputs.versions) }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
       - name: Install build and QEMU dependencies
         run: |
@@ -67,7 +67,7 @@ jobs:
 
       - name: Cache built kernel tree
         id: cache-kernel
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6
         with:
           path: linux-${{ matrix.kernel_version }}-qemu-boot
           # Separate cache namespace from build-matrix.yml's - this
@@ -229,7 +229,7 @@ jobs:
 
       - name: Upload serial console log
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
           name: qemu-serial-log-${{ matrix.kernel_version }}
           path: tests/qemu-boot/serial.log

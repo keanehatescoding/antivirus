@@ -81,7 +81,8 @@ that loads the module and checks clean-vs-EICAR detection
   `shellcheck` on scripts. Quick, no build, no `insmod`.
 - **On push** — `.githooks/pre-push` runs the full suite
   (`pkexec tests/run_all.sh`), but only when the push touches `av/`,
-  `userspace/avctl/`, or `userspace/avd/`. Docs-only pushes skip it.
+  `userspace/avctl/`, `userspace/avd/`, `userspace/av-gui/`, `rules/`,
+  or `corpus/`. Docs-only pushes skip it.
 
 Both accept `--no-verify` if you really need to skip them, but that's
 best avoided — particularly right before a tag.

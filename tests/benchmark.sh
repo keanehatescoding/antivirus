@@ -16,6 +16,27 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ITERATIONS="${ITERATIONS:-2000}"
 
+# Validate before it ever reaches the C harness's atoi() (which silently
+# maps anything non-numeric to 0, and doesn't range-check at all) - this
+# value can come from outside a trusted interactive shell (a CI job
+# input, an env var some other script sets), and an absurdly large
+# count means millions of fork+execve+wait cycles run unattended, not a
+# quick benchmark. 1,000,000 is already far beyond any reading this
+# script's own comments describe as meaningful.
+#
+# The regex itself both rejects non-numeric input AND caps it at 7
+# digits with no leading zero - not just cosmetic: `[ -lt ]`/`[ -gt ]`
+# do arithmetic evaluation, which errors out (and counts as FALSE, not
+# TRUE) on a value too large to fit an integer, so a naive digit-count-
+# unbounded regex plus a plain `-gt 1000000` check would let an
+# absurdly long digit string silently sail past the range check instead
+# of being rejected by it. Bounding the digit count here means the
+# `-le` comparison below only ever runs on a value guaranteed to fit.
+if ! [[ "$ITERATIONS" =~ ^[1-9][0-9]{0,6}$ ]] || [ "$ITERATIONS" -gt 1000000 ]; then
+    echo "ITERATIONS must be an integer between 1 and 1000000 (got: $ITERATIONS)" >&2
+    exit 1
+fi
+
 if [ "$(id -u)" -ne 0 ]; then
     echo "This script needs root (insmod/rmmod). Re-run with sudo."
     exit 1
