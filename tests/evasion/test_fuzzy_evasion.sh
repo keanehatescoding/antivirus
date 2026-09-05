@@ -16,8 +16,12 @@ set -euo pipefail
 # honor a packager-provided override (e.g. FUZZY_LIBS="-l:libfuzzy.a"
 # ./tests/evasion/test_fuzzy_evasion.sh) so environments where plain
 # -lfuzzy doesn't link still work here, and otherwise probe pkg-config
-# with the same plain -lfuzzy fallback the daemon build uses.
-FUZZY_LIBS="${FUZZY_LIBS:-$(pkg-config --libs fuzzy 2>/dev/null || echo "-lfuzzy")}"
+# with the same plain -lfuzzy fallback the daemon build uses. Resolved
+# through PKG_CONFIG (not a hardcoded pkg-config), mirroring the
+# Makefile's `PKG_CONFIG ?=` so a target-specific wrapper applies here
+# too.
+PKG_CONFIG="${PKG_CONFIG:-pkg-config}"
+FUZZY_LIBS="${FUZZY_LIBS:-$("$PKG_CONFIG" --libs fuzzy 2>/dev/null || echo "-lfuzzy")}"
 
 echo "=== Evasion test: fuzzy hash evasion via substantial modification ==="
 

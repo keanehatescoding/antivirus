@@ -17,13 +17,13 @@
 #
 # What this runs: a small harness replicating avd's exact mask sequence
 # (block -> spawn worker -> unblock in main only) then delivers 50
-# process-directed kills from the worker and asserts every one ran its
-# handler on the main thread and woke its blocking pause(). 50 rounds
-# (not 1): with the mask left unblocked delivery is a coin flip per
-# round, so one round would pass unfixed code half the time, while 50
-# consecutive main-thread deliveries by chance is ~2^-50. The harness
-# uses alarm(15) so a regression that re-hangs delivery fails loudly
-# instead of wedging CI.
+# process-directed kills per signal (SIGTERM and SIGINT) from the worker
+# and asserts every one ran its handler on the main thread and woke its
+# blocking pause(). 50 rounds (not 1): with the mask left unblocked
+# delivery is a coin flip per round, so one round would pass unfixed
+# code half the time, while 50 consecutive main-thread deliveries by
+# chance is ~2^-50. The harness uses alarm(15) so a regression that
+# re-hangs delivery fails loudly instead of wedging CI.
 #
 # Pure userspace, no kernel module or root needed - safe standalone:
 #   tests/test_avd_sigroute.sh
@@ -38,8 +38,8 @@ cat > "$BUILD_DIR/sigroute.c" <<'EOF'
 /* Harness for tests/test_avd_sigroute.sh - mirrors avd.c main()'s
  * signal-mask sequence (pthread_sigmask(SIG_BLOCK) before
  * pthread_create(), SIG_UNBLOCK in the main thread only) and checks
- * process-directed SIGTERM always lands on the main thread. Not part
- * of the shipped avd binary. */
+ * process-directed delivery of one signal (SIGTERM or SIGINT per argv)
+ * always lands on the main thread. Not part of the shipped avd binary. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>
@@ -56,6 +56,8 @@ cat > "$BUILD_DIR/sigroute.c" <<'EOF'
 static volatile sig_atomic_t got;
 static pid_t main_tid;
 static pid_t handler_tid;
+static int target_sig = SIGTERM;
+static const char *target_name = "SIGTERM";
 
 static pid_t gettid_self(void) { return (pid_t)syscall(SYS_gettid); }
 
@@ -75,17 +77,17 @@ static void *worker_main(void *arg) {
   (void)arg;
 
   /* Regression check on the first half of avd's fix: the worker must
-   * inherit SIGTERM blocked. If it didn't, the kernel could deliver a
-   * process-directed SIGTERM here instead of to the main thread. */
+   * inherit the target signal blocked. If it didn't, the kernel could
+   * deliver a process-directed kill here instead of to the main thread. */
   pthread_sigmask(SIG_BLOCK, NULL, &cur);
-  if (!sigismember(&cur, SIGTERM)) {
-    fprintf(stderr, "FAIL: worker thread inherited SIGTERM unblocked\n");
+  if (!sigismember(&cur, target_sig)) {
+    fprintf(stderr, "FAIL: worker thread inherited %s unblocked\n", target_name);
     _exit(3);
   }
 
   /* Each round: wait for the main thread's ack (meaning it has armed
    * got = 0 and is parked in pause()), then send one process-directed
-   * SIGTERM exactly as kill(1)/systemctl stop/Ctrl-C would. */
+   * kill exactly as kill(1)/systemctl stop/Ctrl-C would. */
   for (i = 0; i < ROUNDS; i++) {
     ssize_t n;
 
@@ -96,7 +98,7 @@ static void *worker_main(void *arg) {
       fprintf(stderr, "FAIL: worker ack read failed: %s\n", strerror(errno));
       _exit(4);
     }
-    if (kill(getpid(), SIGTERM) != 0) {
+    if (kill(getpid(), target_sig) != 0) {
       fprintf(stderr, "FAIL: kill failed: %s\n", strerror(errno));
       _exit(4);
     }
@@ -104,11 +106,21 @@ static void *worker_main(void *arg) {
   return NULL;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
   struct sigaction sa;
   sigset_t block;
   pthread_t worker;
   int i;
+
+  /* Which routing contract to exercise: SIGTERM (kill(1)/systemctl stop)
+   * or SIGINT (Ctrl-C). avd routes both to the main thread, so both are
+   * verified - a SIGINT-only mask/handler regression must not slip past
+   * a SIGTERM-only check. */
+  if (argc > 1 && (!strcmp(argv[1], "SIGINT") || !strcmp(argv[1], "INT") ||
+                   !strcmp(argv[1], "2"))) {
+    target_sig = SIGINT;
+    target_name = "SIGINT";
+  }
 
   main_tid = gettid_self();
 
@@ -116,13 +128,15 @@ int main(void) {
   sa.sa_handler = on_term;
   sigemptyset(&sa.sa_mask);
   sa.sa_flags = 0; /* no SA_RESTART, same as avd.c: pause() must EINTR out */
-  if (sigaction(SIGTERM, &sa, NULL) != 0) {
+  if (sigaction(target_sig, &sa, NULL) != 0) {
     fprintf(stderr, "FAIL: sigaction: %s\n", strerror(errno));
     return 2;
   }
 
-  /* avd.c's sequence: block before pthread_create() ... */
+  /* avd.c's sequence: block before pthread_create() ... (both signals,
+   * exactly as avd.c does - workers inherit the pair blocked). */
   sigemptyset(&block);
+  sigaddset(&block, SIGINT);
   sigaddset(&block, SIGTERM);
   if (pthread_sigmask(SIG_BLOCK, &block, NULL) != 0) {
     fprintf(stderr, "FAIL: block: %s\n", strerror(errno));
@@ -171,8 +185,8 @@ int main(void) {
 
   alarm(0);
   pthread_join(worker, NULL);
-  printf("PASS: %d/%d process-directed SIGTERMs handled on main thread\n",
-         ROUNDS, ROUNDS);
+  printf("PASS: %d/%d process-directed %ss handled on main thread\n",
+         ROUNDS, ROUNDS, target_name);
   return 0;
 }
 EOF
@@ -180,4 +194,8 @@ EOF
 CC="${CC:-gcc}"
 # shellcheck disable=SC2086
 $CC -Wall -Wextra -O2 -o "$BUILD_DIR/sigroute" "$BUILD_DIR/sigroute.c" -pthread
-"$BUILD_DIR/sigroute"
+# avd routes both SIGTERM (kill/systemctl stop) and SIGINT (Ctrl-C) to
+# the main thread - exercise both so a signal-specific regression in the
+# mask or handler setup cannot hide behind the other signal's coverage.
+"$BUILD_DIR/sigroute" SIGTERM
+"$BUILD_DIR/sigroute" SIGINT
