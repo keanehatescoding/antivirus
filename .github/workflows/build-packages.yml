@@ -41,7 +41,7 @@ jobs:
     # to carry the same names/versions.
     container: debian:trixie
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           persist-credentials: false
 
@@ -89,7 +89,7 @@ jobs:
           mv ../*.deb ../*.buildinfo ../*.changes dist/
 
       - name: Upload .deb packages
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
           name: deb-packages
           path: dist/*.deb
@@ -111,7 +111,7 @@ jobs:
       - name: Install git (before checkout needs it)
         run: pacman -Syu --noconfirm --quiet && pacman -S --noconfirm --needed --quiet git
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           persist-credentials: false
           # PKGBUILD's pkgver() runs `git describe --long --tags`,
@@ -194,7 +194,7 @@ jobs:
             packaging/arch/
 
       - name: Upload .pkg.tar.zst packages
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
           name: arch-packages
           path: packaging/arch/*.pkg.tar.zst
@@ -229,7 +229,7 @@ jobs:
       - name: Install git (before checkout needs it)
         run: dnf install -y -q git
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -301,7 +301,7 @@ jobs:
             packaging/fedora/hyprav.spec
 
       - name: Upload .rpm packages
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
           name: rpm-packages
           path: rpmbuild-out/**/*.rpm
